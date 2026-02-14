@@ -105,7 +105,7 @@ Union mount flags: `REPLACE`, `BEFORE` (searched first), `AFTER` (searched after
 
 ### Console File Server
 
-The first userspace driver (`user/console_server.zig`). Runs as a supervised service, mounted at `/dev/console`. Handles IPC messages in a loop:
+The first userspace driver (will be `srv/console/main.zig`). Runs as a supervised service, mounted at `/dev/console`. Handles IPC messages in a loop:
 
 - `T_WRITE` — relays data to stdout (kernel framebuffer path), replies with bytes written
 - `T_OPEN` — acknowledges open requests

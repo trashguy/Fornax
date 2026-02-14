@@ -75,6 +75,6 @@ Clustering is controlled by the `-Dcluster=true` build option in `build.zig`. Th
 
 | File | Description |
 |------|-------------|
-| `user/cluster_server.zig` | Discovery protocol + /cluster/* file server |
+| `srv/cluster/main.zig` | Discovery protocol + /cluster/* file server |
 | `src/main.zig` | Conditionally spawn cluster server when `build_options.cluster` is true |
 | `build.zig` | `-Dcluster` option, passed to kernel via `build_options` module |

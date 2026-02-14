@@ -94,10 +94,6 @@ This builds the kernel, finds OVMF, and launches QEMU with a framebuffer, serial
 ```
 src/                         kernel
 ├── main.zig                 entry + init chain
-├── boot.zig                 UEFI boot services
-├── console.zig              framebuffer + serial console
-├── pmm.zig                  physical memory manager
-├── heap.zig                 kernel bump allocator
 ├── process.zig              process management + scheduler
 ├── syscall.zig              syscall dispatch + implementations
 ├── ipc.zig                  synchronous channels
@@ -105,24 +101,22 @@ src/                         kernel
 ├── supervisor.zig           fault supervisor
 ├── container.zig            container primitives
 ├── elf.zig                  ELF64 loader
+├── net.zig + net/           IP stack (Ethernet, ARP, IPv4, ICMP, UDP)
 ├── virtio.zig               virtio device/queue
 ├── virtio_net.zig           virtio-net NIC driver
-├── net.zig                  network stack integration
-├── net/                     protocol modules
-│   ├── ethernet.zig
-│   ├── arp.zig
-│   ├── ipv4.zig
-│   ├── icmp.zig
-│   └── udp.zig
 └── arch/x86_64/
-    ├── entry.S              hand-written asm (syscall entry, ISR stubs, resume)
+    ├── entry.S              syscall entry, ISR stubs, resume (asm)
     ├── paging.zig           4-level paging
     ├── gdt.zig              GDT + TSS
     ├── interrupts.zig       exception handling
     ├── syscall_entry.zig    SYSCALL/SYSRET MSR setup
     └── pci.zig              PCI bus enumeration
-user/
-└── fornax.zig               userspace syscall library
+lib/
+└── fornax.zig               userspace syscall library ("libc")
+cmd/                         userspace commands (shell, ls, cat, ...)
+srv/                         userspace servers (console, ramfs, ...)
+docs/
+└── TODO/                    phase-by-phase roadmap
 ```
 
 ## License
