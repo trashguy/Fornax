@@ -19,6 +19,46 @@ Microkernel
 
 Fornax is a microkernel. All drivers (console, network, block devices, GPU) run as userspace file servers. The kernel provides only memory management, scheduling, IPC, and namespace resolution. Programs interact with hardware by reading and writing files — there is no `ioctl`.
 
+## Design Principles
+
+### Plan 9-Pure Kernel, POSIX via Containers
+
+The kernel exposes only Plan 9-style syscalls. There is no POSIX compatibility in the kernel — no `socket()`, no `ioctl()`, no signals, no `fork()`. The native userspace (`init`, shell, file servers, utilities) speaks the kernel's native interface directly via `lib/fornax.zig`.
+
+POSIX compatibility is provided as a **userspace shim library** (`libposix`) that runs inside containers/jails. The shim translates POSIX calls to Fornax equivalents:
+
+| POSIX | Fornax translation |
+|-------|-------------------|
+| `socket()` + `connect()` | `open("/net/tcp/clone")` + `write(ctl, "connect ...")` |
+| `fork()` | `rfork(RFPROC\|RFMEM)` or `spawn()` |
+| `kill(pid, sig)` | `write("/proc/{pid}/note", "kill")` |
+| `ioctl(fd, TIOCGWINSZ)` | `read("/dev/console/ctl")` |
+| `signal(SIGTERM, handler)` | note handler via `/proc/self/note` |
+
+This means:
+- **Native Fornax programs** are small, clean, and use the file interface for everything.
+- **Existing POSIX software** (nginx, postgres, etc.) runs inside containers with the shim, isolated from the native OS.
+- **The kernel stays simple.** POSIX complexity lives in userspace where bugs can't crash the system.
+
+```
+┌─────────────────────────────────────────────┐
+│  POSIX containers (jails)                   │
+│  ┌─────────────┐  ┌─────────────┐           │
+│  │ nginx       │  │ postgres    │           │
+│  │ musl libc   │  │ musl libc   │           │
+│  │ libposix    │  │ libposix    │           │
+│  └──────┬──────┘  └──────┬──────┘           │
+│    fornax syscalls  fornax syscalls          │
+├─────────────────────────────────────────────┤
+│  Native Fornax userspace                    │
+│  init, sh, ramfs, console, net srv...       │
+│  lib/fornax.zig (native syscall API)        │
+├─────────────────────────────────────────────┤
+│  Fornax microkernel                         │
+│  Plan 9 syscalls only — no POSIX, no ioctl  │
+└─────────────────────────────────────────────┘
+```
+
 ## Kernel Subsystems
 
 ### Memory
@@ -34,8 +74,8 @@ Fornax is a microkernel. All drivers (console, network, block devices, GPU) run 
 ### Processes
 
 - **Process model** (`src/process.zig`): Per-process address space, kernel stack, FD table (32 entries), namespace, resource quotas.
-- **ELF64 loader** (`src/elf.zig`): Parses PT_LOAD segments, allocates pages, copies data, maps with correct flags. Returns entry point and program break.
-- **SYSCALL/SYSRET** (`src/arch/x86_64/syscall_entry.zig`): MSR-configured fast syscall entry. Saves user RSP, switches to kernel stack, dispatches, returns via `sysretq`.
+- **ELF64 loader** (`src/elf.zig`): Parses PT_LOAD segments, allocates pages, copies data, maps with correct flags. Returns entry point and program break. Userspace ELFs are currently embedded into the kernel binary at compile time via `@embedFile` in `build.zig` and loaded by the supervisor or `main.zig` directly.
+- **SYSCALL/SYSRET** (`src/arch/x86_64/syscall_entry.zig`): MSR-configured fast syscall entry. Assembly stub saves RIP/RSP/RFLAGS to per-CPU globals, switches to kernel stack, calls Zig dispatch. Returns via `sysretq` (restoring RCX=RIP, R11=RFLAGS). Blocking syscalls (ipc_recv) save context to Process struct and call `scheduleNext()` instead of returning.
 - **Exception handling** (`src/arch/x86_64/interrupts.zig`): Distinguishes Ring 0 (fatal) vs Ring 3 (kill process) faults by checking `CS & 3`.
 
 ### IPC
@@ -47,6 +87,8 @@ Synchronous message passing over channels (L4/Plan 9 inspired).
 - Response tags: `R_OK` (success + data), `R_ERROR` (error + message).
 - Messages carry up to 4 KB of inline data.
 - 256 max channels system-wide.
+- `ipc_recv` blocks: the calling process is marked blocked, its context is saved, and the scheduler runs the next process. When a message arrives, the receiver is unblocked.
+- Message delivery is deferred to `switchTo()` — the kernel copies the message into the target's address space only when switching to that process, ensuring the correct page tables are active.
 
 ### Namespaces
 
@@ -61,9 +103,20 @@ Union mount flags: `REPLACE`, `BEFORE` (searched first), `AFTER` (searched after
 
 `rfork(RFNAMEG)` gives a child a copy of the parent's namespace that can be modified independently.
 
+### Console File Server
+
+The first userspace driver (`user/console_server.zig`). Runs as a supervised service, mounted at `/dev/console`. Handles IPC messages in a loop:
+
+- `T_WRITE` — relays data to stdout (kernel framebuffer path), replies with bytes written
+- `T_OPEN` — acknowledges open requests
+- `T_READ` — returns 0 bytes (no keyboard input yet)
+- Unknown tags — replies `R_ERROR`
+
+Spawned by the supervisor with fd 3 as the server-side channel endpoint.
+
 ### Fault Supervisor
 
-VMS-inspired crash recovery (`src/supervisor.zig`). File servers are registered for supervision with their ELF binary. On crash:
+VMS-inspired crash recovery (`src/supervisor.zig`). File servers are registered for supervision with their ELF binary and mount path. On crash:
 
 1. Kernel catches exception from user process.
 2. Supervisor checks if the PID belongs to a registered service.
@@ -91,27 +144,27 @@ OCI/Docker images can be imported and converted to native format by the userspac
 
 Plan 9-inspired. NOT Linux-compatible. No `ioctl` — device control via text writes to control files (e.g., write `"resolution 1920 1080"` to `/dev/gpu/ctl`).
 
-| Nr | Name | Description |
-|----|------|-------------|
-| 0 | `open` | Open a file by path |
-| 1 | `create` | Create a new file |
-| 2 | `read` | Read from file descriptor |
-| 3 | `write` | Write to file descriptor |
-| 4 | `close` | Close file descriptor |
-| 5 | `stat` | Get file metadata |
-| 6 | `seek` | Seek within file |
-| 7 | `remove` | Delete a file |
-| 8 | `mount` | Mount a file server at a path |
-| 9 | `bind` | Bind a path to another path |
-| 10 | `unmount` | Unmount a path |
-| 11 | `rfork` | Fork with flags (RFMEM, RFNAMEG, etc.) |
-| 12 | `exec` | Execute a program |
-| 13 | `wait` | Wait for child process |
-| 14 | `exit` | Terminate process |
-| 15 | `pipe` | Create a channel pair |
-| 16 | `brk` | Adjust program break |
-
-Currently implemented: `write` (fd 1/2 to console), `exit`.
+| Nr | Name | Description | Status |
+|----|------|-------------|--------|
+| 0 | `open` | Open a file by path (namespace → IPC to file server) | Implemented |
+| 1 | `create` | Create a new file | Planned |
+| 2 | `read` | Read from file descriptor (IPC to file server) | Implemented |
+| 3 | `write` | Write to file descriptor (fd 1/2 → console, or IPC) | Implemented |
+| 4 | `close` | Close file descriptor | Implemented |
+| 5 | `stat` | Get file metadata | Planned |
+| 6 | `seek` | Seek within file | Planned |
+| 7 | `remove` | Delete a file | Planned |
+| 8 | `mount` | Mount a file server at a path | Planned |
+| 9 | `bind` | Bind a path to another path | Planned |
+| 10 | `unmount` | Unmount a path | Planned |
+| 11 | `rfork` | Fork with flags (RFMEM, RFNAMEG, etc.) | Planned |
+| 12 | `exec` | Execute a program | Planned |
+| 13 | `wait` | Wait for child process | Planned |
+| 14 | `exit` | Terminate process | Implemented |
+| 15 | `pipe` | Create a channel pair | Planned |
+| 16 | `brk` | Adjust program break | Planned |
+| 17 | `ipc_recv` | Receive IPC message on a channel (blocks) | Implemented |
+| 18 | `ipc_reply` | Reply to an IPC message on a channel | Implemented |
 
 ## Hardware Support
 
@@ -146,16 +199,15 @@ main.zig: EfiMain via Zig runtime
   ├── Architecture init (GDT, IDT, paging, CR3 switch)
   ├── IPC init
   ├── Process manager init
-  ├── SYSCALL MSR setup
+  ├── SYSCALL MSR setup (x86_64 only)
   ├── Fault supervisor init
-  ├── Console server registration
   ├── Container init
-  ├── PCI enumeration
-  ├── virtio-net init (find NIC, setup queues, read MAC)
+  ├── PCI enumeration + virtio-net init (x86_64 only)
   ├── Network stack init (set IP/gateway/mask)
-  ├── Cluster init (only if built with -Dcluster=true)
-  ├── Launch user hello (ELF load, IRETQ to Ring 3)
-  └── Network poll loop
+  ├── Spawn userspace services:
+  │   ├── Console server (supervised, mounted at /dev/console)
+  │   └── Hello process (standalone)
+  └── scheduleNext() — picks first ready process, SYSRET to Ring 3 (never returns)
 ```
 
 ## Build Options

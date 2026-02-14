@@ -9,73 +9,6 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption(bool, "cluster", cluster);
 
-    // ── User-space binaries (freestanding x86_64) ────────────────────
-    const user_target = b.resolveTargetQuery(.{
-        .cpu_arch = .x86_64,
-        .os_tag = .freestanding,
-        .abi = .none,
-        .cpu_features_sub = Target.x86.featureSet(&.{
-            .x87,
-            .sse,
-            .sse2,
-            .avx,
-            .avx2,
-        }),
-        .cpu_features_add = Target.x86.featureSet(&.{
-            .soft_float,
-        }),
-    });
-
-    const user_hello = b.addExecutable(.{
-        .name = "hello",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("user/hello.zig"),
-            .target = user_target,
-            .optimize = .ReleaseSmall,
-            .imports = &.{
-                .{ .name = "fornax", .module = b.createModule(.{
-                    .root_source_file = b.path("user/fornax.zig"),
-                    .target = user_target,
-                    .optimize = .ReleaseSmall,
-                }) },
-            },
-        }),
-    });
-    user_hello.entry = .{ .symbol_name = "_start" };
-
-    // Shared fornax module for user programs
-    const fornax_mod = b.createModule(.{
-        .root_source_file = b.path("user/fornax.zig"),
-        .target = user_target,
-        .optimize = .ReleaseSmall,
-    });
-
-    const user_console = b.addExecutable(.{
-        .name = "console_server",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("user/console_server.zig"),
-            .target = user_target,
-            .optimize = .ReleaseSmall,
-            .imports = &.{
-                .{ .name = "fornax", .module = fornax_mod },
-            },
-        }),
-    });
-    user_console.entry = .{ .symbol_name = "_start" };
-
-    const user_oci = b.addExecutable(.{
-        .name = "oci_import",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("user/oci_import.zig"),
-            .target = user_target,
-            .optimize = .ReleaseSmall,
-            .imports = &.{
-                .{ .name = "fornax", .module = fornax_mod },
-            },
-        }),
-    });
-    user_oci.entry = .{ .symbol_name = "_start" };
-
     // ── x86_64 UEFI target ──────────────────────────────────────────
     const x86_64_target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
@@ -104,17 +37,6 @@ pub fn build(b: *std.Build) void {
 
     // Build options
     x86_exe.root_module.addOptions("build_options", build_options);
-
-    // Embed user binaries into the kernel
-    x86_exe.root_module.addAnonymousImport("user_hello_elf", .{
-        .root_source_file = user_hello.getEmittedBin(),
-    });
-    x86_exe.root_module.addAnonymousImport("user_console_elf", .{
-        .root_source_file = user_console.getEmittedBin(),
-    });
-    x86_exe.root_module.addAnonymousImport("user_oci_elf", .{
-        .root_source_file = user_oci.getEmittedBin(),
-    });
 
     // Add hand-written assembly entry points (syscall, ISR stubs, resume)
     x86_exe.addAssemblyFile(b.path("src/arch/x86_64/entry.S"));

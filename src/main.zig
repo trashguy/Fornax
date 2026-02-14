@@ -8,14 +8,11 @@ const serial = @import("serial.zig");
 const heap = @import("heap.zig");
 const ipc = @import("ipc.zig");
 const process = @import("process.zig");
-const elf = @import("elf.zig");
 const supervisor = @import("supervisor.zig");
 const container = @import("container.zig");
-const namespace = @import("namespace.zig");
 const virtio_net = @import("virtio_net.zig");
 const net = @import("net.zig");
 const panic_handler = @import("panic.zig");
-const mem = @import("mem.zig");
 
 const cpu = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/cpu.zig"),
@@ -95,77 +92,11 @@ pub fn main() noreturn {
     // Phase 16: IP stack
     net.init();
 
-    // ── Spawn userspace services and processes ────────────────────────
-    if (@import("builtin").cpu.arch == .x86_64) {
-        spawnServices();
-    }
+    console.puts("Kernel initialized. No userspace yet.\n");
 
-    // Start the scheduler — picks the first ready process and runs it.
-    // This never returns.
-    console.puts("Starting scheduler...\n");
+    // Start the scheduler — with no processes spawned, this will
+    // print "All processes exited" and halt.
     process.scheduleNext();
-}
-
-/// Spawn all userspace services and the initial user process.
-fn spawnServices() void {
-    const console_elf = @embedFile("user_console_elf");
-    const hello_elf = @embedFile("user_hello_elf");
-
-    const paging = @import("arch/x86_64/paging.zig");
-
-    // Spawn the console server as a supervised service
-    if (supervisor.spawnService("console", console_elf, "/dev/console")) |svc| {
-        _ = svc;
-        console.puts("Console server spawned.\n");
-    } else {
-        console.puts("Failed to spawn console server!\n");
-    }
-
-    // Spawn hello.zig as a regular user process
-    const hello_proc = process.create() orelse {
-        console.puts("Failed to create hello process!\n");
-        return;
-    };
-
-    const load_result = elf.load(hello_proc.pml4.?, hello_elf) catch |err| {
-        console.puts("ELF load failed for hello: ");
-        console.puts(switch (err) {
-            elf.LoadError.InvalidMagic => "invalid magic",
-            elf.LoadError.Not64Bit => "not 64-bit",
-            elf.LoadError.NotExecutable => "not executable",
-            elf.LoadError.WrongArch => "wrong arch",
-            elf.LoadError.NoSegments => "no segments",
-            elf.LoadError.OutOfMemory => "out of memory",
-        });
-        console.puts("\n");
-        return;
-    };
-
-    hello_proc.user_rip = load_result.entry_point;
-    hello_proc.brk = load_result.brk;
-
-    // Allocate user stack (multiple pages)
-    const user_stack_pages = 2;
-    for (0..user_stack_pages) |i| {
-        const page = pmm.allocPage() orelse {
-            console.puts("Failed to allocate user stack for hello!\n");
-            return;
-        };
-        // Zero the page
-        const ptr: [*]u8 = @ptrFromInt(page);
-        @memset(ptr[0..mem.PAGE_SIZE], 0);
-
-        const virt = mem.USER_STACK_TOP - (user_stack_pages - i) * mem.PAGE_SIZE;
-        paging.mapPage(hello_proc.pml4.?, virt, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
-            console.puts("Failed to map user stack for hello!\n");
-            return;
-        };
-    }
-    hello_proc.user_rsp = mem.USER_STACK_TOP;
-
-    console.puts("Hello process created (pid=");
-    console.putDec(hello_proc.pid);
-    console.puts(")\n");
 }
 
 fn halt() noreturn {
