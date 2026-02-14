@@ -1,0 +1,25 @@
+# Phase 18: DNS Resolver
+
+## Goal
+
+Userspace DNS resolver file server at `/net/dns`.
+
+## Interface
+
+```
+/net/dns                    write "query example.com" → read "93.184.216.34\n"
+/net/dns/ctl                write "add nameserver 8.8.8.8"
+/net/dns/cache              read = cached entries (text)
+```
+
+## Implementation
+
+- UDP-based DNS client (port 53)
+- Parse A records (IPv4 only for now)
+- Simple cache with TTL expiry
+- Configurable nameservers via ctl file
+
+## Verify
+
+1. Resolve a known domain name
+2. Cache hit on second query (faster response)

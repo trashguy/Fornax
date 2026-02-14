@@ -1,0 +1,9 @@
+zig-out/
+zig-cache/
+.zig-cache/
+*.o
+*.efi
+*.EFI
+*.img
+.idea/
+.DS_Store

@@ -1,0 +1,74 @@
+pub fn halt() noreturn {
+    while (true) {
+        asm volatile ("cli");
+        asm volatile ("hlt");
+    }
+}
+
+pub fn disableInterrupts() void {
+    asm volatile ("cli");
+}
+
+pub fn enableInterrupts() void {
+    asm volatile ("sti");
+}
+
+pub fn outb(port: u16, val: u8) void {
+    asm volatile ("outb %[val], %[port]"
+        :
+        : [val] "{al}" (val),
+          [port] "N{dx}" (port),
+    );
+}
+
+pub fn inb(port: u16) u8 {
+    return asm volatile ("inb %[port], %[val]"
+        : [val] "={al}" (-> u8),
+        : [port] "N{dx}" (port),
+    );
+}
+
+/// Read a Model-Specific Register.
+pub fn rdmsr(msr: u32) u64 {
+    var low: u32 = undefined;
+    var high: u32 = undefined;
+    asm volatile ("rdmsr"
+        : [low] "={eax}" (low),
+          [high] "={edx}" (high),
+        : [msr] "{ecx}" (msr),
+    );
+    return @as(u64, high) << 32 | low;
+}
+
+/// Write a Model-Specific Register.
+pub fn wrmsr(msr: u32, val: u64) void {
+    asm volatile ("wrmsr"
+        :
+        : [msr] "{ecx}" (msr),
+          [low] "{eax}" (@as(u32, @truncate(val))),
+          [high] "{edx}" (@as(u32, @truncate(val >> 32))),
+    );
+}
+
+/// Read CR2 (page fault linear address).
+pub fn readCr2() u64 {
+    return asm volatile ("mov %%cr2, %[cr2]"
+        : [cr2] "=r" (-> u64),
+    );
+}
+
+/// Read CR3 (page table base).
+pub fn readCr3() u64 {
+    return asm volatile ("mov %%cr3, %[cr3]"
+        : [cr3] "=r" (-> u64),
+    );
+}
+
+// MSR numbers
+pub const MSR_EFER = 0xC0000080;
+pub const MSR_STAR = 0xC0000081;
+pub const MSR_LSTAR = 0xC0000082;
+pub const MSR_SFMASK = 0xC0000084;
+
+// EFER bits
+pub const EFER_SCE: u64 = 1 << 0; // System Call Extensions

@@ -1,0 +1,39 @@
+# Phase 17: TCP
+
+## Goal
+
+Add TCP to the IP stack file server. Full connection lifecycle: connect, listen/accept, data transfer, close.
+
+## Interface
+
+```
+/net/tcp/
+├── clone                   open → returns connection number
+└── 0/
+    ├── ctl                 "connect 10.0.0.1!80" / "announce *!8080"
+    ├── listen              open blocks until incoming connection → new conn dir
+    ├── data                read/write byte stream
+    ├── local               "10.0.0.2!54321"
+    ├── remote              "10.0.0.1!80"
+    └── status              "Established" / "Listen" / "TimeWait" / ...
+```
+
+## TCP State Machine
+
+CLOSED → SYN_SENT → ESTABLISHED → FIN_WAIT_1 → FIN_WAIT_2 → TIME_WAIT → CLOSED
+CLOSED → LISTEN → SYN_RECEIVED → ESTABLISHED → CLOSE_WAIT → LAST_ACK → CLOSED
+
+## Key Implementation Points
+
+- Sliding window for flow control
+- Retransmission timer (simple exponential backoff)
+- Nagle's algorithm (optional, can default off for simplicity)
+- MSS negotiation
+- RST handling
+- No need for: SACK, timestamps, window scaling (keep it simple)
+
+## Verify
+
+1. Fornax connects to host HTTP server, downloads a page
+2. Host connects to Fornax TCP server, exchanges data
+3. Connection properly closes (FIN handshake, no RST)
