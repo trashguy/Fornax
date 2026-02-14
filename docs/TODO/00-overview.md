@@ -57,6 +57,12 @@ Build with: `zig build x86_64 -Dcluster=true`
 | 201 | Remote namespace import (9P over TCP) | 100, 200 |
 | 202 | Cluster scheduler (container placement across nodes) | 201 |
 
+## Future: Language Support (1000-series)
+
+| Phase | Description | Depends On |
+|-------|-------------|------------|
+| 1000 | C/C++/Go support — freestanding C, minimal libc, musl port, POSIX realms | 17-25 |
+
 ## Dependency Graph
 
 ```
@@ -124,3 +130,4 @@ Phase 16 (done) ─────┐
 | 11 | Two Fornax nodes discover each other | 200 | Not started (requires `-Dcluster=true`) |
 | 12 | Mount remote node's namespace | 201 | Not started (requires `-Dcluster=true`) |
 | 13 | Schedule container across cluster | 202 | Not started (requires `-Dcluster=true`) |
+| 14 | Compile and run a C program on Fornax | 1000 | Not started |

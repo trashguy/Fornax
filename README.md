@@ -10,7 +10,7 @@ A microkernel operating system written in Zig. Plan 9's "everything is a file" d
 
 **Containers without containers.** In Fornax, a container is just `rfork` + `bind` + `mount` — existing kernel primitives. Each process already has its own namespace (file tree), so isolation is the default, not an afterthought bolted on with cgroups and seccomp filters.
 
-**Run POSIX software without compromising the kernel.** The kernel speaks only Plan 9-style syscalls — no `socket()`, no `ioctl()`, no signals. Native Fornax programs are clean and simple. But existing POSIX software (nginx, postgres, etc.) runs inside containers via a userspace shim library (`libposix`) that translates POSIX calls to Fornax file operations. `socket() + connect()` becomes `open("/net/tcp/clone")`. POSIX complexity lives in userspace where bugs can't crash the system.
+**Run POSIX software without compromising the kernel.** The kernel speaks only Plan 9-style syscalls — no `socket()`, no `ioctl()`, no signals. Native Fornax programs are clean and simple. POSIX software runs transparently via a userspace shim: type `gcc main.c` and it just works — the ELF interpreter detects the POSIX binary and sets up a POSIX realm automatically. CLI tools get ephemeral realms (created on exec, gone on exit). Daemons like nginx get full containers with their own rootfs and resource quotas. `socket() + connect()` becomes `open("/net/tcp/clone")`. POSIX complexity lives in userspace where bugs can't crash the system.
 
 **Optional clustering.** Build with `-Dcluster=true` to enable multi-node support. Nodes discover each other via UDP gossip and import remote namespaces over 9P. Mount another machine's `/dev/` into your local tree. Schedule containers across a cluster. Disabled by default — zero overhead when you don't need it.
 
@@ -21,17 +21,17 @@ A microkernel operating system written in Zig. Plan 9's "everything is a file" d
 ## Design
 
 ```
-POSIX Containers (jails)          Native Fornax
-┌──────────┐ ┌──────────┐     ┌──────┐ ┌──────┐
-│ nginx    │ │ postgres │     │ sh   │ │ init │ ...
-│ musl     │ │ musl     │     │      │ │      │
-│ libposix │ │ libposix │     │      │ │      │
-└────┬─────┘ └────┬─────┘     └──┬───┘ └──┬───┘
-     └────────────┴──────────────┴────────┘
-          fornax syscalls / lib/fornax.zig
-────────────────────────────────────────────────
+Containers (managed)        POSIX realms            Native Fornax
+┌──────────┐                ┌──────────┐         ┌──────┐ ┌──────┐
+│ nginx    │                │ gcc      │         │ sh   │ │ init │ ...
+│ own root │                │ musl     │         │      │ │      │
+│ quotas   │                │ libposix │         │      │ │      │
+└────┬─────┘                └────┬─────┘         └──┬───┘ └──┬───┘
+     └───────────────────────────┴──────────────────┴────────┘
+              fornax syscalls / lib/fornax.zig
+────────────────────────────────────────────────────────────────
 Userspace File Servers (console, net, ramfs...)
-────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────
 Microkernel (Plan 9 syscalls only)
 ├── Memory       PMM + paging + address spaces
 ├── IPC          synchronous channels (L4-style)
@@ -40,7 +40,11 @@ Microkernel (Plan 9 syscalls only)
 └── Containers   namespace + quotas + rootfs
 ```
 
-Programs interact with the system through Plan 9-style syscalls: `open`, `read`, `write`, `close`, `mount`, `bind`, `rfork`, and friends. IPC is synchronous message passing over channels. File servers handle `T_OPEN`/`T_READ`/`T_WRITE` messages and reply with `R_OK` or `R_ERROR`. The kernel has no POSIX — that lives in a userspace shim for containers.
+Programs interact with the system through Plan 9-style syscalls: `open`, `read`, `write`, `close`, `mount`, `bind`, `rfork`, and friends. IPC is synchronous message passing over channels. File servers handle `T_OPEN`/`T_READ`/`T_WRITE` messages and reply with `R_OK` or `R_ERROR`.
+
+The kernel has no POSIX. POSIX programs run in two modes:
+- **POSIX realms** — for CLI tools (gcc, python, etc.). The ELF interpreter auto-detects POSIX binaries and sets up a realm with musl/libposix. Ephemeral — lives and dies with the process.
+- **Containers** — for daemons (nginx, postgres). Managed environments with own rootfs, resource quotas, and lifecycle. Created explicitly.
 
 ## Current State
 

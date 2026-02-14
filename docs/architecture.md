@@ -21,11 +21,11 @@ Fornax is a microkernel. All drivers (console, network, block devices, GPU) run 
 
 ## Design Principles
 
-### Plan 9-Pure Kernel, POSIX via Containers
+### Plan 9-Pure Kernel, POSIX via Userspace
 
 The kernel exposes only Plan 9-style syscalls. There is no POSIX compatibility in the kernel — no `socket()`, no `ioctl()`, no signals, no `fork()`. The native userspace (`init`, shell, file servers, utilities) speaks the kernel's native interface directly via `lib/fornax.zig`.
 
-POSIX compatibility is provided as a **userspace shim library** (`libposix`) that runs inside containers/jails. The shim translates POSIX calls to Fornax equivalents:
+POSIX compatibility is provided as a **userspace shim library** (`libposix`) that translates POSIX calls to Fornax equivalents:
 
 | POSIX | Fornax translation |
 |-------|-------------------|
@@ -35,28 +35,41 @@ POSIX compatibility is provided as a **userspace shim library** (`libposix`) tha
 | `ioctl(fd, TIOCGWINSZ)` | `read("/dev/console/ctl")` |
 | `signal(SIGTERM, handler)` | note handler via `/proc/self/note` |
 
-This means:
-- **Native Fornax programs** are small, clean, and use the file interface for everything.
-- **Existing POSIX software** (nginx, postgres, etc.) runs inside containers with the shim, isolated from the native OS.
-- **The kernel stays simple.** POSIX complexity lives in userspace where bugs can't crash the system.
+### POSIX Namespaces vs Containers
+
+POSIX programs run in two modes, using different levels of isolation:
+
+**POSIX realms** are for interactive/CLI programs (gcc, python, etc.). When
+the kernel loads an ELF with `PT_INTERP = /lib/posix-realm`, the posix-realm
+loader (a native Fornax program) calls `rfork(RFNAMEG)` to create a new
+namespace, mounts musl/libposix and POSIX /dev, then loads the real binary.
+The realm is ephemeral — lives and dies with the process. The shell doesn't
+know or care; it just calls exec. This is standard Plan 9 namespace
+customization — not a special feature.
+
+**Containers** are for managed, long-running services (nginx, postgres). They
+have their own rootfs image, resource quotas, lifecycle management
+(create/start/stop/destroy), and potentially their own init process. Created
+explicitly by a container manager.
 
 ```
-┌─────────────────────────────────────────────┐
-│  POSIX containers (jails)                   │
-│  ┌─────────────┐  ┌─────────────┐           │
-│  │ nginx       │  │ postgres    │           │
-│  │ musl libc   │  │ musl libc   │           │
-│  │ libposix    │  │ libposix    │           │
-│  └──────┬──────┘  └──────┬──────┘           │
-│    fornax syscalls  fornax syscalls          │
-├─────────────────────────────────────────────┤
-│  Native Fornax userspace                    │
-│  init, sh, ramfs, console, net srv...       │
-│  lib/fornax.zig (native syscall API)        │
-├─────────────────────────────────────────────┤
-│  Fornax microkernel                         │
-│  Plan 9 syscalls only — no POSIX, no ioctl  │
-└─────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│ Containers (managed)       POSIX realms (ephemeral)       │
+│ ┌───────────┐              ┌───────────┐                  │
+│ │ nginx     │              │ gcc       │                  │
+│ │ own rootfs│              │ musl      │                  │
+│ │ quotas    │              │ libposix  │                  │
+│ └─────┬─────┘              └─────┬─────┘                  │
+│       └──────────────────────────┘                        │
+│            fornax syscalls                                │
+├───────────────────────────────────────────────────────────┤
+│ Native Fornax userspace                                   │
+│ init, sh, ramfs, console, net srv...                      │
+│ lib/fornax.zig (native syscall API)                       │
+├───────────────────────────────────────────────────────────┤
+│ Fornax microkernel                                        │
+│ Plan 9 syscalls only — no POSIX, no ioctl                 │
+└───────────────────────────────────────────────────────────┘
 ```
 
 ## Kernel Subsystems
