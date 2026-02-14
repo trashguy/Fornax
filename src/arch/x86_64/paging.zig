@@ -101,21 +101,42 @@ fn mapHugePage(pml4: *PageTable, virt: u64, phys: u64) ?void {
     const pd_idx = (virt >> 21) & 0x1FF;
 
     // Ensure PDPT exists
-    const pdpt = getOrAllocTable(pml4, pml4_idx) orelse return null;
+    const pdpt = getOrAllocTable(pml4, pml4_idx, 0) orelse return null;
 
     // Ensure PD exists
-    const pd = getOrAllocTable(pdpt, pdpt_idx) orelse return null;
+    const pd = getOrAllocTable(pdpt, pdpt_idx, 0) orelse return null;
 
     // Set 2MB huge page entry
     pd.entries[pd_idx] = phys | Flags.PRESENT | Flags.WRITABLE | Flags.HUGE_PAGE;
 }
 
+const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+const HUGE_ADDR_MASK: u64 = 0x000F_FFFF_FFE0_0000; // 2MB-aligned
+
 /// Get the next-level page table at `index`, allocating if necessary.
-fn getOrAllocTable(table: *PageTable, index: u64) ?*PageTable {
+/// If the entry is a 2MB huge page, split it into 512 × 4KB pages first.
+fn getOrAllocTable(table: *PageTable, index: u64, propagate_flags: u64) ?*PageTable {
     const idx: usize = @intCast(index);
     if (table.entries[idx] & Flags.PRESENT != 0) {
-        // Already exists — extract physical address
-        const addr = table.entries[idx] & 0x000F_FFFF_FFFF_F000;
+        // Propagate USER/WRITABLE to existing intermediate entries
+        table.entries[idx] |= propagate_flags;
+
+        if (table.entries[idx] & Flags.HUGE_PAGE != 0) {
+            // Split 2MB huge page into 512 × 4KB pages
+            const huge_phys = table.entries[idx] & HUGE_ADDR_MASK;
+            const base_flags = (table.entries[idx] & 0xFFF) & ~Flags.HUGE_PAGE;
+
+            const pt_page = pmm.allocPage() orelse return null;
+            const pt: *PageTable = @ptrFromInt(pt_page);
+            for (0..512) |i| {
+                pt.entries[i] = (huge_phys + i * PAGE_SIZE) | base_flags;
+            }
+            // Replace PD entry: now points to a page table instead of a huge page
+            table.entries[idx] = pt_page | Flags.PRESENT | Flags.WRITABLE | propagate_flags;
+            return pt;
+        }
+        // Regular table entry — extract physical address
+        const addr = table.entries[idx] & ADDR_MASK;
         return @ptrFromInt(addr);
     }
 
@@ -123,22 +144,57 @@ fn getOrAllocTable(table: *PageTable, index: u64) ?*PageTable {
     const page = pmm.allocPage() orelse return null;
     const new_table: *PageTable = @ptrFromInt(page);
     new_table.zero();
-    table.entries[idx] = page | Flags.PRESENT | Flags.WRITABLE;
+    table.entries[idx] = page | Flags.PRESENT | Flags.WRITABLE | propagate_flags;
     return new_table;
 }
 
-/// Create a new address space (PML4) with the kernel half pre-mapped.
-/// The upper 256 entries (indices 256-511) are copied from the kernel PML4
+/// Create a new address space (PML4) with the kernel half and identity map.
+/// The upper 256 entries (indices 256-511) are shallow-copied from the kernel PML4
 /// so that kernel memory is accessible in every address space.
+/// Entry 0 (identity map) is deep-copied (private PDPT + PD pages) so that
+/// mapPage() can safely split 2MB huge pages for user mappings without
+/// corrupting the kernel's identity map.
 pub fn createAddressSpace() ?*PageTable {
     const page = pmm.allocPage() orelse return null;
     const new_pml4: *PageTable = @ptrFromInt(page);
     new_pml4.zero();
 
-    // Copy kernel half (PML4 entries 256-511) from kernel PML4
     const kernel_pml4: *PageTable = @ptrFromInt(kernel_pml4_phys);
+
+    // Copy kernel half (PML4 entries 256-511) — shallow copy is fine,
+    // kernel mappings are never modified per-process.
     for (256..512) |i| {
         new_pml4.entries[i] = kernel_pml4.entries[i];
+    }
+
+    // Deep-copy identity map (PML4 entry 0).
+    // The kernel runs from identity-mapped addresses, so this must be present
+    // in every address space. We deep-copy the PDPT and PD levels so that
+    // mapPage() can split 2MB huge pages into 4KB entries without corrupting
+    // the kernel's shared tables.
+    if (kernel_pml4.entries[0] & Flags.PRESENT != 0) {
+        const kernel_pdpt: *PageTable = @ptrFromInt(kernel_pml4.entries[0] & ADDR_MASK);
+        const new_pdpt_page = pmm.allocPage() orelse return null;
+        const new_pdpt: *PageTable = @ptrFromInt(new_pdpt_page);
+        new_pdpt.zero();
+
+        for (0..512) |i| {
+            if (kernel_pdpt.entries[i] & Flags.PRESENT == 0) continue;
+
+            if (kernel_pdpt.entries[i] & Flags.HUGE_PAGE != 0) {
+                // 1GB huge page — just copy the entry (not used currently but safe)
+                new_pdpt.entries[i] = kernel_pdpt.entries[i];
+            } else {
+                // Points to a PD — allocate a private copy
+                const kernel_pd: *PageTable = @ptrFromInt(kernel_pdpt.entries[i] & ADDR_MASK);
+                const new_pd_page = pmm.allocPage() orelse return null;
+                const new_pd: *PageTable = @ptrFromInt(new_pd_page);
+                new_pd.* = kernel_pd.*; // Copy all entries (including 2MB huge pages)
+                new_pdpt.entries[i] = new_pd_page | (kernel_pdpt.entries[i] & 0xFFF);
+            }
+        }
+
+        new_pml4.entries[0] = new_pdpt_page | (kernel_pml4.entries[0] & 0xFFF);
     }
 
     return new_pml4;
@@ -151,9 +207,11 @@ pub fn mapPage(pml4: *PageTable, virt: u64, phys: u64, flags: u64) ?void {
     const pd_idx = (virt >> 21) & 0x1FF;
     const pt_idx = (virt >> 12) & 0x1FF;
 
-    const pdpt = getOrAllocTable(pml4, pml4_idx) orelse return null;
-    const pd = getOrAllocTable(pdpt, pdpt_idx) orelse return null;
-    const pt = getOrAllocTable(pd, pd_idx) orelse return null;
+    // Propagate USER and WRITABLE to intermediate table entries
+    const propagate = flags & (Flags.USER | Flags.WRITABLE);
+    const pdpt = getOrAllocTable(pml4, pml4_idx, propagate) orelse return null;
+    const pd = getOrAllocTable(pdpt, pdpt_idx, propagate) orelse return null;
+    const pt = getOrAllocTable(pd, pd_idx, propagate) orelse return null;
 
     pt.entries[@intCast(pt_idx)] = phys | flags | Flags.PRESENT;
 }

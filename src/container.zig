@@ -12,13 +12,29 @@
 ///   3. mount(console_channel, "/dev/console")  — give it a console
 ///   4. exec("/init")  — run container's init
 const console = @import("console.zig");
+const serial = @import("serial.zig");
 const process = @import("process.zig");
 const namespace = @import("namespace.zig");
 const ipc = @import("ipc.zig");
+const elf = @import("elf.zig");
+const pmm = @import("pmm.zig");
+const mem = @import("mem.zig");
+
+const paging = switch (@import("builtin").cpu.arch) {
+    .x86_64 => @import("arch/x86_64/paging.zig"),
+    else => struct {
+        pub const Flags = struct {
+            pub const WRITABLE: u64 = 2;
+            pub const USER: u64 = 4;
+        };
+        pub fn mapPage(_: anytype, _: u64, _: u64, _: u64) ?void {}
+    },
+};
 
 const MAX_CONTAINERS = 16;
 const MAX_NAME = 64;
 const MAX_PATH = 256;
+const USER_STACK_PAGES = 2;
 
 pub const Container = struct {
     /// Human-readable container name.
@@ -83,9 +99,11 @@ pub fn create(name: []const u8, rootfs_path: []const u8, quotas: process.Resourc
     return null;
 }
 
-/// Start a container: create a process with isolated namespace.
-/// Returns the init process PID, or null on failure.
-pub fn start(ct: *Container) ?u32 {
+/// Start a container: create a process with isolated namespace, load ELF,
+/// apply quotas.
+/// `init_elf` is the raw ELF binary for the container's init process.
+/// `console_channel_id` is the IPC channel for /dev/console access (optional).
+pub fn start(ct: *Container, init_elf: []const u8, console_channel_id: ?ipc.ChannelId) ?u32 {
     if (ct.state != .created) return null;
 
     // Create the container's init process
@@ -94,10 +112,46 @@ pub fn start(ct: *Container) ?u32 {
     // Apply resource quotas
     proc.quotas = ct.quotas;
 
-    // The container's namespace starts as a clone of root, then will be
-    // modified by the container startup to bind the rootfs and mount
-    // required services.
-    // For now, the namespace is already cloned in process.create().
+    // Create a fresh, empty namespace for isolation
+    proc.ns = namespace.Namespace.init();
+
+    // Mount /dev/console if a channel was provided
+    if (console_channel_id) |chan_id| {
+        proc.ns.mount("/dev/console", chan_id, .{}) catch {
+            serial.puts("[container] Failed to mount /dev/console\n");
+        };
+    }
+
+    // Load ELF into process address space
+    const load_result = elf.load(proc.pml4.?, init_elf) catch {
+        serial.puts("[container] ELF load failed for '");
+        serial.puts(ct.name[0..ct.name_len]);
+        serial.puts("'\n");
+        proc.state = .dead;
+        return null;
+    };
+
+    proc.user_rip = load_result.entry_point;
+    proc.brk = load_result.brk;
+
+    // Allocate user stack
+    for (0..USER_STACK_PAGES) |i| {
+        const page = process.allocPageForProcess(proc) orelse {
+            serial.puts("[container] Stack alloc failed (quota?)\n");
+            proc.state = .dead;
+            return null;
+        };
+        const ptr: [*]u8 = @ptrFromInt(page);
+        @memset(ptr[0..mem.PAGE_SIZE], 0);
+
+        const virt = mem.USER_STACK_TOP - (USER_STACK_PAGES - i) * mem.PAGE_SIZE;
+        paging.mapPage(proc.pml4.?, virt, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
+            serial.puts("[container] Stack map failed\n");
+            proc.state = .dead;
+            return null;
+        };
+    }
+    proc.user_rsp = mem.USER_STACK_TOP;
 
     ct.init_pid = proc.pid;
     ct.state = .running;
@@ -106,7 +160,9 @@ pub fn start(ct: *Container) ?u32 {
     console.puts(ct.name[0..ct.name_len]);
     console.puts("' started (pid=");
     console.putDec(proc.pid);
-    console.puts(")\n");
+    console.puts(", quota=");
+    console.putDec(ct.quotas.max_memory_pages);
+    console.puts(" pages)\n");
 
     return proc.pid;
 }

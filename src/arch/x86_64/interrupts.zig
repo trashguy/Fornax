@@ -5,6 +5,7 @@ const idt = @import("idt.zig");
 const cpu = @import("cpu.zig");
 const paging = @import("paging.zig");
 const supervisor = @import("../../supervisor.zig");
+const process = @import("../../process.zig");
 
 const exception_names = [_][]const u8{
     "Division Error", // 0
@@ -64,18 +65,49 @@ pub fn handleException(frame: *idt.ExceptionFrame) void {
             serial.puts("\n");
         }
 
-        // Try supervisor restart for supervised services
-        // TODO: determine the faulting PID from current process tracking
-        // For now, log and halt
-        console.puts("\n[User process faulted: ");
-        console.puts(exception_names[frame.vector]);
-        console.puts("]\n");
+        // Get the faulting process
+        if (process.getCurrent()) |proc| {
+            const pid = proc.pid;
 
-        // For Milestone 3: this will call supervisor.handleProcessFault(pid)
-        // and return to the scheduler instead of halting.
-        cpu.halt();
+            // Try supervisor restart for supervised services
+            _ = supervisor.handleProcessFault(pid);
+
+            // Whether supervised or not, mark the process dead
+            proc.state = .dead;
+
+            console.puts("[Process ");
+            console.putDec(pid);
+            console.puts(" faulted: ");
+            if (frame.vector < 32) {
+                console.puts(exception_names[frame.vector]);
+            }
+            console.puts("]\n");
+
+            // Schedule the next process
+            process.scheduleNext();
+        } else {
+            // No current process — shouldn't happen, but handle gracefully
+            console.puts("[User fault with no current process]\n");
+            cpu.halt();
+        }
     } else {
         // Kernel-mode fault — always fatal
+        serial.puts("\n--- KERNEL EXCEPTION (serial) ---\n");
+        serial.puts("Vector: ");
+        serial.putDec(frame.vector);
+        serial.puts(" Err: ");
+        serial.putHex(frame.error_code);
+        serial.puts(" RIP: ");
+        serial.putHex(frame.rip);
+        serial.puts(" CS: ");
+        serial.putHex(frame.cs);
+        serial.puts(" RFLAGS: ");
+        serial.putHex(frame.rflags);
+        serial.puts(" RSP: ");
+        serial.putHex(frame.rsp);
+        serial.puts(" SS: ");
+        serial.putHex(frame.ss);
+        serial.puts("\n");
         console.puts("\n--- KERNEL EXCEPTION ---\n");
 
         if (frame.vector < 32) {

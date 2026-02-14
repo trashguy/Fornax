@@ -26,8 +26,10 @@ const OciManifest = struct {
 };
 
 export fn _start() callconv(.naked) noreturn {
-    asm volatile ("call _main");
-    unreachable;
+    asm volatile (
+        \\call _main
+        \\ud2
+    );
 }
 
 export fn _main() callconv(.c) noreturn {

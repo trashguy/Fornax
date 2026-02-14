@@ -27,7 +27,7 @@ var idt_entries: [256]IdtEntry = [_]IdtEntry{.{
 
 var idt_ptr: IdtPtr = undefined;
 
-/// Exception frame pushed by our ISR stubs.
+/// Exception frame pushed by ISR stubs in entry.S.
 pub const ExceptionFrame = extern struct {
     // Pushed by common stub (in reverse order)
     r15: u64,
@@ -56,100 +56,31 @@ pub const ExceptionFrame = extern struct {
     ss: u64,
 };
 
-// Exceptions that push their own error code
-fn hasErrorCode(vector: u8) bool {
-    return switch (vector) {
-        8, 10, 11, 12, 13, 14, 17, 21, 29, 30 => true,
-        else => false,
-    };
-}
+/// ISR stub address table defined in entry.S.
+extern const isr_stub_table: [32]u64;
 
-/// Comptime-generate an ISR stub for each vector.
-/// Each stub is self-contained: push error code (if needed), push vector,
-/// save registers, call handler, restore registers, iretq.
-fn makeIsrStub(comptime vector: u8) *const fn () callconv(.naked) void {
-    return &struct {
-        fn stub() callconv(.naked) void {
-            if (comptime !hasErrorCode(vector)) {
-                asm volatile ("push $0");
-            }
-            asm volatile ("push %[vec]"
-                :
-                : [vec] "i" (@as(u64, vector)),
-            );
-            asm volatile (
-                \\push %%rax
-                \\push %%rbx
-                \\push %%rcx
-                \\push %%rdx
-                \\push %%rsi
-                \\push %%rdi
-                \\push %%rbp
-                \\push %%r8
-                \\push %%r9
-                \\push %%r10
-                \\push %%r11
-                \\push %%r12
-                \\push %%r13
-                \\push %%r14
-                \\push %%r15
-                \\mov %%rsp, %%rdi
-            );
-            asm volatile ("call handleExceptionWrapper");
-            asm volatile (
-                \\pop %%r15
-                \\pop %%r14
-                \\pop %%r13
-                \\pop %%r12
-                \\pop %%r11
-                \\pop %%r10
-                \\pop %%r9
-                \\pop %%r8
-                \\pop %%rbp
-                \\pop %%rdi
-                \\pop %%rsi
-                \\pop %%rdx
-                \\pop %%rcx
-                \\pop %%rbx
-                \\pop %%rax
-                \\add $16, %%rsp
-                \\iretq
-            );
-        }
-    }.stub;
-}
-
-export fn handleExceptionWrapper(frame: *ExceptionFrame) callconv(.c) void {
+/// Exception handler wrapper called from entry.S using System V ABI.
+export fn handleExceptionWrapper(frame: *ExceptionFrame) callconv(.{ .x86_64_sysv = .{} }) void {
     const interrupts = @import("interrupts.zig");
     interrupts.handleException(frame);
 }
 
-fn setGate(vector: u8, handler: *const fn () callconv(.naked) void) void {
-    const addr = @intFromPtr(handler);
+fn setGate(vector: u8, handler_addr: u64) void {
     idt_entries[vector] = .{
-        .offset_low = @truncate(addr),
+        .offset_low = @truncate(handler_addr),
         .selector = 0x08, // kernel code segment
         .ist = 0,
         .type_attr = 0x8E, // present, DPL=0, interrupt gate
-        .offset_mid = @truncate(addr >> 16),
-        .offset_high = @truncate(addr >> 32),
+        .offset_mid = @truncate(handler_addr >> 16),
+        .offset_high = @truncate(handler_addr >> 32),
         .reserved = 0,
     };
 }
 
-/// Generate stubs for vectors 0-31 (CPU exceptions)
-const isr_stubs = blk: {
-    var stubs: [32]*const fn () callconv(.naked) void = undefined;
-    for (0..32) |i| {
-        stubs[i] = makeIsrStub(i);
-    }
-    break :blk stubs;
-};
-
 pub fn init() void {
-    // Install exception handlers (vectors 0-31)
+    // Install exception handlers (vectors 0-31) from entry.S stubs
     for (0..32) |i| {
-        setGate(@intCast(i), isr_stubs[i]);
+        setGate(@intCast(i), isr_stub_table[i]);
     }
 
     idt_ptr = .{

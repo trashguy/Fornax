@@ -70,7 +70,7 @@ const ChannelState = enum {
 };
 
 /// A channel endpoint.
-const ChannelEnd = struct {
+pub const ChannelEnd = struct {
     /// Process ID of the process that owns this end (0 = unowned).
     owner_pid: u32,
     /// Pending message (set by sender, consumed by receiver at rendezvous).
@@ -79,6 +79,16 @@ const ChannelEnd = struct {
     send_waiting: bool,
     /// Whether this end is waiting to receive.
     recv_waiting: bool,
+    /// PID of the process currently blocked on this end (0 = none).
+    blocked_pid: u32,
+};
+
+const empty_end = ChannelEnd{
+    .owner_pid = 0,
+    .pending_msg = null,
+    .send_waiting = false,
+    .recv_waiting = false,
+    .blocked_pid = 0,
 };
 
 /// A channel: two endpoints connected together.
@@ -90,8 +100,8 @@ pub const Channel = struct {
 
 var channels: [MAX_CHANNELS]Channel = [_]Channel{.{
     .state = .free,
-    .server = .{ .owner_pid = 0, .pending_msg = null, .send_waiting = false, .recv_waiting = false },
-    .client = .{ .owner_pid = 0, .pending_msg = null, .send_waiting = false, .recv_waiting = false },
+    .server = empty_end,
+    .client = empty_end,
 }} ** MAX_CHANNELS;
 
 var initialized: bool = false;
@@ -119,8 +129,8 @@ pub fn channelCreate() IpcError!struct { server: ChannelId, client: ChannelId } 
         if (channels[i].state == .free) {
             channels[i] = .{
                 .state = .open,
-                .server = .{ .owner_pid = 0, .pending_msg = null, .send_waiting = false, .recv_waiting = false },
-                .client = .{ .owner_pid = 0, .pending_msg = null, .send_waiting = false, .recv_waiting = false },
+                .server = empty_end,
+                .client = empty_end,
             };
             const id: ChannelId = @intCast(i);
             return .{ .server = id, .client = id };

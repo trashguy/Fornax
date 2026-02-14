@@ -170,6 +170,9 @@ fn reloadSegments() void {
         \\push %%rax
         \\lretq
         \\1:
+        :
+        :
+        : .{ .rax = true, .memory = true }
     );
 
     // Reload data segment registers
@@ -181,5 +184,8 @@ fn reloadSegments() void {
         \\xor %%ax, %%ax
         \\mov %%ax, %%fs
         \\mov %%ax, %%gs
+        :
+        :
+        : .{ .rax = true }
     );
 }

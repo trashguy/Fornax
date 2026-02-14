@@ -78,7 +78,7 @@ pub const LoadResult = struct {
 pub fn load(page_table: *paging.PageTable, elf_data: []const u8) LoadError!LoadResult {
     if (elf_data.len < @sizeOf(Elf64Header)) return error.InvalidMagic;
 
-    const header: *const Elf64Header = @ptrCast(@alignCast(elf_data.ptr));
+    const header: *align(1) const Elf64Header = @ptrCast(elf_data.ptr);
 
     // Validate ELF magic
     if (!std.mem.eql(u8, header.e_ident[0..4], &ELF_MAGIC)) return error.InvalidMagic;
@@ -95,7 +95,7 @@ pub fn load(page_table: *paging.PageTable, elf_data: []const u8) LoadError!LoadR
         const ph_offset = header.e_phoff + @as(u64, i) * header.e_phentsize;
         if (ph_offset + @sizeOf(Elf64Phdr) > elf_data.len) continue;
 
-        const phdr: *const Elf64Phdr = @ptrCast(@alignCast(elf_data.ptr + ph_offset));
+        const phdr: *align(1) const Elf64Phdr = @ptrCast(elf_data.ptr + ph_offset);
 
         if (phdr.p_type != PT_LOAD) continue;
 
@@ -118,7 +118,7 @@ pub fn load(page_table: *paging.PageTable, elf_data: []const u8) LoadError!LoadR
 const std = @import("std");
 
 /// Load a single PT_LOAD segment: allocate pages, map them, copy data.
-fn loadSegment(page_table: *paging.PageTable, elf_data: []const u8, phdr: *const Elf64Phdr) ?void {
+fn loadSegment(page_table: *paging.PageTable, elf_data: []const u8, phdr: *align(1) const Elf64Phdr) ?void {
     const vaddr_start = phdr.p_vaddr & ~@as(u64, mem.PAGE_SIZE - 1);
     const vaddr_end = (phdr.p_vaddr + phdr.p_memsz + mem.PAGE_SIZE - 1) & ~@as(u64, mem.PAGE_SIZE - 1);
 

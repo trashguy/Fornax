@@ -116,6 +116,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = user_oci.getEmittedBin(),
     });
 
+    // Add hand-written assembly entry points (syscall, ISR stubs, resume)
+    x86_exe.addAssemblyFile(b.path("src/arch/x86_64/entry.S"));
+
     const x86_install = b.addInstallArtifact(x86_exe, .{
         .dest_dir = .{ .override = .{ .custom = "esp/EFI/BOOT" } },
         .dest_sub_path = "BOOTX64.EFI",

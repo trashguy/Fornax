@@ -11,9 +11,17 @@ const process = @import("process.zig");
 const elf = @import("elf.zig");
 const supervisor = @import("supervisor.zig");
 const container = @import("container.zig");
+const namespace = @import("namespace.zig");
 const virtio_net = @import("virtio_net.zig");
 const net = @import("net.zig");
 const panic_handler = @import("panic.zig");
+const mem = @import("mem.zig");
+
+const cpu = switch (@import("builtin").cpu.arch) {
+    .x86_64 => @import("arch/x86_64/cpu.zig"),
+    .aarch64 => @import("arch/aarch64/cpu.zig"),
+    else => @compileError("unsupported architecture"),
+};
 
 const arch = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/interrupts.zig"),
@@ -72,15 +80,6 @@ pub fn main() noreturn {
     // Phase 13: Fault supervisor
     supervisor.init();
 
-    // Register console server for supervision
-    if (@import("builtin").cpu.arch == .x86_64) {
-        const console_elf = @embedFile("user_console_elf");
-        if (supervisor.register("console", console_elf, "/dev/console")) |svc| {
-            _ = svc;
-            console.puts("Console server registered for supervision\n");
-        }
-    }
-
     // Phase 14: Containers
     container.init();
 
@@ -96,47 +95,40 @@ pub fn main() noreturn {
     // Phase 16: IP stack
     net.init();
 
-    // ── Milestone 1: Load and run user hello program ────────────────
-    launchUserHello();
-
-    // Network poll loop — process packets while idle
-    if (net.isInitialized()) {
-        console.puts("\nFornax ready. Polling network...\n");
-        while (true) {
-            net.poll();
-        }
+    // ── Spawn userspace services and processes ────────────────────────
+    if (@import("builtin").cpu.arch == .x86_64) {
+        spawnServices();
     }
 
-    console.puts("\nFornax ready. Halting.\n");
-    halt();
+    // Start the scheduler — picks the first ready process and runs it.
+    // This never returns.
+    console.puts("Starting scheduler...\n");
+    process.scheduleNext();
 }
 
-fn launchUserHello() void {
-    if (@import("builtin").cpu.arch != .x86_64) {
-        console.puts("User mode not yet supported on this architecture.\n");
-        return;
-    }
+/// Spawn all userspace services and the initial user process.
+fn spawnServices() void {
+    const console_elf = @embedFile("user_console_elf");
+    const hello_elf = @embedFile("user_hello_elf");
 
     const paging = @import("arch/x86_64/paging.zig");
-    const syscall_entry = @import("arch/x86_64/syscall_entry.zig");
-    const gdt = @import("arch/x86_64/gdt.zig");
-    const mem = @import("mem.zig");
 
-    // Embedded user binary
-    const user_elf = @embedFile("user_hello_elf");
-    console.puts("Loading user hello (");
-    console.putDec(user_elf.len);
-    console.puts(" bytes)...\n");
+    // Spawn the console server as a supervised service
+    if (supervisor.spawnService("console", console_elf, "/dev/console")) |svc| {
+        _ = svc;
+        console.puts("Console server spawned.\n");
+    } else {
+        console.puts("Failed to spawn console server!\n");
+    }
 
-    // Create process
-    const proc = process.create() orelse {
-        console.puts("Failed to create process!\n");
+    // Spawn hello.zig as a regular user process
+    const hello_proc = process.create() orelse {
+        console.puts("Failed to create hello process!\n");
         return;
     };
 
-    // Load ELF into process address space
-    const load_result = elf.load(proc.pml4.?, user_elf) catch |err| {
-        console.puts("ELF load failed: ");
+    const load_result = elf.load(hello_proc.pml4.?, hello_elf) catch |err| {
+        console.puts("ELF load failed for hello: ");
         console.puts(switch (err) {
             elf.LoadError.InvalidMagic => "invalid magic",
             elf.LoadError.Not64Bit => "not 64-bit",
@@ -149,70 +141,35 @@ fn launchUserHello() void {
         return;
     };
 
-    console.puts("ELF loaded. Entry: ");
-    console.putHex(load_result.entry_point);
-    console.puts("\n");
+    hello_proc.user_rip = load_result.entry_point;
+    hello_proc.brk = load_result.brk;
 
-    proc.user_rip = load_result.entry_point;
-    proc.brk = load_result.brk;
+    // Allocate user stack (multiple pages)
+    const user_stack_pages = 2;
+    for (0..user_stack_pages) |i| {
+        const page = pmm.allocPage() orelse {
+            console.puts("Failed to allocate user stack for hello!\n");
+            return;
+        };
+        // Zero the page
+        const ptr: [*]u8 = @ptrFromInt(page);
+        @memset(ptr[0..mem.PAGE_SIZE], 0);
 
-    // Allocate user stack (one page at USER_STACK_TOP - PAGE_SIZE)
-    const user_stack_phys = pmm.allocPage() orelse {
-        console.puts("Failed to allocate user stack!\n");
-        return;
-    };
-    // Zero the stack page
-    const stack_ptr: [*]u8 = @ptrFromInt(user_stack_phys);
-    @memset(stack_ptr[0..mem.PAGE_SIZE], 0);
+        const virt = mem.USER_STACK_TOP - (user_stack_pages - i) * mem.PAGE_SIZE;
+        paging.mapPage(hello_proc.pml4.?, virt, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
+            console.puts("Failed to map user stack for hello!\n");
+            return;
+        };
+    }
+    hello_proc.user_rsp = mem.USER_STACK_TOP;
 
-    const user_stack_virt = mem.USER_STACK_TOP - mem.PAGE_SIZE;
-    paging.mapPage(proc.pml4.?, user_stack_virt, user_stack_phys, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
-        console.puts("Failed to map user stack!\n");
-        return;
-    };
-    proc.user_rsp = mem.USER_STACK_TOP; // stack grows down
-
-    // Set kernel stack for syscall entry
-    syscall_entry.setKernelStack(proc.kernel_stack_top);
-    gdt.setKernelStack(proc.kernel_stack_top);
-
-    console.puts("Entering Ring 3...\n");
-
-    // Jump to user mode via IRETQ
-    // Stack frame: SS, RSP, RFLAGS, CS, RIP
-    jumpToUserMode(proc.user_rip, proc.user_rsp);
-}
-
-fn jumpToUserMode(rip: u64, rsp: u64) noreturn {
-    const gdt = @import("arch/x86_64/gdt.zig");
-    asm volatile (
-        \\push %[ss]       // SS
-        \\push %[rsp]      // RSP
-        \\push %[rflags]   // RFLAGS (IF=1 to enable interrupts)
-        \\push %[cs]       // CS
-        \\push %[rip]      // RIP
-        \\iretq
-        :
-        : [ss] "r" (@as(u64, gdt.USER_DS)),
-          [rsp] "r" (rsp),
-          [rflags] "r" (@as(u64, 0x202)), // IF=1
-          [cs] "r" (@as(u64, gdt.USER_CS)),
-          [rip] "r" (rip),
-    );
-    unreachable;
+    console.puts("Hello process created (pid=");
+    console.putDec(hello_proc.pid);
+    console.puts(")\n");
 }
 
 fn halt() noreturn {
-    switch (@import("builtin").cpu.arch) {
-        .x86_64 => while (true) {
-            asm volatile ("cli");
-            asm volatile ("hlt");
-        },
-        .aarch64 => while (true) {
-            asm volatile ("wfi");
-        },
-        else => while (true) {},
-    }
+    cpu.halt();
 }
 
 /// Convert a comptime ASCII string literal to a UEFI UTF-16 null-terminated string.
