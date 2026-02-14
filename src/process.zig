@@ -3,6 +3,7 @@
 /// Each process has its own address space, kernel stack, file descriptor table,
 /// and namespace (mount table).
 const console = @import("console.zig");
+const serial = @import("serial.zig");
 const pmm = @import("pmm.zig");
 const mem = @import("mem.zig");
 const ipc = @import("ipc.zig");
@@ -54,15 +55,16 @@ const syscall_entry = switch (@import("builtin").cpu.arch) {
 };
 
 const MAX_PROCESSES = 64;
-const MAX_FDS = 32;
+pub const MAX_FDS = 32;
 const KERNEL_STACK_PAGES = 2; // 8 KB kernel stack per process
-const USER_STACK_PAGES = 2; // 8 KB user stack per process
+pub const USER_STACK_PAGES = 16; // 64 KB user stack per process
 
 pub const ProcessState = enum {
     free,
     running,
     ready,
     blocked,
+    zombie, // exited but not yet reaped by parent
     dead,
 };
 
@@ -73,10 +75,16 @@ pub const ResourceQuotas = struct {
     cpu_priority: u8 = 128, // 0=lowest, 255=highest
 };
 
+pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat };
+
 /// File descriptor entry: channel ID + which end of the channel.
 pub const FdEntry = struct {
     channel_id: ipc.ChannelId,
     is_server: bool,
+    /// Read offset for kernel-backed channels (initrd files).
+    read_offset: u32,
+    /// Server-assigned handle (0 = none / raw channel or kernel-backed, >0 = server file handle).
+    server_handle: u32,
 };
 
 pub const Process = struct {
@@ -114,6 +122,16 @@ pub const Process = struct {
     ipc_recv_buf_ptr: u64,
     /// Pointer to pending message to deliver when this process resumes.
     ipc_pending_msg: ?*ipc.Message,
+    /// Parent process ID (null if orphaned or root process).
+    parent_pid: ?u32,
+    /// Exit status stored when process exits (for parent to collect via wait).
+    exit_status: u8,
+    /// PID of child this process is waiting for (0 = any child, null = not waiting).
+    waiting_for_pid: ?u32,
+    /// What IPC op is in-flight (for reply dispatch in server-backed file ops).
+    pending_op: PendingOp,
+    /// Pre-allocated fd for open/create reply handling.
+    pending_fd: u32,
 
     pub fn initFds(self: *Process) void {
         for (&self.fds) |*fd| {
@@ -127,7 +145,7 @@ pub const Process = struct {
         // Start from fd 3 (0=stdin, 1=stdout, 2=stderr are special)
         for (3..MAX_FDS) |i| {
             if (self.fds[i] == null) {
-                self.fds[i] = .{ .channel_id = channel_id, .is_server = is_server };
+                self.fds[i] = .{ .channel_id = channel_id, .is_server = is_server, .read_offset = 0, .server_handle = 0 };
                 return @intCast(i);
             }
         }
@@ -137,7 +155,7 @@ pub const Process = struct {
     /// Set a specific fd to a channel entry.
     pub fn setFd(self: *Process, fd: u32, channel_id: ipc.ChannelId, is_server: bool) void {
         if (fd < MAX_FDS) {
-            self.fds[fd] = .{ .channel_id = channel_id, .is_server = is_server };
+            self.fds[fd] = .{ .channel_id = channel_id, .is_server = is_server, .read_offset = 0, .server_handle = 0 };
         }
     }
 
@@ -152,6 +170,12 @@ pub const Process = struct {
     pub fn getFdEntry(self: *const Process, fd: u32) ?FdEntry {
         if (fd >= MAX_FDS) return null;
         return self.fds[fd];
+    }
+
+    /// Get a mutable pointer to an fd entry (for updating read_offset).
+    pub fn getFdEntryPtr(self: *Process, fd: u32) ?*FdEntry {
+        if (fd >= MAX_FDS) return null;
+        return if (self.fds[fd]) |*entry| entry else null;
     }
 };
 
@@ -181,6 +205,11 @@ pub fn init() void {
         p.ipc_msg = ipc.Message.init(.t_open);
         p.ipc_recv_buf_ptr = 0;
         p.ipc_pending_msg = null;
+        p.parent_pid = null;
+        p.exit_status = 0;
+        p.waiting_for_pid = null;
+        p.pending_op = .none;
+        p.pending_fd = 0;
         p.initFds();
     }
     initialized = true;
@@ -213,6 +242,9 @@ pub fn create() ?*Process {
         if (i == 0) stack_base = page;
     }
 
+    // Parent is whoever is currently running (null for kernel-spawned processes)
+    const parent_pid: ?u32 = if (current) |cur| cur.pid else null;
+
     proc.* = .{
         .pid = next_pid,
         .state = .ready,
@@ -231,6 +263,11 @@ pub fn create() ?*Process {
         .ipc_msg = ipc.Message.init(.t_open),
         .ipc_recv_buf_ptr = 0,
         .ipc_pending_msg = null,
+        .parent_pid = parent_pid,
+        .exit_status = 0,
+        .waiting_for_pid = null,
+        .pending_op = .none,
+        .pending_fd = 0,
     };
     next_pid += 1;
 
@@ -253,6 +290,29 @@ pub fn getByPid(pid: u32) ?*Process {
         if (p.state != .free and p.pid == pid) return p;
     }
     return null;
+}
+
+/// Recursively kill all children of a process (Fornax orphan policy).
+/// When a parent exits, its entire subtree dies — Plan 9/L4/VMS style.
+pub fn killChildren(parent_pid: u32) void {
+    for (&processes) |*p| {
+        if (p.parent_pid) |ppid| {
+            if (ppid == parent_pid and p.state != .free) {
+                // Recurse first (kill grandchildren before child)
+                killChildren(p.pid);
+                p.state = .free;
+                p.parent_pid = null;
+                serial.puts("[killed orphan pid=");
+                serial.putDec(p.pid);
+                serial.puts("]\n");
+            }
+        }
+    }
+}
+
+/// Get the process table for iteration (used by syscall implementations).
+pub fn getProcessTable() *[64]Process {
+    return &processes;
 }
 
 /// Save current user context from the syscall entry point globals.
@@ -287,16 +347,16 @@ pub fn scheduleNext() noreturn {
     }
 
     // No ready process found
-    // Check if any processes are alive (blocked)
-    var any_blocked = false;
+    // Check if any processes are alive (blocked or zombie awaiting reap)
+    var any_alive = false;
     for (&processes) |*p| {
-        if (p.state == .blocked) {
-            any_blocked = true;
+        if (p.state == .blocked or p.state == .zombie) {
+            any_alive = true;
             break;
         }
     }
 
-    if (any_blocked) {
+    if (any_alive) {
         console.puts("\n[DEADLOCK: all processes blocked, none ready]\n");
     } else {
         console.puts("\n[All processes exited. System halting.]\n");
@@ -329,10 +389,16 @@ fn switchTo(proc: *Process) noreturn {
     // (address space is loaded, so user pointers are valid)
     if (proc.ipc_pending_msg) |msg| {
         if (proc.ipc_recv_buf_ptr != 0) {
-            deliverIpcMessage(msg, proc.ipc_recv_buf_ptr);
+            if (proc.pending_op == .read) {
+                // Raw data delivery for read replies — copy just data, not IpcMessage wrapper
+                deliverRawData(msg, proc.ipc_recv_buf_ptr);
+            } else {
+                deliverIpcMessage(msg, proc.ipc_recv_buf_ptr);
+            }
         }
         proc.ipc_pending_msg = null;
         proc.ipc_recv_buf_ptr = 0;
+        proc.pending_op = .none;
     }
 
     if (proc.saved_kernel_rsp != 0) {
@@ -347,6 +413,16 @@ fn switchTo(proc: *Process) noreturn {
         // First run (no saved kernel frame) — use IRETQ path
         resume_user_mode(proc.user_rip, proc.user_rsp, proc.user_rflags, proc.syscall_ret);
     }
+}
+
+/// Copy raw data from an IPC message directly to a user buffer (no IpcMessage wrapper).
+/// Used for read() reply delivery — user expects raw file data, not a tagged message.
+fn deliverRawData(msg: *const ipc.Message, user_buf_ptr: u64) void {
+    if (user_buf_ptr == 0 or user_buf_ptr >= 0x0000_8000_0000_0000) return;
+    if (msg.data_len == 0) return;
+
+    const dest: [*]u8 = @ptrFromInt(user_buf_ptr);
+    @memcpy(dest[0..msg.data_len], msg.data_buf[0..msg.data_len]);
 }
 
 /// Copy an IPC message to a user-space IpcMessage struct.

@@ -5,6 +5,9 @@ const console = @import("console.zig");
 pub const BootInfo = struct {
     framebuffer: console.Framebuffer,
     memory_map: MemoryMap,
+    /// Initrd image loaded from ESP (null if not found).
+    initrd_base: ?[*]const u8,
+    initrd_size: usize,
 };
 
 pub const MemoryMap = struct {
@@ -44,6 +47,9 @@ pub fn init() InitError!BootInfo {
         .is_bgr = is_bgr,
     };
 
+    // Load initrd from ESP (optional — boot proceeds without it)
+    const initrd = loadInitrd(boot_services);
+
     // Get memory map and exit boot services
     // Allocate a generous buffer for the memory map
     const map_buf_size: usize = 64 * 1024;
@@ -71,6 +77,51 @@ pub fn init() InitError!BootInfo {
             .slice = memory_map,
             .buffer = aligned_buf,
         },
+        .initrd_base = initrd.base,
+        .initrd_size = initrd.size,
+    };
+}
+
+const InitrdResult = struct {
+    base: ?[*]const u8,
+    size: usize,
+};
+
+/// Try to load \EFI\BOOT\INITRD from the ESP. Returns null base if not found.
+fn loadInitrd(boot_services: *uefi.tables.BootServices) InitrdResult {
+    const none = InitrdResult{ .base = null, .size = 0 };
+
+    // Locate Simple File System protocol
+    const sfs = (boot_services.locateProtocol(uefi.protocol.SimpleFileSystem, null) catch
+        return none) orelse return none;
+
+    // Open root volume
+    const root = sfs.openVolume() catch return none;
+
+    // Open \EFI\BOOT\INITRD
+    const file = root.open(L("\\EFI\\BOOT\\INITRD"), .read, .{}) catch return none;
+
+    // Get file size
+    const info_buf_size = file.getInfoSize(.file) catch return none;
+    const info_buf = boot_services.allocatePool(.loader_data, info_buf_size) catch return none;
+    const aligned_info: []align(@alignOf(uefi.protocol.File.Info.File)) u8 = @alignCast(info_buf);
+    const file_info = file.getInfo(.file, aligned_info) catch return none;
+    const file_size: usize = @intCast(file_info.file_size);
+
+    if (file_size == 0) return none;
+
+    // Allocate buffer for file contents (persists after ExitBootServices)
+    const data_buf = boot_services.allocatePool(.loader_data, file_size) catch return none;
+
+    // Read the file
+    const bytes_read = file.read(data_buf) catch return none;
+    if (bytes_read != file_size) return none;
+
+    file.close() catch {};
+
+    return InitrdResult{
+        .base = @ptrCast(data_buf.ptr),
+        .size = file_size,
     };
 }
 

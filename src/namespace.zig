@@ -144,6 +144,8 @@ fn isPrefix(prefix: []const u8, path: []const u8) bool {
     // The prefix must end at a path boundary
     if (prefix.len == path.len) return true;
     if (prefix.len == 0) return true;
+    // "/" is a prefix of everything starting with "/"
+    if (prefix[prefix.len - 1] == '/') return true;
     return path[prefix.len] == '/';
 }
 

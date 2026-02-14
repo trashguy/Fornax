@@ -33,8 +33,11 @@ fi
 for cmd in dd mkfs.fat mmd mcopy; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "Error: '$cmd' not found."
-        echo "Install with: brew install mtools dosfstools  (macOS)"
-        echo "Or on Linux: apt install mtools dosfstools"
+        case "$(uname -s)" in
+            Darwin) echo "Install with: brew install mtools dosfstools" ;;
+            Linux)  echo "Install with: pacman -S mtools dosfstools  (Arch) / apt install mtools dosfstools  (Debian)" ;;
+            *)      echo "Install mtools and dosfstools for your platform" ;;
+        esac
         exit 1
     fi
 done

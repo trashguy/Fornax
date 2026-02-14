@@ -96,12 +96,16 @@ pub const Channel = struct {
     state: ChannelState,
     server: ChannelEnd,
     client: ChannelEnd,
+    /// Kernel-backed data: if non-null, reads are served directly from this
+    /// buffer (no IPC message passing). Used for initrd file server.
+    kernel_data: ?[]const u8,
 };
 
 var channels: [MAX_CHANNELS]Channel = [_]Channel{.{
     .state = .free,
     .server = empty_end,
     .client = empty_end,
+    .kernel_data = null,
 }} ** MAX_CHANNELS;
 
 var initialized: bool = false;
@@ -131,9 +135,28 @@ pub fn channelCreate() IpcError!struct { server: ChannelId, client: ChannelId } 
                 .state = .open,
                 .server = empty_end,
                 .client = empty_end,
+                .kernel_data = null,
             };
             const id: ChannelId = @intCast(i);
             return .{ .server = id, .client = id };
+        }
+    }
+    return error.NoFreeChannels;
+}
+
+/// Create a kernel-backed channel: reads served directly from data, no server process.
+pub fn channelCreateKernelBacked(data: []const u8) IpcError!ChannelId {
+    if (!initialized) return error.NotInitialized;
+
+    for (0..MAX_CHANNELS) |i| {
+        if (channels[i].state == .free) {
+            channels[i] = .{
+                .state = .open,
+                .server = empty_end,
+                .client = empty_end,
+                .kernel_data = data,
+            };
+            return @intCast(i);
         }
     }
     return error.NoFreeChannels;

@@ -12,7 +12,9 @@ A microkernel operating system written in Zig. Plan 9's "everything is a file" d
 
 **Run POSIX software without compromising the kernel.** The kernel speaks only Plan 9-style syscalls — no `socket()`, no `ioctl()`, no signals. Native Fornax programs are clean and simple. POSIX software runs transparently via a userspace shim: type `gcc main.c` and it just works — the ELF interpreter detects the POSIX binary and sets up a POSIX realm automatically. CLI tools get ephemeral realms (created on exec, gone on exit). Daemons like nginx get full containers with their own rootfs and resource quotas. `socket() + connect()` becomes `open("/net/tcp/clone")`. POSIX complexity lives in userspace where bugs can't crash the system.
 
-**Optional clustering.** Build with `-Dcluster=true` to enable multi-node support. Nodes discover each other via UDP gossip and import remote namespaces over 9P. Mount another machine's `/dev/` into your local tree. Schedule containers across a cluster. Disabled by default — zero overhead when you don't need it.
+**Orchestration without the orchestrator.** Kubernetes exists because Linux can't express "this service's `/db` is a TCP mount to that machine's postgres." So you need kube-proxy to fake routing with iptables, CoreDNS to fake service discovery, etcd to fake distributed state, and an API server to glue it together — ~100 binaries and a million lines of Go papering over a missing OS primitive. Fornax has the primitive: `mount("tcp!10.0.0.3!564", "/svc/db", "")`. Service discovery is `ls /svc/`. Health checks are `read /svc/web/health`. Deployment is writing a text file. The entire orchestration layer — deployment, health checks, rolling updates, routing, secrets, observability — is a handful of small file servers doing what Plan 9 showed was possible in 1992. Build with `-Dviceroy=true` to include it, or leave it off for zero overhead.
+
+**Optional clustering.** Build with `-Dcluster=true` to enable multi-node support. Nodes discover each other via UDP gossip and import remote namespaces over 9P. Mount another machine's `/dev/` into your local tree. Schedule containers across a cluster. Disabled by default — zero overhead when you don't need it. Add `-Dviceroy=true` to layer production deployment tooling on top.
 
 **One language, top to bottom.** Kernel, drivers, userspace, and build system — all Zig. Memory-safe where it matters, bare-metal where it counts.
 
@@ -73,6 +75,9 @@ zig build            # both
 
 # With clustering support
 zig build x86_64 -Dcluster=true
+
+# With deployment/orchestration tooling (implies cluster)
+zig build x86_64 -Ddeploy=true
 ```
 
 ## Running

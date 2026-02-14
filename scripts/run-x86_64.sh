@@ -8,26 +8,41 @@ echo "==> Building x86_64 UEFI kernel..."
 cd "$PROJECT_DIR"
 zig build x86_64
 
-# Find OVMF firmware
+# Detect platform and find OVMF firmware
 OVMF=""
-for candidate in \
-    /opt/homebrew/share/qemu/edk2-x86_64-code.fd \
-    /opt/homebrew/share/OVMF/OVMF_CODE.fd \
-    /usr/share/OVMF/OVMF_CODE.fd \
-    /usr/share/edk2/ovmf/OVMF_CODE.fd \
-    /usr/share/qemu/OVMF.fd \
-    /usr/share/edk2-ovmf/x64/OVMF_CODE.fd \
-    ; do
-    if [ -f "$candidate" ]; then
-        OVMF="$candidate"
-        break
-    fi
-done
+case "$(uname -s)" in
+    Darwin)
+        for candidate in \
+            /opt/homebrew/share/qemu/edk2-x86_64-code.fd \
+            /opt/homebrew/share/OVMF/OVMF_CODE.fd \
+            /usr/local/share/qemu/edk2-x86_64-code.fd \
+            /usr/local/share/OVMF/OVMF_CODE.fd \
+            ; do
+            [ -f "$candidate" ] && OVMF="$candidate" && break
+        done
+        INSTALL_HINT="Install with: brew install qemu"
+        ;;
+    Linux)
+        for candidate in \
+            /usr/share/edk2/x64/OVMF_CODE.4m.fd \
+            /usr/share/edk2/x64/OVMF.4m.fd \
+            /usr/share/edk2-ovmf/x64/OVMF_CODE.fd \
+            /usr/share/OVMF/OVMF_CODE.fd \
+            /usr/share/edk2/ovmf/OVMF_CODE.fd \
+            /usr/share/qemu/OVMF.fd \
+            ; do
+            [ -f "$candidate" ] && OVMF="$candidate" && break
+        done
+        INSTALL_HINT="Install with: pacman -S edk2-ovmf  (Arch) / apt install ovmf  (Debian) / dnf install edk2-ovmf  (Fedora)"
+        ;;
+    *)
+        INSTALL_HINT="Install OVMF/edk2 for your platform"
+        ;;
+esac
 
 if [ -z "$OVMF" ]; then
     echo "Error: Could not find OVMF firmware."
-    echo "Install with: brew install qemu  (includes OVMF on macOS)"
-    echo "Or on Linux: apt install ovmf / dnf install edk2-ovmf"
+    echo "$INSTALL_HINT"
     exit 1
 fi
 

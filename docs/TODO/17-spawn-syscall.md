@@ -1,44 +1,46 @@
-# Phase 17: spawn Syscall
+# Phase 17: spawn Syscall — DONE
 
 ## Goal
 
 Let userspace create new processes. This is the first step toward the kernel
 not needing to know what programs exist — userspace decides what to run.
 
-## Decision Points (discuss before implementing)
+## Decisions (resolved)
 
-- **fork vs spawn**: Unix uses `fork()` (clone current process, COW pages) then
-  `exec()`. Microkernels like L4/seL4 typically use `spawn()` (create new empty
-  process, load ELF into it). Fork requires copy-on-write page fault handling.
-  Spawn is simpler but less Unix-compatible. Which model fits Fornax?
-- **Who provides the ELF bytes?** Options:
-  1. Kernel reads from initrd (kernel knows about the ramdisk format)
-  2. Userspace reads bytes via IPC to a filesystem server, passes them to a
-     `spawn(ptr, len)` syscall
-  3. Kernel takes a path string, resolves it through the namespace (like Linux
-     `execve("/bin/foo", ...)`)
-- **Capability passing**: Should the parent be able to pass file descriptors /
-  channels to the child at spawn time? (Plan 9 does this via `rfork` flags)
+- **spawn (not fork)**: No COW needed. Simpler, fits the microkernel model.
+- **Buffer-based**: `spawn(elf_ptr, elf_len, fd_map_ptr, fd_map_len)` — userspace
+  passes ELF bytes directly. Path-based spawn deferred to Phase 22 when ramfs exists.
+- **FD mapping**: Parent specifies which of its fds the child inherits, and at which
+  child fd slots. Child also inherits parent's namespace.
 
-## Minimal Design (starting point for discussion)
+## Design
 
 ```zig
-// Syscall: spawn(elf_ptr, elf_len) -> pid or error
-// - Creates a new process with its own address space
-// - Loads ELF from the provided userspace buffer
-// - Child inherits parent's namespace (or a copy?)
-// - Returns child PID to parent
+// Kernel: SYS.spawn = 19
+// spawn(elf_ptr, elf_len, fd_map_ptr, fd_map_len) → child pid or error
+//
+// FdMapping = extern struct { child_fd: u32, parent_fd: u32 };
+//
+// Validates pointers are in user space, ELF <= 4MB.
+// Creates process, clones parent namespace, loads ELF, allocates stack,
+// copies FD mappings, returns child PID.
 ```
 
-## What Already Exists
+## What Was Implemented
 
-- `process.create()` — allocates PID, creates address space
-- `elf.load()` — parses ELF, maps segments into an address space
-- `supervisor.spawnServiceProcess()` — does create+load+stack setup (but from kernel)
-- The main gap: no syscall interface, no way for userspace to trigger this
+- `src/syscall.zig`: Added `spawn = 19` to SYS enum, `FdMapping` struct,
+  `sysSpawn()` with full validation and error handling
+- `src/process.zig`: Made `MAX_FDS` pub for cross-module access
+- `lib/fornax.zig`: Added `spawn = 19`, `FdMapping`, `syscall4` helper,
+  `spawn()` wrapper
+
+## Key Design Notes
+
+- ELF reading works because parent's page table is active during syscall
+- On failure after `process.create()`, child is marked `.dead` (leak cleanup is future work)
+- No wait syscall yet — parent gets child PID but can't wait for exit (Phase 19)
 
 ## Verify
 
-1. Userspace program calls `spawn()` with an ELF blob
-2. Child process runs, prints to console
-3. Parent continues executing after spawn returns
+1. `zig build x86_64` — compiles without errors
+2. QEMU test deferred — no userspace program calls spawn yet (Phase 21: init)

@@ -15,8 +15,14 @@
 | 14 | Container primitives + OCI import tool | Done |
 | 15 | PCI enumeration + virtio-net NIC driver | Done |
 | 16 | IP stack: Ethernet + ARP + IPv4 + UDP + ICMP | Done |
+| 17 | `spawn` syscall (create child process from userspace) | Done |
+| 18 | `exec` syscall (replace current process image) | Done |
+| 19 | `wait`/`exit` lifecycle (parent-child, reaping, orphan kill) | Done |
+| 20 | Initrd (FXINITRD flat namespace image, UEFI-loaded) | Done |
+| 21 | Init process (PID 1, kernel-backed /boot/, SMF-style wait) | Done |
+| 22 | Ramfs (in-memory filesystem server, userspace) | Done |
 
-## Next: Userspace Separation (Phases 17-25)
+## Next: Userspace Separation (Phases 22-25)
 
 The kernel can create processes and run ELFs, but everything is baked in at
 compile time via `@embedFile`. These phases decouple userspace from the kernel
@@ -27,12 +33,12 @@ tradeoffs to discuss before implementing.
 
 | Phase | Description | Depends On | Key Decision |
 |-------|-------------|------------|--------------|
-| 17 | `spawn` syscall (create child process from userspace) | 10 | fork vs spawn? Who provides ELF bytes? |
-| 18 | `exec` syscall (replace current process image) | 17 | Do we need this now, or defer? |
-| 19 | `wait`/`exit` lifecycle (parent-child, reaping) | 17 | Blocking vs async? Orphan policy? |
-| 20 | Initrd (ramdisk loaded by UEFI) | 17 | Format? Who parses it? |
-| 21 | Init process (PID 1, userspace service spawning) | 19, 20 | How much policy? Supervisor role? |
-| 22 | Ramfs (in-memory filesystem server) | 21, 9 | Backed by initrd? Full 9P? |
+| 17 | `spawn` syscall (create child process from userspace) | 10 | **Done** |
+| 18 | `exec` syscall (replace current process image) | 17 | **Done** |
+| 19 | `wait`/`exit` lifecycle (parent-child, reaping) | 17 | **Done** |
+| 20 | Initrd (ramdisk loaded by UEFI) | 17 | **Done** |
+| 21 | Init process (PID 1, userspace service spawning) | 19, 20 | **Done** |
+| 22 | Ramfs (in-memory filesystem server) | 21, 9 | **Done** |
 | 23 | TTY / interactive console (keyboard input) | 12, 22 | Keyboard driver? Line vs raw mode? |
 | 24 | Shell (command prompt, spawn+wait loop) | 23, 17, 19 | How minimal? Builtins? |
 | 25 | Login / getty (authentication layer) | 24 | Defer? Single-user OK for now? |
@@ -62,6 +68,44 @@ Build with: `zig build x86_64 -Dcluster=true`
 | Phase | Description | Depends On |
 |-------|-------------|------------|
 | 1000 | C/C++/Go support — freestanding C, minimal libc, musl port, POSIX realms | 17-25 |
+
+## Future: Deployment + Orchestration (3000-series, optional, `-Dviceroy=true`)
+
+Production deployment tooling — all userspace. Turns a Fornax cluster into a
+hardened service platform. No Kubernetes, no etcd, no YAML — just text manifests,
+9P namespaces, and file operations. Builds on 200-series cluster primitives.
+
+Deployment is an optional build-time feature. `-Dviceroy=true` implies `-Dcluster=true`.
+When disabled (default), none of the deployment tooling is compiled — zero overhead.
+
+Build with: `zig build x86_64 -Dviceroy=true`
+
+| Phase | Description | Depends On |
+|-------|-------------|------------|
+| 3000 | Service manifests + cmd/deploy (declarative text-based deployment) | 202 |
+| 3001 | Health checks + auto-recovery (liveness via file reads) | 3000 |
+| 3002 | Rolling updates (zero-downtime deployments) | 3000, 3001 |
+| 3003 | Service routing (namespace-based discovery + load balancing) | 3000, 3001, 201 |
+| 3004 | Secrets + config (encrypted namespace for service credentials) | 3000, 201 |
+| 3005 | Image registry (srv/registry — 9P-based container image store) | 201, 14 |
+| 3006 | Observability (structured logs + metrics via /deploy/* files) | 3000, 3001 |
+
+## Future: Graphics Stack (2000-series)
+
+From bare GPU hardware to Chrome rendering in a Fornax window.
+All drivers and servers in userspace, composited via Plan 9 namespaces,
+with POSIX realm bridging for legacy GUI apps.
+
+| Phase | Description | Depends On |
+|-------|-------------|------------|
+| 2000 | srv/gpu — modesetting + framebuffer (UEFI GOP backend) | 17 |
+| 2001 | srv/draw — 2D drawing server (Plan 9 /dev/draw) | 2000 |
+| 2002 | srv/input — input devices (/dev/mouse, /dev/kbd) | 17 |
+| 2003 | srv/wm — window manager (namespace multiplexing) | 2001, 2002 |
+| 2004 | Native GUI apps (cmd/clock, cmd/term) | 2003 |
+| 2005 | srv/gpu+ — GPU command submission (stretch, not gating) | 2000 |
+| 2006 | Wayland bridge (sommelier in POSIX realm) | 1000, 2003 |
+| 2007 | Chrome in a Fornax window | 2006 |
 
 ## Dependency Graph
 
@@ -111,6 +155,53 @@ Phase 16 (done) ─────┐
   | Phase 202: Cluster Scheduler
   |                                     |
   └─────────────────────────────────────┘
+
+
+                Phase 17 (spawn)
+              ┌──────┼──────────┐
+              v      v          v
+         Ph 1000  Ph 2000    Ph 2002
+         (POSIX   (srv/gpu)  (srv/input)
+          Realms)    |          |
+              |   Ph 2001      |
+              |   (srv/draw)   |
+              |      |         |
+              |      └────┬────┘
+              |           v
+              |        Ph 2003
+              |        (srv/wm)
+              |           |
+              |        Ph 2004
+              |        (native GUI apps)
+              |           |
+              └─────┬─────┘
+                    v
+                Ph 2006 (Wayland bridge)
+                    |
+                Ph 2007 (Chrome in realm)
+
+       Ph 2005 (GPU accel) is independent,
+       enhances performance but not required
+
+
+  Phase 202 (Cluster Scheduler)
+       |
+       v
+  Ph 3000 (Service Manifests + cmd/deploy)
+       |
+       ├──────────────────────┐
+       v                      v
+  Ph 3001 (Health Checks)  Ph 3004 (Secrets)
+       |                   Ph 3005 (Image Registry)
+       ├──────────┐
+       v          v
+  Ph 3002      Ph 3003
+  (Rolling     (Service
+   Updates)     Routing)
+       |          |
+       └────┬─────┘
+            v
+       Ph 3006 (Observability)
 ```
 
 ## Milestones
@@ -123,11 +214,19 @@ Phase 16 (done) ─────┐
 | 4 | Run a container with namespace isolation | 14 | Done |
 | 5 | Ping reply from Fornax | 15-16 | Code complete, needs QEMU test |
 | 6 | Two Fornax instances exchange UDP | 16 | Code complete, needs QEMU test |
-| 7 | Userspace spawns a child process | 17 | Not started |
-| 8 | Init process boots the system from userspace | 21 | Not started |
+| 7 | Userspace spawns a child process | 17 | Done |
+| 8 | Init process boots the system from userspace | 21 | Done |
+| 8.5 | Ramfs serves files, init creates/reads/writes via IPC | 22 | Done |
 | 9 | Interactive shell prompt | 24 | Not started |
 | 10 | TCP connection to/from Fornax | 100 | Not started |
 | 11 | Two Fornax nodes discover each other | 200 | Not started (requires `-Dcluster=true`) |
 | 12 | Mount remote node's namespace | 201 | Not started (requires `-Dcluster=true`) |
 | 13 | Schedule container across cluster | 202 | Not started (requires `-Dcluster=true`) |
 | 14 | Compile and run a C program on Fornax | 1000 | Not started |
+| 15 | Framebuffer accessible from userspace srv/gpu | 2000 | Not started |
+| 16 | Native app draws in a window | 2004 | Not started |
+| 17 | Chrome renders in a Fornax window | 2007 | Not started |
+| 18 | `deploy apply` schedules a service across cluster | 3000 | Not started |
+| 19 | Service auto-recovers after crash | 3001 | Not started |
+| 20 | Zero-downtime rolling update | 3002 | Not started |
+| 21 | `deploy top` shows live cluster overview | 3006 | Not started |

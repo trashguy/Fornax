@@ -1,4 +1,4 @@
-# Phase 22: Ramfs (In-Memory Filesystem Server)
+# Phase 22: Ramfs (In-Memory Filesystem Server) — DONE
 
 ## Goal
 
@@ -6,38 +6,42 @@ A userspace filesystem server that holds files in memory. This is the first
 "real" filesystem — programs can create, read, write, and delete files
 through the standard namespace/IPC mechanism.
 
-## Decision Points (discuss before implementing)
+## Decisions Made
 
-- **Backed by initrd or independent?** Options:
-  1. Ramfs starts empty, init populates it by copying from initrd
-  2. Ramfs IS the initrd — it wraps the initrd data and serves it read-only,
-     with a writable overlay for new files
-  3. Two separate servers: initrd server (read-only) + ramfs (read-write),
-     union-mounted
-- **Directory support**: Do we need mkdir/readdir from the start, or just flat
-  files?
-- **9P protocol**: The IPC messages already use 9P-style tags. Should ramfs
-  speak full 9P2000 internally? This would make it compatible with remote
-  namespace import later (Phase 28).
+- **Backed by initrd or independent?** Independent. Ramfs starts empty and
+  runs as a standalone userspace server (PID 1). Init communicates with it
+  via IPC to create/read/write files.
+- **Directory support**: Flat namespace from the start. Paths like `/tmp/hello.txt`
+  are supported via the namespace mount mechanism.
+- **9P protocol**: Uses the existing 9P-style IPC message tags (open, read,
+  write, create). Not full 9P2000 yet — can be extended for remote namespace
+  import in Phase 201.
 
-## Interface
+## Implementation
+
+- `srv/ramfs/main.zig` — userspace ramfs server
+  - Registers as a namespace server, listens on IPC channel
+  - Handles `create`, `open`, `read`, `write` operations
+  - Stores file data in memory
+- `cmd/init/main.zig` — init process tests ramfs
+  - Creates `/tmp/hello.txt`, writes data, reads it back
+- `tools/mkinitrd.zig` — packs ramfs + init into FXINITRD image
+- `src/initrd.zig` — kernel-side initrd parser, mounts files to `/boot/`
+- `build.zig` — builds ramfs and init as userspace ELFs, packs into initrd
+
+## Boot Sequence
 
 ```
-/              (ramfs mount point)
-├── bin/
-│   ├── init
-│   ├── sh
-│   └── hello
-├── dev/
-│   └── console → (mounted by console server)
-├── etc/
-│   └── init.conf
-└── tmp/
+Kernel boots → parses initrd → mounts /boot/ramfs, /boot/init
+  → spawns ramfs (PID 1) → spawns init (PID 2)
+  → init creates /tmp/hello.txt via IPC to ramfs
+  → init writes "hello fornax!" → reads it back → verifies → exits
 ```
 
-## Verify
+## Verified
 
-1. Ramfs serves files from memory
-2. `open("/bin/hello")` → IPC to ramfs → returns ELF bytes
-3. `write` to create new files in `/tmp`
-4. `readdir` to list directory contents
+1. Ramfs serves files from memory — **pass**
+2. `create("/tmp/hello.txt")` → IPC to ramfs → returns fd — **pass**
+3. `write` to create new files — **pass** (14 bytes written)
+4. `read` returns correct data — **pass** (28 bytes read back: "hello fornax!")
+5. Init exits cleanly with status 0 — **pass**

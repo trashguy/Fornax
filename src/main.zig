@@ -12,7 +12,22 @@ const supervisor = @import("supervisor.zig");
 const container = @import("container.zig");
 const virtio_net = @import("virtio_net.zig");
 const net = @import("net.zig");
+const initrd = @import("initrd.zig");
+const elf = @import("elf.zig");
+const mem = @import("mem.zig");
+const namespace = @import("namespace.zig");
 const panic_handler = @import("panic.zig");
+
+const paging = switch (@import("builtin").cpu.arch) {
+    .x86_64 => @import("arch/x86_64/paging.zig"),
+    else => struct {
+        pub fn mapPage(_: anytype, _: u64, _: u64, _: u64) ?void {}
+        pub const Flags = struct {
+            pub const WRITABLE: u64 = 0;
+            pub const USER: u64 = 0;
+        };
+    },
+};
 
 const cpu = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/cpu.zig"),
@@ -92,11 +107,150 @@ pub fn main() noreturn {
     // Phase 16: IP stack
     net.init();
 
-    console.puts("Kernel initialized. No userspace yet.\n");
+    // Phase 20: Initrd
+    _ = initrd.init(boot_info.initrd_base, boot_info.initrd_size);
 
-    // Start the scheduler — with no processes spawned, this will
-    // print "All processes exited" and halt.
+    // Phase 21: Mount initrd files at /boot/ and spawn init
+    initrd.mountFiles();
+    spawnRamfs();
+    spawnInit();
+
+    console.puts("Kernel initialized.\n");
+
+    // Start the scheduler — runs init (PID 1) if spawned, else halts.
     process.scheduleNext();
+}
+
+/// Spawn ramfs server from the initrd. Creates a channel mounted at "/" in the
+/// root namespace. Ramfs serves the root filesystem via IPC.
+fn spawnRamfs() void {
+    const ramfs_elf = initrd.findFile("ramfs") orelse {
+        console.puts("No ramfs in initrd — running without root filesystem.\n");
+        return;
+    };
+
+    const proc = process.create() orelse {
+        console.puts("Failed to create ramfs process!\n");
+        return;
+    };
+
+    // Load ELF into ramfs's address space
+    const load_result = elf.load(proc.pml4.?, ramfs_elf) catch {
+        console.puts("Failed to load ramfs ELF!\n");
+        proc.state = .dead;
+        return;
+    };
+
+    proc.user_rip = load_result.entry_point;
+    proc.brk = load_result.brk;
+
+    // Allocate user stack
+    for (0..process.USER_STACK_PAGES) |i| {
+        const page = pmm.allocPage() orelse {
+            console.puts("Failed to allocate ramfs stack!\n");
+            proc.state = .dead;
+            return;
+        };
+        const ptr: [*]u8 = @ptrFromInt(page);
+        @memset(ptr[0..mem.PAGE_SIZE], 0);
+        const vaddr = mem.USER_STACK_TOP - (process.USER_STACK_PAGES - i) * mem.PAGE_SIZE;
+        paging.mapPage(proc.pml4.?, vaddr, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
+            console.puts("Failed to map ramfs stack!\n");
+            proc.state = .dead;
+            return;
+        };
+    }
+    proc.user_rsp = mem.USER_STACK_TOP;
+
+    // Create IPC channel for ramfs
+    const chan = ipc.channelCreate() catch {
+        console.puts("Failed to create ramfs channel!\n");
+        proc.state = .dead;
+        return;
+    };
+
+    // Server end as fd 3
+    proc.setFd(3, chan.server, true);
+
+    // Mount client end at "/" in the root namespace
+    const root_ns = namespace.getRootNamespace();
+    root_ns.mount("/", chan.client, .{ .replace = true }) catch {
+        console.puts("Failed to mount ramfs at /!\n");
+        proc.state = .dead;
+        return;
+    };
+
+    // Ramfs has no parent (kernel-spawned)
+    proc.parent_pid = null;
+    proc.ns = root_ns.clone();
+
+    serial.puts("[ramfs: pid=");
+    serial.putDec(proc.pid);
+    serial.puts(" entry=0x");
+    serial.putHex(load_result.entry_point);
+    serial.puts("]\n");
+
+    console.puts("Spawned ramfs (PID ");
+    console.putDec(proc.pid);
+    console.puts(")\n");
+}
+
+/// Spawn init (PID 1) from the initrd. Init inherits the root namespace
+/// with /boot/ mounts, so it can open("/boot/<program>") + read + spawn.
+fn spawnInit() void {
+    const init_elf = initrd.findFile("init") orelse {
+        console.puts("No init in initrd — running without userspace.\n");
+        return;
+    };
+
+    const proc = process.create() orelse {
+        console.puts("Failed to create init process!\n");
+        return;
+    };
+
+    // Load ELF into init's address space
+    const load_result = elf.load(proc.pml4.?, init_elf) catch {
+        console.puts("Failed to load init ELF!\n");
+        proc.state = .dead;
+        return;
+    };
+
+    proc.user_rip = load_result.entry_point;
+    proc.brk = load_result.brk;
+
+    // Allocate user stack
+    for (0..process.USER_STACK_PAGES) |i| {
+        const page = pmm.allocPage() orelse {
+            console.puts("Failed to allocate init stack!\n");
+            proc.state = .dead;
+            return;
+        };
+        const ptr: [*]u8 = @ptrFromInt(page);
+        @memset(ptr[0..mem.PAGE_SIZE], 0);
+        const vaddr = mem.USER_STACK_TOP - (process.USER_STACK_PAGES - i) * mem.PAGE_SIZE;
+        paging.mapPage(proc.pml4.?, vaddr, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
+            console.puts("Failed to map init stack!\n");
+            proc.state = .dead;
+            return;
+        };
+    }
+    proc.user_rsp = mem.USER_STACK_TOP;
+
+    // Init has no parent (kernel-spawned PID 1)
+    proc.parent_pid = null;
+
+    // Init inherits root namespace (already has /boot/ mounts)
+    proc.ns = namespace.getRootNamespace().clone();
+
+    serial.puts("[init: pid=");
+    serial.putDec(proc.pid);
+    serial.puts(" entry=0x");
+    serial.putHex(load_result.entry_point);
+    serial.puts("]\n");
+
+    console.puts("Spawned init (PID ");
+    console.putDec(proc.pid);
+    console.puts(")\n");
 }
 
 fn halt() noreturn {
