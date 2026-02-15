@@ -5,6 +5,10 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const cluster = b.option(bool, "cluster", "Enable clustering support (gossip discovery, remote namespaces, scheduler)") orelse false;
 
+    // Userspace always uses ReleaseSafe: keeps bounds/overflow checks while
+    // producing small stack frames. Debug mode overflows the 256 KB user stack.
+    const user_optimize: std.builtin.OptimizeMode = .ReleaseSafe;
+
     // ── Build options (passed to kernel as @import("build_options")) ──
     const build_options = b.addOptions();
     build_options.addOption(bool, "cluster", cluster);
@@ -32,32 +36,66 @@ pub fn build(b: *std.Build) void {
     const fornax_module = b.createModule(.{
         .root_source_file = b.path("lib/fornax.zig"),
         .target = x86_64_freestanding,
-        .optimize = optimize,
+        .optimize = user_optimize,
     });
+
+    // All userspace programs are linked at 1 GB (0x40000000) to avoid
+    // overlapping the kernel's identity-mapped code region (PDPT[0], <1 GB).
+    // User code lands in PDPT[1]'s separately deep-copied PD table,
+    // so mapPage() can't corrupt kernel code entries.
+    const user_image_base: u64 = 0x40000000;
 
     const init_exe = b.addExecutable(.{
         .name = "init",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cmd/init/main.zig"),
             .target = x86_64_freestanding,
-            .optimize = optimize,
+            .optimize = user_optimize,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
         }),
     });
+    init_exe.image_base = user_image_base;
+
+    const fsh_exe = b.addExecutable(.{
+        .name = "fsh",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/fsh/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    fsh_exe.image_base = user_image_base;
+
+    const hello_exe = b.addExecutable(.{
+        .name = "hello",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/hello/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    hello_exe.image_base = user_image_base;
 
     const ramfs_exe = b.addExecutable(.{
         .name = "ramfs",
         .root_module = b.createModule(.{
             .root_source_file = b.path("srv/ramfs/main.zig"),
             .target = x86_64_freestanding,
-            .optimize = .ReleaseSafe,
+            .optimize = user_optimize,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
         }),
     });
+    ramfs_exe.image_base = user_image_base;
 
     // ── x86_64 UEFI kernel ──────────────────────────────────────────
     const x86_64_target = b.resolveTargetQuery(.{
@@ -94,7 +132,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // ── Initrd: pack userspace programs into INITRD image ────────────
-    const x86_initrd = addInitrdStep(b, mkinitrd, "esp/EFI/BOOT", &.{ ramfs_exe, init_exe });
+    const x86_initrd = addInitrdStep(b, mkinitrd, "esp/EFI/BOOT", &.{ ramfs_exe, init_exe, fsh_exe, hello_exe });
     x86_initrd.step.dependOn(&x86_install.step); // ensure ESP dir exists
 
     // ── aarch64 UEFI kernel ─────────────────────────────────────────

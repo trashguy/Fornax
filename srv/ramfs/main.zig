@@ -36,13 +36,15 @@ const Handle = struct {
     active: bool,
 };
 
-var nodes: [MAX_NODES]Node = undefined;
+/// linksection forces large arrays into .bss so they don't bloat the ELF
+/// with debug-mode 0xAA fill patterns (~534 KB for nodes alone).
+var nodes: [MAX_NODES]Node linksection(".bss") = undefined;
 var node_count: u8 = 0; // next free index
-var handles: [MAX_HANDLES]Handle = undefined;
+var handles: [MAX_HANDLES]Handle linksection(".bss") = undefined;
 
 // IPC message buffers — file-scope to avoid stack overflow (each is 4104 bytes).
-var msg: fx.IpcMessage = undefined;
-var reply: fx.IpcMessage = undefined;
+var msg: fx.IpcMessage linksection(".bss") = undefined;
+var reply: fx.IpcMessage linksection(".bss") = undefined;
 
 fn initNodes() void {
     // .bss is zero-initialized by ELF loader; we just need to allocate the

@@ -26,6 +26,9 @@ const paging = switch (@import("builtin").cpu.arch) {
             pub const WRITABLE: u64 = 0;
             pub const USER: u64 = 0;
         };
+        pub inline fn physPtr(phys: u64) [*]u8 {
+            return @ptrFromInt(phys);
+        }
     },
 };
 
@@ -164,7 +167,7 @@ fn spawnRamfs() void {
             proc.state = .dead;
             return;
         };
-        const ptr: [*]u8 = @ptrFromInt(page);
+        const ptr: [*]u8 = paging.physPtr(page);
         @memset(ptr[0..mem.PAGE_SIZE], 0);
         const vaddr = mem.USER_STACK_TOP - (process.USER_STACK_PAGES - i) * mem.PAGE_SIZE;
         paging.mapPage(proc.pml4.?, vaddr, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
@@ -173,7 +176,7 @@ fn spawnRamfs() void {
             return;
         };
     }
-    proc.user_rsp = mem.USER_STACK_TOP;
+    proc.user_rsp = mem.USER_STACK_INIT;
 
     // Create IPC channel for ramfs
     const chan = ipc.channelCreate() catch {
@@ -195,7 +198,7 @@ fn spawnRamfs() void {
 
     // Ramfs has no parent (kernel-spawned)
     proc.parent_pid = null;
-    proc.ns = root_ns.clone();
+    root_ns.cloneInto(&proc.ns);
 
     serial.puts("[ramfs: pid=");
     serial.putDec(proc.pid);
@@ -238,7 +241,7 @@ fn spawnInit() void {
             proc.state = .dead;
             return;
         };
-        const ptr: [*]u8 = @ptrFromInt(page);
+        const ptr: [*]u8 = paging.physPtr(page);
         @memset(ptr[0..mem.PAGE_SIZE], 0);
         const vaddr = mem.USER_STACK_TOP - (process.USER_STACK_PAGES - i) * mem.PAGE_SIZE;
         paging.mapPage(proc.pml4.?, vaddr, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
@@ -247,13 +250,13 @@ fn spawnInit() void {
             return;
         };
     }
-    proc.user_rsp = mem.USER_STACK_TOP;
+    proc.user_rsp = mem.USER_STACK_INIT;
 
     // Init has no parent (kernel-spawned PID 1)
     proc.parent_pid = null;
 
     // Init inherits root namespace (already has /boot/ mounts)
-    proc.ns = namespace.getRootNamespace().clone();
+    namespace.getRootNamespace().cloneInto(&proc.ns);
 
     serial.puts("[init: pid=");
     serial.putDec(proc.pid);

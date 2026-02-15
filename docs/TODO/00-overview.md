@@ -21,6 +21,8 @@
 | 20 | Initrd (FXINITRD flat namespace image, UEFI-loaded) | Done |
 | 21 | Init process (PID 1, kernel-backed /boot/, SMF-style wait) | Done |
 | 22 | Ramfs (in-memory filesystem server, userspace) | Done |
+| 23 | TTY / interactive console (keyboard input) | Done |
+| 24 | Shell (fsh — Fornax shell, builtins + spawn) | Done |
 
 ## Next: Userspace Separation (Phases 22-25)
 
@@ -39,8 +41,8 @@ tradeoffs to discuss before implementing.
 | 20 | Initrd (ramdisk loaded by UEFI) | 17 | **Done** |
 | 21 | Init process (PID 1, userspace service spawning) | 19, 20 | **Done** |
 | 22 | Ramfs (in-memory filesystem server) | 21, 9 | **Done** |
-| 23 | TTY / interactive console (keyboard input) | 12, 22 | Keyboard driver? Line vs raw mode? |
-| 24 | Shell (command prompt, spawn+wait loop) | 23, 17, 19 | How minimal? Builtins? |
+| 23 | TTY / interactive console (keyboard input) | 12, 22 | **Done** |
+| 24 | Shell (command prompt, spawn+wait loop) | 23, 17, 19 | **Done** |
 | 25 | Login / getty (authentication layer) | 24 | Defer? Single-user OK for now? |
 
 ## Later: Networking (100-series)
@@ -217,7 +219,7 @@ Phase 16 (done) ─────┐
 | 7 | Userspace spawns a child process | 17 | Done |
 | 8 | Init process boots the system from userspace | 21 | Done |
 | 8.5 | Ramfs serves files, init creates/reads/writes via IPC | 22 | Done |
-| 9 | Interactive shell prompt | 24 | Not started |
+| 9 | Interactive shell prompt | 24 | Done |
 | 10 | TCP connection to/from Fornax | 100 | Not started |
 | 11 | Two Fornax nodes discover each other | 200 | Not started (requires `-Dcluster=true`) |
 | 12 | Mount remote node's namespace | 201 | Not started (requires `-Dcluster=true`) |

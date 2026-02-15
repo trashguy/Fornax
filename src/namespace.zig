@@ -126,6 +126,15 @@ pub const Namespace = struct {
         new_ns.count = self.count;
         return new_ns;
     }
+
+    /// Copy this namespace into a destination pointer (no stack temporaries).
+    /// Use this instead of clone() when stack space is limited (e.g., kernel stacks).
+    pub fn cloneInto(self: *const Namespace, dest: *Namespace) void {
+        for (0..MAX_MOUNTS) |i| {
+            dest.mounts[i] = self.mounts[i];
+        }
+        dest.count = self.count;
+    }
 };
 
 fn pathEqual(a: []const u8, b: []const u8) bool {

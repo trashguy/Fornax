@@ -18,6 +18,12 @@ const paging = switch (@import("builtin").cpu.arch) {
         }
         pub fn mapPage(_: anytype, _: u64, _: u64, _: u64) ?void {}
         pub fn switchAddressSpace(_: anytype) void {}
+        pub fn isInitialized() bool {
+            return false;
+        }
+        pub inline fn physPtr(phys: u64) [*]u8 {
+            return @ptrFromInt(phys);
+        }
     },
 };
 
@@ -56,8 +62,8 @@ const syscall_entry = switch (@import("builtin").cpu.arch) {
 
 const MAX_PROCESSES = 64;
 pub const MAX_FDS = 32;
-const KERNEL_STACK_PAGES = 2; // 8 KB kernel stack per process
-pub const USER_STACK_PAGES = 16; // 64 KB user stack per process
+const KERNEL_STACK_PAGES = 4; // 8 KB kernel stack per process
+pub const USER_STACK_PAGES = 64; // 256 KB user stack per process
 
 pub const ProcessState = enum {
     free,
@@ -235,40 +241,40 @@ pub fn create() ?*Process {
     // Allocate address space
     const addr_space = paging.createAddressSpace() orelse return null;
 
-    // Allocate kernel stack
+    // Allocate kernel stack — use higher-half address so the kernel stack
+    // is immune to identity-map overwrites by user ELF mappings.
     var stack_base: u64 = 0;
     for (0..KERNEL_STACK_PAGES) |i| {
         const page = pmm.allocPage() orelse return null;
         if (i == 0) stack_base = page;
     }
+    const stack_virt = if (paging.isInitialized()) stack_base + mem.KERNEL_VIRT_BASE else stack_base;
 
     // Parent is whoever is currently running (null for kernel-spawned processes)
     const parent_pid: ?u32 = if (current) |cur| cur.pid else null;
 
-    proc.* = .{
-        .pid = next_pid,
-        .state = .ready,
-        .pml4 = addr_space,
-        .kernel_stack_top = stack_base + KERNEL_STACK_PAGES * mem.PAGE_SIZE,
-        .user_rip = 0,
-        .user_rsp = 0,
-        .user_rflags = 0x202, // IF=1, reserved bit 1
-        .syscall_ret = 0,
-        .saved_kernel_rsp = 0,
-        .fds = [_]?FdEntry{null} ** MAX_FDS,
-        .ns = namespace.getRootNamespace().clone(),
-        .brk = 0,
-        .pages_used = 0,
-        .quotas = .{},
-        .ipc_msg = ipc.Message.init(.t_open),
-        .ipc_recv_buf_ptr = 0,
-        .ipc_pending_msg = null,
-        .parent_pid = parent_pid,
-        .exit_status = 0,
-        .waiting_for_pid = null,
-        .pending_op = .none,
-        .pending_fd = 0,
-    };
+    proc.pid = next_pid;
+    proc.state = .ready;
+    proc.pml4 = addr_space;
+    proc.kernel_stack_top = stack_virt + KERNEL_STACK_PAGES * mem.PAGE_SIZE;
+    proc.user_rip = 0;
+    proc.user_rsp = 0;
+    proc.user_rflags = 0x202;
+    proc.syscall_ret = 0;
+    proc.saved_kernel_rsp = 0;
+    proc.fds = [_]?FdEntry{null} ** MAX_FDS;
+    proc.brk = 0;
+    proc.pages_used = 0;
+    proc.quotas = .{};
+    proc.ipc_recv_buf_ptr = 0;
+    proc.ipc_pending_msg = null;
+    proc.parent_pid = parent_pid;
+    proc.exit_status = 0;
+    proc.waiting_for_pid = null;
+    proc.pending_op = .none;
+    proc.pending_fd = 0;
+    namespace.getRootNamespace().cloneInto(&proc.ns);
+    proc.ipc_msg = ipc.Message.init(.t_open);
     next_pid += 1;
 
     return proc;

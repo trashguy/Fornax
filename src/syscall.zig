@@ -664,7 +664,7 @@ fn sysExec(elf_ptr: u64, elf_len: u64) u64 {
             proc.state = .dead;
             process.scheduleNext();
         };
-        const page_ptr: [*]u8 = @ptrFromInt(page);
+        const page_ptr: [*]u8 = paging.physPtr(page);
         @memset(page_ptr[0..mem.PAGE_SIZE], 0);
         const vaddr = stack_top - (process.USER_STACK_PAGES - i) * mem.PAGE_SIZE;
         paging.mapPage(new_pml4, vaddr, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
@@ -726,7 +726,6 @@ fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64) u64 {
         child.state = .dead;
         return ENOMEM;
     };
-
     child.user_rip = load_result.entry_point;
     child.brk = load_result.brk;
 
@@ -736,7 +735,7 @@ fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64) u64 {
             child.state = .dead;
             return ENOMEM;
         };
-        const ptr: [*]u8 = @ptrFromInt(page);
+        const ptr: [*]u8 = paging.physPtr(page);
         @memset(ptr[0..mem.PAGE_SIZE], 0);
         const vaddr = mem.USER_STACK_TOP - (process.USER_STACK_PAGES - i) * mem.PAGE_SIZE;
         paging.mapPage(child.pml4.?, vaddr, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
@@ -744,10 +743,10 @@ fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64) u64 {
             return ENOMEM;
         };
     }
-    child.user_rsp = mem.USER_STACK_TOP;
+    child.user_rsp = mem.USER_STACK_INIT;
 
     // Copy namespace from parent (Plan 9: children inherit namespace)
-    child.ns = parent.ns.clone();
+    parent.ns.cloneInto(&child.ns);
 
     // Copy fd mappings from parent to child
     if (fd_map_len > 0) {

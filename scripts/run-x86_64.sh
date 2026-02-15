@@ -4,9 +4,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-echo "==> Building x86_64 UEFI kernel..."
 cd "$PROJECT_DIR"
-zig build x86_64
+
+# Build if not already built (use `make run` or `make run-release` to build+run).
+if [ ! -f "$PROJECT_DIR/zig-out/esp/EFI/BOOT/BOOTX64.EFI" ]; then
+    echo "==> Building x86_64 UEFI kernel..."
+    zig build x86_64 "$@"
+fi
 
 # Detect platform and find OVMF firmware
 OVMF=""

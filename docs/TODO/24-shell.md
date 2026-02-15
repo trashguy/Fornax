@@ -1,40 +1,31 @@
-# Phase 24: Shell
+# Phase 24: Shell — DONE
 
-## Goal
+## What Was Implemented
 
-A minimal interactive shell — the first program where a user types commands
-and things happen. This is the "it feels like an OS" milestone.
+**fsh** — Fornax shell, an rc-inspired interactive shell.
 
-## Decision Points (discuss before implementing)
+### cmd/fsh/main.zig
+- Prompt loop: prints `fornax% `, reads line from stdin, tokenizes on whitespace
+- Builtins: `exit`, `echo`, `clear`, `help`
+- External commands: looks up `/boot/<name>`, loads ELF into 2MB buffer, spawns child, waits
+- Error handling: "not found" for missing commands, "spawn failed" for spawn errors
 
-- **How minimal?** Options:
-  1. Bare minimum: read line, split on spaces, spawn program, wait. No pipes,
-     no redirection, no variables.
-  2. Basic: above + simple PATH lookup, cd, exit builtins
-  3. Plan 9 rc-style: slightly richer, `$var`, `; &&`, but still simple
-- **Program lookup**: Where does the shell find executables? Hardcoded `/bin`?
-  A PATH variable? Search the namespace?
-- **Builtins**: What's built into the shell vs external commands?
-  - `cd` must be builtin (changes shell's own namespace)
-  - `exit` must be builtin
-  - `ls`, `cat`, `echo` — could be external programs or builtins. External is
-    more correct but requires those programs to exist.
+### cmd/hello/main.zig
+- Simple test program: prints "Hello from Fornax!" and exits
 
-## Minimal Design
+### cmd/init/main.zig (modified)
+- Replaced echo loop with spawn-fsh-and-wait loop
+- Loads /boot/fsh ELF, spawns, waits, respawns on exit
 
-```
-shell loop:
-  1. Print prompt ("fornax% ")
-  2. Read line from /dev/console
-  3. Parse: command = first word, args = rest
-  4. If builtin (cd, exit): handle directly
-  5. Else: spawn("/bin/{command}"), wait for it to exit
-  6. Goto 1
-```
+### build.zig (modified)
+- Added fsh_exe and hello_exe build targets
+- Included both in x86_64 initrd
 
-## Verify
-
-1. Shell prints prompt, waits for input
-2. Type "hello" → shell spawns /bin/hello, hello runs, shell prompts again
-3. Type "exit" → shell exits
-4. This is Milestone 6: interactive OS
+## Verification
+- `zig build x86_64` compiles cleanly
+- Boot → init spawns fsh → `fornax%` prompt
+- `hello` → "Hello from Fornax!" → prompt returns
+- `echo foo bar` → "foo bar"
+- `help` → lists builtins and /boot/ programs
+- `nonexistent` → "fsh: nonexistent: not found"
+- `exit` → fsh exits, init respawns it

@@ -16,6 +16,9 @@ const paging = switch (@import("builtin").cpu.arch) {
             pub const USER: u64 = 4;
         };
         pub fn mapPage(_: anytype, _: u64, _: u64, _: u64) ?void {}
+        pub inline fn physPtr(phys: u64) [*]u8 {
+            return @ptrFromInt(phys);
+        }
     },
 };
 
@@ -131,8 +134,8 @@ fn loadSegment(page_table: *paging.PageTable, elf_data: []const u8, phdr: *align
     while (vaddr < vaddr_end) : (vaddr += mem.PAGE_SIZE) {
         const phys = pmm.allocPage() orelse return null;
 
-        // Zero the page first
-        const page_ptr: [*]u8 = @ptrFromInt(phys);
+        // Zero the page first (use higher-half to avoid identity-map conflicts)
+        const page_ptr: [*]u8 = paging.physPtr(phys);
         @memset(page_ptr[0..mem.PAGE_SIZE], 0);
 
         // Copy data from ELF file if this page overlaps the file data region

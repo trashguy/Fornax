@@ -5,7 +5,9 @@
 ///   - Higher-half map at 0xFFFF_8000_0000_0000 with 2MB huge pages
 ///   - After switch, kernel runs in higher-half; identity map kept temporarily
 ///
-/// Later: createAddressSpace() for per-process page tables.
+/// After init(), all page table access goes through the higher-half mapping
+/// so that user-space ELF mappings (which overwrite identity-map entries)
+/// cannot corrupt the kernel's view of physical memory during syscalls.
 const console = @import("../../console.zig");
 const serial = @import("../../serial.zig");
 const pmm = @import("../../pmm.zig");
@@ -46,6 +48,20 @@ var initialized: bool = false;
 
 pub fn isInitialized() bool {
     return initialized;
+}
+
+/// Convert a physical address to a PageTable pointer.
+/// Before paging init: uses identity map (UEFI page tables).
+/// After paging init: uses higher-half mapping (safe during syscalls,
+/// immune to user-space identity-map overwrites).
+inline fn tablePtr(phys: u64) *PageTable {
+    return @ptrFromInt(if (initialized) phys +% mem.KERNEL_VIRT_BASE else phys);
+}
+
+/// Convert a physical address to a byte pointer (for zeroing/copying pages).
+/// Same logic as tablePtr but returns [*]u8.
+pub inline fn physPtr(phys: u64) [*]u8 {
+    return @ptrFromInt(if (initialized) phys +% mem.KERNEL_VIRT_BASE else phys);
 }
 
 pub fn init() void {
@@ -127,7 +143,7 @@ fn getOrAllocTable(table: *PageTable, index: u64, propagate_flags: u64) ?*PageTa
             const base_flags = (table.entries[idx] & 0xFFF) & ~Flags.HUGE_PAGE;
 
             const pt_page = pmm.allocPage() orelse return null;
-            const pt: *PageTable = @ptrFromInt(pt_page);
+            const pt: *PageTable = tablePtr(pt_page);
             for (0..512) |i| {
                 pt.entries[i] = (huge_phys + i * PAGE_SIZE) | base_flags;
             }
@@ -137,12 +153,12 @@ fn getOrAllocTable(table: *PageTable, index: u64, propagate_flags: u64) ?*PageTa
         }
         // Regular table entry — extract physical address
         const addr = table.entries[idx] & ADDR_MASK;
-        return @ptrFromInt(addr);
+        return tablePtr(addr);
     }
 
     // Allocate a new page table
     const page = pmm.allocPage() orelse return null;
-    const new_table: *PageTable = @ptrFromInt(page);
+    const new_table: *PageTable = tablePtr(page);
     new_table.zero();
     table.entries[idx] = page | Flags.PRESENT | Flags.WRITABLE | propagate_flags;
     return new_table;
@@ -156,10 +172,10 @@ fn getOrAllocTable(table: *PageTable, index: u64, propagate_flags: u64) ?*PageTa
 /// corrupting the kernel's identity map.
 pub fn createAddressSpace() ?*PageTable {
     const page = pmm.allocPage() orelse return null;
-    const new_pml4: *PageTable = @ptrFromInt(page);
+    const new_pml4: *PageTable = tablePtr(page);
     new_pml4.zero();
 
-    const kernel_pml4: *PageTable = @ptrFromInt(kernel_pml4_phys);
+    const kernel_pml4: *PageTable = tablePtr(kernel_pml4_phys);
 
     // Copy kernel half (PML4 entries 256-511) — shallow copy is fine,
     // kernel mappings are never modified per-process.
@@ -173,9 +189,9 @@ pub fn createAddressSpace() ?*PageTable {
     // mapPage() can split 2MB huge pages into 4KB entries without corrupting
     // the kernel's shared tables.
     if (kernel_pml4.entries[0] & Flags.PRESENT != 0) {
-        const kernel_pdpt: *PageTable = @ptrFromInt(kernel_pml4.entries[0] & ADDR_MASK);
+        const kernel_pdpt: *PageTable = tablePtr(kernel_pml4.entries[0] & ADDR_MASK);
         const new_pdpt_page = pmm.allocPage() orelse return null;
-        const new_pdpt: *PageTable = @ptrFromInt(new_pdpt_page);
+        const new_pdpt: *PageTable = tablePtr(new_pdpt_page);
         new_pdpt.zero();
 
         for (0..512) |i| {
@@ -186,9 +202,9 @@ pub fn createAddressSpace() ?*PageTable {
                 new_pdpt.entries[i] = kernel_pdpt.entries[i];
             } else {
                 // Points to a PD — allocate a private copy
-                const kernel_pd: *PageTable = @ptrFromInt(kernel_pdpt.entries[i] & ADDR_MASK);
+                const kernel_pd: *PageTable = tablePtr(kernel_pdpt.entries[i] & ADDR_MASK);
                 const new_pd_page = pmm.allocPage() orelse return null;
-                const new_pd: *PageTable = @ptrFromInt(new_pd_page);
+                const new_pd: *PageTable = tablePtr(new_pd_page);
                 new_pd.* = kernel_pd.*; // Copy all entries (including 2MB huge pages)
                 new_pdpt.entries[i] = new_pd_page | (kernel_pdpt.entries[i] & 0xFFF);
             }
@@ -224,13 +240,13 @@ pub fn unmapPage(pml4: *PageTable, virt: u64) void {
     const pt_idx: usize = @intCast((virt >> 12) & 0x1FF);
 
     if (pml4.entries[pml4_idx] & Flags.PRESENT == 0) return;
-    const pdpt: *PageTable = @ptrFromInt(pml4.entries[pml4_idx] & 0x000F_FFFF_FFFF_F000);
+    const pdpt: *PageTable = tablePtr(pml4.entries[pml4_idx] & ADDR_MASK);
 
     if (pdpt.entries[pdpt_idx] & Flags.PRESENT == 0) return;
-    const pd: *PageTable = @ptrFromInt(pdpt.entries[pdpt_idx] & 0x000F_FFFF_FFFF_F000);
+    const pd: *PageTable = tablePtr(pdpt.entries[pdpt_idx] & ADDR_MASK);
 
     if (pd.entries[pd_idx] & Flags.PRESENT == 0) return;
-    const pt: *PageTable = @ptrFromInt(pd.entries[pd_idx] & 0x000F_FFFF_FFFF_F000);
+    const pt: *PageTable = tablePtr(pd.entries[pd_idx] & ADDR_MASK);
 
     pt.entries[pt_idx] = 0;
 
@@ -243,7 +259,9 @@ pub fn unmapPage(pml4: *PageTable, virt: u64) void {
 
 /// Switch to a different address space.
 pub fn switchAddressSpace(pml4: *PageTable) void {
-    const phys = @intFromPtr(pml4);
+    // pml4 may be a higher-half pointer — convert back to physical for CR3.
+    const virt = @intFromPtr(pml4);
+    const phys = if (virt >= mem.KERNEL_VIRT_BASE) virt - mem.KERNEL_VIRT_BASE else virt;
     asm volatile ("mov %[cr3], %%cr3"
         :
         : [cr3] "r" (phys),
@@ -252,5 +270,5 @@ pub fn switchAddressSpace(pml4: *PageTable) void {
 
 /// Get the physical address of the kernel PML4.
 pub fn getKernelPml4() *PageTable {
-    return @ptrFromInt(kernel_pml4_phys);
+    return tablePtr(kernel_pml4_phys);
 }

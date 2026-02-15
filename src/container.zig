@@ -28,13 +28,16 @@ const paging = switch (@import("builtin").cpu.arch) {
             pub const USER: u64 = 4;
         };
         pub fn mapPage(_: anytype, _: u64, _: u64, _: u64) ?void {}
+        pub inline fn physPtr(phys: u64) [*]u8 {
+            return @ptrFromInt(phys);
+        }
     },
 };
 
 const MAX_CONTAINERS = 16;
 const MAX_NAME = 64;
 const MAX_PATH = 256;
-const USER_STACK_PAGES = 2;
+const USER_STACK_PAGES = process.USER_STACK_PAGES;
 
 pub const Container = struct {
     /// Human-readable container name.
@@ -141,7 +144,7 @@ pub fn start(ct: *Container, init_elf: []const u8, console_channel_id: ?ipc.Chan
             proc.state = .dead;
             return null;
         };
-        const ptr: [*]u8 = @ptrFromInt(page);
+        const ptr: [*]u8 = paging.physPtr(page);
         @memset(ptr[0..mem.PAGE_SIZE], 0);
 
         const virt = mem.USER_STACK_TOP - (USER_STACK_PAGES - i) * mem.PAGE_SIZE;
@@ -151,7 +154,7 @@ pub fn start(ct: *Container, init_elf: []const u8, console_channel_id: ?ipc.Chan
             return null;
         };
     }
-    proc.user_rsp = mem.USER_STACK_TOP;
+    proc.user_rsp = mem.USER_STACK_INIT;
 
     ct.init_pid = proc.pid;
     ct.state = .running;

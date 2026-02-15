@@ -65,6 +65,20 @@ pub fn registerIrqHandler(irq: u8, handler: IrqHandler) bool {
     return false;
 }
 
+/// Output a u64 as hex using only serial.putChar and arithmetic (no memory reads).
+/// Avoids both serial.putHex (function call) and string literals (.rodata access).
+inline fn inlineHex(val: u64) void {
+    serial.putChar('0');
+    serial.putChar('x');
+    inline for (0..16) |i| {
+        const shift: u6 = @intCast(60 - i * 4);
+        const nibble: u4 = @intCast((val >> shift) & 0xF);
+        const n: u8 = nibble;
+        const c: u8 = if (n < 10) '0' + n else 'A' - 10 + n;
+        serial.putChar(c);
+    }
+}
+
 pub fn handleException(frame: *idt.ExceptionFrame) void {
     // IRQ dispatch (vectors 32-47)
     if (frame.vector >= 32 and frame.vector < 48) {
@@ -136,53 +150,32 @@ pub fn handleException(frame: *idt.ExceptionFrame) void {
         }
     } else {
         // Kernel-mode fault — always fatal
-        serial.puts("\n--- KERNEL EXCEPTION (serial) ---\n");
-        serial.puts("Vector: ");
-        serial.putDec(frame.vector);
-        serial.puts(" Err: ");
-        serial.putHex(frame.error_code);
-        serial.puts(" RIP: ");
-        serial.putHex(frame.rip);
-        serial.puts(" CS: ");
-        serial.putHex(frame.cs);
-        serial.puts(" RFLAGS: ");
-        serial.putHex(frame.rflags);
-        serial.puts(" RSP: ");
-        serial.putHex(frame.rsp);
-        serial.puts(" SS: ");
-        serial.putHex(frame.ss);
-        serial.puts("\n");
-        console.puts("\n--- KERNEL EXCEPTION ---\n");
-
-        if (frame.vector < 32) {
-            console.puts("Type: ");
-            console.puts(exception_names[frame.vector]);
-            console.puts(" (#");
-            console.putDec(frame.vector);
-            console.puts(")\n");
-        } else {
-            console.puts("Vector: ");
-            console.putDec(frame.vector);
-            console.puts("\n");
-        }
-
-        console.puts("Error code: ");
-        console.putHex(frame.error_code);
-        console.puts("\nRIP: ");
-        console.putHex(frame.rip);
-        console.puts("\nRSP: ");
-        console.putHex(frame.rsp);
-        console.puts("\nRFLAGS: ");
-        console.putHex(frame.rflags);
-        console.puts("\n");
-
+        // Print RIP first (most critical), then vector, error, rsp.
+        // Pure putChar + arithmetic only — no function calls, no .rodata.
+        serial.putChar('\n');
+        serial.putChar('r');
+        serial.putChar('=');
+        inlineHex(frame.rip);
+        serial.putChar(' ');
+        serial.putChar('v');
+        serial.putChar('=');
+        inlineHex(frame.vector);
+        serial.putChar(' ');
+        serial.putChar('e');
+        serial.putChar('=');
+        inlineHex(frame.error_code);
+        serial.putChar(' ');
+        serial.putChar('s');
+        serial.putChar('=');
+        inlineHex(frame.rsp);
         if (frame.vector == 14) {
-            console.puts("CR2: ");
-            console.putHex(cpu.readCr2());
-            console.puts("\n");
+            serial.putChar(' ');
+            serial.putChar('c');
+            serial.putChar('=');
+            inlineHex(cpu.readCr2());
         }
-
-        console.puts("--- Halting ---\n");
+        serial.putChar('\r');
+        serial.putChar('\n');
         cpu.halt();
     }
 }

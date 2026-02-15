@@ -15,6 +15,11 @@ pub const KERNEL_VIRT_BASE: u64 = 0xFFFF_8000_0000_0000;
 /// User stack top (grows down).
 pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFF0_0000;
 
+/// Initial user RSP: 8 bytes below USER_STACK_TOP to satisfy the
+/// x86_64 ABI requirement that RSP ≡ 8 (mod 16) at function entry
+/// (as if a `call` instruction pushed a return address).
+pub const USER_STACK_INIT: u64 = USER_STACK_TOP - 8;
+
 /// How much physical memory to map in the kernel half (4 GB).
 pub const KERNEL_MAP_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 
