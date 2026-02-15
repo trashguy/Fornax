@@ -1,0 +1,221 @@
+/// Fornax userspace syscall library.
+///
+/// Thin wrappers around the Fornax syscall ABI.
+/// Convention: RAX=nr, RDI=a0, RSI=a1, RDX=a2, R10=a3, R8=a4
+/// Returns: RAX
+pub const SYS = enum(u64) {
+    open = 0,
+    create = 1,
+    read = 2,
+    write = 3,
+    close = 4,
+    stat = 5,
+    seek = 6,
+    remove = 7,
+    mount = 8,
+    bind = 9,
+    unmount = 10,
+    rfork = 11,
+    exec = 12,
+    wait = 13,
+    exit_sys = 14,
+    pipe = 15,
+    brk = 16,
+    ipc_recv = 17,
+    ipc_reply = 18,
+    spawn = 19,
+};
+
+const ipc = @import("ipc.zig");
+pub const IpcMessage = ipc.IpcMessage;
+pub const DirEntry = ipc.DirEntry;
+pub const Stat = ipc.Stat;
+pub const FdMapping = ipc.FdMapping;
+pub const T_OPEN = ipc.T_OPEN;
+pub const T_READ = ipc.T_READ;
+pub const T_WRITE = ipc.T_WRITE;
+pub const T_CLOSE = ipc.T_CLOSE;
+pub const T_STAT = ipc.T_STAT;
+pub const T_CTL = ipc.T_CTL;
+pub const T_CREATE = ipc.T_CREATE;
+pub const T_REMOVE = ipc.T_REMOVE;
+pub const R_OK = ipc.R_OK;
+pub const R_ERROR = ipc.R_ERROR;
+
+/// User argv layout base address (one page below stack top).
+pub const ARGV_BASE: u64 = 0x0000_7FFF_FFEF_F000;
+
+pub fn write(fd: i32, buf: []const u8) usize {
+    return syscall3(.write, @bitCast(@as(i64, fd)), @intFromPtr(buf.ptr), buf.len);
+}
+
+pub fn exit(status: u8) noreturn {
+    _ = syscall1(.exit_sys, status);
+    unreachable;
+}
+
+pub fn wait(pid: u32) u64 {
+    return syscall1(.wait, pid);
+}
+
+pub fn open(path: []const u8) i32 {
+    const result = syscall2(.open, @intFromPtr(path.ptr), path.len);
+    return @bitCast(@as(u32, @truncate(result)));
+}
+
+pub fn read(fd: i32, buf: []u8) isize {
+    const result = syscall3(.read, @bitCast(@as(i64, fd)), @intFromPtr(buf.ptr), buf.len);
+    return @bitCast(@as(usize, result));
+}
+
+pub fn close(fd: i32) i32 {
+    const result = syscall1(.close, @bitCast(@as(i64, fd)));
+    return @bitCast(@as(u32, @truncate(result)));
+}
+
+pub fn create(path: []const u8, flags: u32) i32 {
+    const result = syscall3(.create, @intFromPtr(path.ptr), path.len, flags);
+    return @bitCast(@as(u32, @truncate(result)));
+}
+
+pub fn mkdir(path: []const u8) i32 {
+    return create(path, 1);
+}
+
+pub fn stat(fd: i32, buf: *Stat) i32 {
+    const result = syscall2(.stat, @bitCast(@as(i64, fd)), @intFromPtr(buf));
+    return @bitCast(@as(u32, @truncate(result)));
+}
+
+pub fn remove(path: []const u8) i32 {
+    const result = syscall2(.remove, @intFromPtr(path.ptr), path.len);
+    return @bitCast(@as(u32, @truncate(result)));
+}
+
+pub fn brk(new_brk: u64) u64 {
+    return syscall1(.brk, new_brk);
+}
+
+pub fn ipc_recv(fd: i32, msg: *IpcMessage) i32 {
+    const result = syscall2(.ipc_recv, @bitCast(@as(i64, fd)), @intFromPtr(msg));
+    return @bitCast(@as(u32, @truncate(result)));
+}
+
+pub fn ipc_reply(fd: i32, msg: *IpcMessage) i32 {
+    const result = syscall2(.ipc_reply, @bitCast(@as(i64, fd)), @intFromPtr(msg));
+    return @bitCast(@as(u32, @truncate(result)));
+}
+
+pub fn spawn(elf_data: []const u8, fd_map: []const FdMapping, argv_block: ?[]const u8) i32 {
+    const argv_ptr: u64 = if (argv_block) |blk| @intFromPtr(blk.ptr) else 0;
+    const result = syscall5(.spawn, @intFromPtr(elf_data.ptr), elf_data.len, @intFromPtr(fd_map.ptr), fd_map.len, argv_ptr);
+    return @bitCast(@as(u32, @truncate(result)));
+}
+
+pub fn exec(elf_data: []const u8) i32 {
+    const result = syscall2(.exec, @intFromPtr(elf_data.ptr), elf_data.len);
+    return @bitCast(@as(u32, @truncate(result)));
+}
+
+pub fn pipe() struct { read_fd: i32, write_fd: i32, err: i32 } {
+    var fds: [2]u32 = undefined;
+    const result = syscall1(.pipe, @intFromPtr(&fds));
+    if (result != 0) return .{ .read_fd = -1, .write_fd = -1, .err = @bitCast(@as(u32, @truncate(result))) };
+    return .{ .read_fd = @bitCast(fds[0]), .write_fd = @bitCast(fds[1]), .err = 0 };
+}
+
+/// Build a serialized argv block: [argc: u32][total_len: u32][str0\0str1\0...]
+pub fn buildArgvBlock(buf: []u8, args: []const []const u8) ?[]const u8 {
+    if (args.len == 0) return null;
+    if (buf.len < 8) return null;
+
+    // Write argc
+    const argc: u32 = @intCast(args.len);
+    buf[0] = @truncate(argc);
+    buf[1] = @truncate(argc >> 8);
+    buf[2] = @truncate(argc >> 16);
+    buf[3] = @truncate(argc >> 24);
+
+    // Write strings with null terminators
+    var pos: usize = 8;
+    for (args) |arg| {
+        if (pos + arg.len + 1 > buf.len) return null;
+        @memcpy(buf[pos..][0..arg.len], arg);
+        buf[pos + arg.len] = 0;
+        pos += arg.len + 1;
+    }
+
+    // Write total string data length
+    const total: u32 = @intCast(pos - 8);
+    buf[4] = @truncate(total);
+    buf[5] = @truncate(total >> 8);
+    buf[6] = @truncate(total >> 16);
+    buf[7] = @truncate(total >> 24);
+
+    return buf[0..pos];
+}
+
+/// Get argc from the argv layout at ARGV_BASE.
+pub fn getArgc() usize {
+    const ptr: *const u64 = @ptrFromInt(ARGV_BASE);
+    return @intCast(ptr.*);
+}
+
+/// Get the argv pointer array from the argv layout at ARGV_BASE.
+pub fn getArgs() []const [*:0]const u8 {
+    const argc = getArgc();
+    if (argc == 0) return &.{};
+    const argv_ptr: [*]const [*:0]const u8 = @ptrFromInt(ARGV_BASE + 8);
+    return argv_ptr[0..argc];
+}
+
+fn syscall1(nr: SYS, a0: u64) u64 {
+    return asm volatile ("syscall"
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (@intFromEnum(nr)),
+          [a0] "{rdi}" (a0),
+        : .{ .rcx = true, .r11 = true, .memory = true });
+}
+
+fn syscall2(nr: SYS, a0: u64, a1: u64) u64 {
+    return asm volatile ("syscall"
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (@intFromEnum(nr)),
+          [a0] "{rdi}" (a0),
+          [a1] "{rsi}" (a1),
+        : .{ .rcx = true, .r11 = true, .memory = true });
+}
+
+fn syscall3(nr: SYS, a0: u64, a1: u64, a2: u64) u64 {
+    return asm volatile ("syscall"
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (@intFromEnum(nr)),
+          [a0] "{rdi}" (a0),
+          [a1] "{rsi}" (a1),
+          [a2] "{rdx}" (a2),
+        : .{ .rcx = true, .r11 = true, .memory = true });
+}
+
+fn syscall4(nr: SYS, a0: u64, a1: u64, a2: u64, a3: u64) u64 {
+    return asm volatile ("syscall"
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (@intFromEnum(nr)),
+          [a0] "{rdi}" (a0),
+          [a1] "{rsi}" (a1),
+          [a2] "{rdx}" (a2),
+          [a3] "{r10}" (a3),
+        : .{ .rcx = true, .r11 = true, .memory = true });
+}
+
+fn syscall5(nr: SYS, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
+    return asm volatile ("syscall"
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (@intFromEnum(nr)),
+          [a0] "{rdi}" (a0),
+          [a1] "{rsi}" (a1),
+          [a2] "{rdx}" (a2),
+          [a3] "{r10}" (a3),
+          [a4] "{r8}" (a4),
+        : .{ .rcx = true, .r11 = true, .memory = true });
+}
+

@@ -146,7 +146,7 @@ fn resolvePath(path: []const u8) ?u8 {
         var child = nodes[current].first_child;
         while (child != NONE) {
             const n = &nodes[child];
-            if (n.active and n.name_len == component.len and nameEql(n.name[0..n.name_len], component)) {
+            if (n.active and n.name_len == component.len and fx.str.eql(n.name[0..n.name_len], component)) {
                 found = child;
                 break;
             }
@@ -180,14 +180,6 @@ fn resolveParent(path: []const u8) ?struct { parent: u8, name: []const u8 } {
 
     // No slash: parent is root, name is the whole path
     return .{ .parent = 0, .name = path };
-}
-
-fn nameEql(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        if (x != y) return false;
-    }
-    return true;
 }
 
 fn writeU32LE(buf: *[4]u8, val: u32) void {
@@ -383,6 +375,94 @@ fn handleClose(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
     resp.data_len = 0;
 }
 
+fn handleStat(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
+    if (req.data_len < 4) {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    }
+
+    const handle_id = readU32LE(req.data[0..4]);
+    const h = getHandle(handle_id) orelse {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    };
+
+    const node = &nodes[h.node_idx];
+    if (!node.active) {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    }
+
+    // Reply with [size: u32][file_type: u32][reserved: 56 bytes]
+    resp.* = fx.IpcMessage.init(fx.R_OK);
+    @memset(resp.data[0..64], 0);
+    writeU32LE(resp.data[0..4], node.data_len);
+    writeU32LE(resp.data[4..8], @intFromEnum(node.node_type));
+    resp.data_len = 64;
+}
+
+fn handleRemove(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
+    // T_REMOVE data = [path suffix bytes]
+    const path = req.data[0..req.data_len];
+    const node_idx = resolvePath(path) orelse {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    };
+
+    // Refuse to remove root
+    if (node_idx == 0) {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    }
+
+    const node = &nodes[node_idx];
+    if (!node.active) {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    }
+
+    // Refuse to remove non-empty directories
+    if (node.node_type == .directory and node.first_child != NONE) {
+        // Check if any active children exist
+        var child = node.first_child;
+        while (child != NONE) {
+            if (nodes[child].active) {
+                resp.* = fx.IpcMessage.init(fx.R_ERROR);
+                return;
+            }
+            child = nodes[child].next_sibling;
+        }
+    }
+
+    // Unlink from parent's child list
+    const parent = &nodes[node.parent];
+    if (parent.first_child == node_idx) {
+        parent.first_child = node.next_sibling;
+    } else {
+        var prev = parent.first_child;
+        while (prev != NONE) {
+            if (nodes[prev].next_sibling == node_idx) {
+                nodes[prev].next_sibling = node.next_sibling;
+                break;
+            }
+            prev = nodes[prev].next_sibling;
+        }
+    }
+
+    // Invalidate handles pointing to this node
+    for (1..MAX_HANDLES) |i| {
+        if (handles[i].active and handles[i].node_idx == node_idx) {
+            handles[i].active = false;
+        }
+    }
+
+    // Mark node inactive
+    node.active = false;
+
+    resp.* = fx.IpcMessage.init(fx.R_OK);
+    resp.data_len = 0;
+}
+
 export fn _start() noreturn {
     _ = fx.write(1, "ramfs: starting\n");
 
@@ -405,6 +485,8 @@ export fn _start() noreturn {
             fx.T_READ => handleRead(&msg, &reply),
             fx.T_WRITE => handleWrite(&msg, &reply),
             fx.T_CLOSE => handleClose(&msg, &reply),
+            fx.T_STAT => handleStat(&msg, &reply),
+            fx.T_REMOVE => handleRemove(&msg, &reply),
             else => {
                 reply = fx.IpcMessage.init(fx.R_ERROR);
             },

@@ -35,6 +35,19 @@ var entries: [*]const Entry = undefined;
 var entry_count: u32 = 0;
 var ready: bool = false;
 
+/// DirEntry-compatible struct for /boot directory listing (matches lib/ipc.zig DirEntry layout).
+const BootDirEntry = extern struct {
+    name: [64]u8,
+    file_type: u32, // 0=file, 1=directory
+    size: u32,
+};
+comptime {
+    if (@sizeOf(BootDirEntry) != 72) @compileError("BootDirEntry must be 72 bytes");
+}
+
+const MAX_DIR_ENTRIES = 32;
+var dir_listing: [MAX_DIR_ENTRIES]BootDirEntry = undefined;
+
 /// Initialize the initrd from a memory region loaded by UEFI.
 /// Returns false if the image is missing or invalid.
 pub fn init(base: ?[*]const u8, size: usize) bool {
@@ -140,6 +153,29 @@ pub fn mountFiles() void {
         serial.puts("initrd: mounted /boot/");
         serial.puts(name);
         serial.puts("\n");
+
+        // Build DirEntry for directory listing (same 72-byte layout)
+        if (i < MAX_DIR_ENTRIES) {
+            var dir_entry = &dir_listing[i];
+            dir_entry.name = e.name; // copy 64-byte name (already null-padded)
+            dir_entry.file_type = 0; // file
+            dir_entry.size = e.size;
+        }
+    }
+
+    // Mount /boot directory listing as kernel-backed channel
+    const dir_count = @min(entry_count, MAX_DIR_ENTRIES);
+    if (dir_count > 0) {
+        const dir_bytes: []const u8 = @as([*]const u8, @ptrCast(&dir_listing))[0 .. @as(usize, dir_count) * @sizeOf(BootDirEntry)];
+        const dir_chan = ipc.channelCreateKernelBacked(dir_bytes) catch {
+            serial.puts("initrd: failed to create /boot dir channel\n");
+            return;
+        };
+        root_ns.mount("/boot", dir_chan, .{ .replace = true }) catch {
+            serial.puts("initrd: failed to mount /boot dir\n");
+            return;
+        };
+        serial.puts("initrd: mounted /boot directory\n");
     }
 }
 

@@ -75,6 +75,26 @@ pub fn handleEvdevKey(code: u16, value: u32) void {
     // Only process on press and repeat (not release)
     if (value == 0) return;
 
+    // Arrow/Home/End keys: emit ANSI escape sequences in raw mode
+    if (raw_mode) {
+        const esc_char: ?u8 = switch (code) {
+            KEY_UP => 'A',
+            KEY_DOWN => 'B',
+            KEY_RIGHT => 'C',
+            KEY_LEFT => 'D',
+            KEY_HOME => 'H',
+            KEY_END => 'F',
+            else => null,
+        };
+        if (esc_char) |c| {
+            pushToRing(0x1B);
+            pushToRing('[');
+            pushToRing(c);
+            wakeWaiter();
+            return;
+        }
+    }
+
     // Translate keycode to ASCII
     const ascii = translateToAscii(code) orelse return;
     handleChar(ascii);
@@ -376,3 +396,11 @@ const KEY_DELETE: u16 = 111;
 const KEY_RIGHTCTRL: u16 = 97;
 const KEY_LEFTALT: u16 = 56;
 const KEY_RIGHTALT: u16 = 100;
+
+// Arrow keys, Home, End (evdev keycodes)
+const KEY_UP: u16 = 103;
+const KEY_DOWN: u16 = 108;
+const KEY_LEFT: u16 = 105;
+const KEY_RIGHT: u16 = 106;
+const KEY_HOME: u16 = 102;
+const KEY_END: u16 = 107;

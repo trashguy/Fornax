@@ -272,3 +272,89 @@ pub fn switchAddressSpace(pml4: *PageTable) void {
 pub fn getKernelPml4() *PageTable {
     return tablePtr(kernel_pml4_phys);
 }
+
+/// Walk a PML4 to translate a virtual address to physical.
+/// Returns null if the mapping doesn't exist.
+pub fn translateVaddr(pml4: *PageTable, virt: u64) ?u64 {
+    const pml4_idx: usize = @intCast((virt >> 39) & 0x1FF);
+    if (pml4.entries[pml4_idx] & Flags.PRESENT == 0) return null;
+    const pdpt: *PageTable = tablePtr(pml4.entries[pml4_idx] & ADDR_MASK);
+
+    const pdpt_idx: usize = @intCast((virt >> 30) & 0x1FF);
+    if (pdpt.entries[pdpt_idx] & Flags.PRESENT == 0) return null;
+    if (pdpt.entries[pdpt_idx] & Flags.HUGE_PAGE != 0) {
+        // 1GB huge page
+        return (pdpt.entries[pdpt_idx] & HUGE_ADDR_MASK) | (virt & 0x3FFFFFFF);
+    }
+    const pd: *PageTable = tablePtr(pdpt.entries[pdpt_idx] & ADDR_MASK);
+
+    const pd_idx: usize = @intCast((virt >> 21) & 0x1FF);
+    if (pd.entries[pd_idx] & Flags.PRESENT == 0) return null;
+    if (pd.entries[pd_idx] & Flags.HUGE_PAGE != 0) {
+        // 2MB huge page
+        return (pd.entries[pd_idx] & HUGE_ADDR_MASK) | (virt & 0x1FFFFF);
+    }
+    const pt: *PageTable = tablePtr(pd.entries[pd_idx] & ADDR_MASK);
+
+    const pt_idx: usize = @intCast((virt >> 12) & 0x1FF);
+    if (pt.entries[pt_idx] & Flags.PRESENT == 0) return null;
+    return (pt.entries[pt_idx] & ADDR_MASK) | (virt & 0xFFF);
+}
+
+/// Free all user-half pages and page tables in an address space.
+/// Walks PML4 entries 0-255 (user half). Frees leaf pages, intermediate
+/// table pages, and the PML4 page itself.
+/// IMPORTANT: Must not be called while the address space is active (CR3).
+pub fn freeAddressSpace(pml4: *PageTable) void {
+    // Walk user-half only (entries 0-255). Kernel half (256-511) is shared.
+    for (0..256) |pml4_idx| {
+        if (pml4.entries[pml4_idx] & Flags.PRESENT == 0) continue;
+        const pdpt_phys = pml4.entries[pml4_idx] & ADDR_MASK;
+        const pdpt: *PageTable = tablePtr(pdpt_phys);
+
+        for (0..512) |pdpt_idx| {
+            if (pdpt.entries[pdpt_idx] & Flags.PRESENT == 0) continue;
+            if (pdpt.entries[pdpt_idx] & Flags.HUGE_PAGE != 0) {
+                // 1GB huge page — don't free (kernel identity map)
+                continue;
+            }
+            const pd_phys = pdpt.entries[pdpt_idx] & ADDR_MASK;
+            const pd: *PageTable = tablePtr(pd_phys);
+
+            for (0..512) |pd_idx| {
+                if (pd.entries[pd_idx] & Flags.PRESENT == 0) continue;
+                if (pd.entries[pd_idx] & Flags.HUGE_PAGE != 0) {
+                    // 2MB huge page — part of identity map, don't free
+                    continue;
+                }
+                const pt_phys = pd.entries[pd_idx] & ADDR_MASK;
+                const pt: *PageTable = tablePtr(pt_phys);
+
+                // Free leaf (4KB) pages that have USER flag
+                for (0..512) |pt_idx| {
+                    if (pt.entries[pt_idx] & Flags.PRESENT == 0) continue;
+                    if (pt.entries[pt_idx] & Flags.USER != 0) {
+                        pmm.freePage(pt.entries[pt_idx] & ADDR_MASK);
+                    }
+                }
+
+                // Free the PT page itself if it has USER flag in PD entry
+                if (pd.entries[pd_idx] & Flags.USER != 0) {
+                    pmm.freePage(pt_phys);
+                }
+            }
+
+            // Free the PD page itself if it has USER flag in PDPT entry
+            if (pdpt.entries[pdpt_idx] & Flags.USER != 0) {
+                pmm.freePage(pd_phys);
+            }
+        }
+
+        // Free the PDPT page
+        pmm.freePage(pdpt_phys);
+    }
+
+    // Free the PML4 page itself
+    const pml4_phys = @intFromPtr(pml4) - if (@intFromPtr(pml4) >= mem.KERNEL_VIRT_BASE) mem.KERNEL_VIRT_BASE else 0;
+    pmm.freePage(pml4_phys);
+}

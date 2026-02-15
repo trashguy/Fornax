@@ -20,6 +20,11 @@ pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFF0_0000;
 /// (as if a `call` instruction pushed a return address).
 pub const USER_STACK_INIT: u64 = USER_STACK_TOP - 8;
 
+/// Base address for argv layout (one page below USER_STACK_TOP).
+/// Layout at ARGV_BASE: [argc: u64][argv[0]: ptr][argv[1]: ptr]...[str0\0str1\0...]
+/// Stack pointer is set to ARGV_BASE - 8, so program stack grows down from here.
+pub const ARGV_BASE: u64 = USER_STACK_TOP - PAGE_SIZE;
+
 /// How much physical memory to map in the kernel half (4 GB).
 pub const KERNEL_MAP_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 

@@ -83,7 +83,7 @@ fn sendToServer(chan: *ipc.Channel, proc: *process.Process) void {
 }
 
 /// Main syscall dispatch. Called from arch-specific entry point.
-pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, _: u64) u64 {
+pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) u64 {
     // Save user context to the current process at the start of every syscall.
     // This snapshots RIP/RSP/RFLAGS so blocking syscalls can schedule away.
     process.saveCurrentContext();
@@ -104,7 +104,9 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, _: u64) u64
         .ipc_recv => sysIpcRecv(arg0, arg1),
         .ipc_reply => sysIpcReply(arg0, arg1),
         .create => sysCreate(arg0, arg1, arg2),
-        .stat, .seek, .remove => {
+        .stat => sysStat(arg0, arg1),
+        .remove => sysRemove(arg0, arg1),
+        .seek => {
             serial.puts("syscall: unimplemented nr=");
             serial.putDec(nr);
             serial.puts("\n");
@@ -112,8 +114,10 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, _: u64) u64
         },
         .exec => sysExec(arg0, arg1),
         .wait => sysWait(arg0),
-        .spawn => sysSpawn(arg0, arg1, arg2, arg3),
-        .mount, .bind, .unmount, .rfork, .pipe, .brk => {
+        .spawn => sysSpawn(arg0, arg1, arg2, arg3, arg4),
+        .brk => sysBrk(arg0),
+        .pipe => sysPipe(arg0),
+        .mount, .bind, .unmount, .rfork => {
             serial.puts("syscall: unimplemented nr=");
             serial.putDec(nr);
             serial.puts("\n");
@@ -126,25 +130,32 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, _: u64) u64
 /// fd 1/2 → direct framebuffer console + serial (bootstrap path).
 /// Other fds → IPC to file server via channel.
 fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
-    // Console control (Plan 9 style: write to fd 0)
-    if (fd == 0) {
-        const keyboard = @import("keyboard.zig");
-        if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
-        if (count == 0) return 0;
-        const buf: [*]const u8 = @ptrFromInt(buf_ptr);
-        const len: usize = @intCast(@min(count, 64));
-        keyboard.handleCtl(buf[0..len]);
-        return len;
-    }
+    const pipe_mod = @import("pipe.zig");
 
-    // Direct framebuffer path for stdout (1) and stderr (2)
-    if (fd == 1 or fd == 2) {
-        if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
-        if (count == 0) return 0;
-        const buf: [*]const u8 = @ptrFromInt(buf_ptr);
-        const len: usize = @intCast(@min(count, 4096));
-        console.puts(buf[0..len]);
-        return len;
+    // For fd 0/1/2, check if process has an explicit FdEntry override.
+    // If not, use the default console/keyboard path.
+    if (fd <= 2) {
+        const proc = process.getCurrent() orelse return EBADF;
+        if (fd == 0 and proc.fds[0] == null) {
+            // Default: keyboard control (Plan 9 style: write to fd 0)
+            const keyboard = @import("keyboard.zig");
+            if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+            if (count == 0) return 0;
+            const buf: [*]const u8 = @ptrFromInt(buf_ptr);
+            const len: usize = @intCast(@min(count, 64));
+            keyboard.handleCtl(buf[0..len]);
+            return len;
+        }
+        if ((fd == 1 or fd == 2) and proc.fds[fd] == null) {
+            // Default: direct framebuffer console + serial
+            if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+            if (count == 0) return 0;
+            const buf: [*]const u8 = @ptrFromInt(buf_ptr);
+            const len: usize = @intCast(@min(count, 4096));
+            console.puts(buf[0..len]);
+            return len;
+        }
+        // Fall through to normal fd table path below
     }
 
     const proc = process.getCurrent() orelse return EBADF;
@@ -152,6 +163,23 @@ fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
 
     if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
     if (count == 0) return 0;
+
+    // Pipe fd: write to pipe buffer
+    if (entry.fd_type == .pipe) {
+        const buf: [*]const u8 = @ptrFromInt(buf_ptr);
+        const n = @min(count, 4096);
+        if (pipe_mod.pipeWrite(entry.pipe_id, buf[0..n])) |bytes| {
+            return bytes;
+        }
+        // Block — pipe full
+        pipe_mod.setWriteWaiter(entry.pipe_id, @intCast(proc.pid));
+        proc.pending_op = .pipe_write;
+        proc.pending_fd = @intCast(fd);
+        proc.ipc_recv_buf_ptr = buf_ptr;
+        proc.syscall_ret = n;
+        proc.state = .blocked;
+        process.scheduleNext();
+    }
 
     // Net fd: dispatch to netfs
     if (entry.fd_type == .net) {
@@ -239,6 +267,31 @@ fn sysExit(status: u64) noreturn {
     // Kill all children recursively (Fornax orphan policy)
     process.killChildren(proc.pid);
 
+    // Close all pipe fds (decrement refcounts, wake blocked peers)
+    {
+        const pipe_mod = @import("pipe.zig");
+        for (0..process.MAX_FDS) |i| {
+            if (proc.fds[i]) |entry| {
+                if (entry.fd_type == .pipe) {
+                    if (entry.pipe_is_read) {
+                        pipe_mod.closeReadEnd(entry.pipe_id);
+                    } else {
+                        pipe_mod.closeWriteEnd(entry.pipe_id);
+                    }
+                    proc.closeFd(@intCast(i));
+                }
+            }
+        }
+    }
+
+    // Free user address space (safe: we're on the kernel stack, not user memory)
+    process.freeUserMemory(proc);
+
+    // Kernel stack: deferred free — we're still running on it.
+    // It gets freed when the parent reaps us (sysWait) or when the
+    // process slot is reused.
+    proc.needs_stack_free = true;
+
     // Check if parent exists and is waiting for us
     if (proc.parent_pid) |ppid| {
         if (process.getByPid(ppid)) |parent| {
@@ -269,6 +322,52 @@ fn sysExit(status: u64) noreturn {
     process.scheduleNext();
 }
 
+/// brk(new_brk) — adjust program break (heap top).
+/// If new_brk == 0, return current brk. Otherwise, expand heap by allocating
+/// and mapping pages for the new region, checking quotas.
+fn sysBrk(new_brk: u64) u64 {
+    const proc = process.getCurrent() orelse return 0;
+
+    // Query current brk
+    if (new_brk == 0) return proc.brk;
+
+    // Only allow growing, not shrinking
+    if (new_brk <= proc.brk) return proc.brk;
+
+    // Validate: brk must stay in user space
+    if (new_brk >= 0x0000_8000_0000_0000) return proc.brk;
+
+    const page_size = mem.PAGE_SIZE;
+    const old_brk_page = (proc.brk + page_size - 1) / page_size;
+    const new_brk_page = (new_brk + page_size - 1) / page_size;
+
+    const proc_pml4 = proc.pml4 orelse return proc.brk;
+
+    // Allocate and map new pages
+    var page_idx = old_brk_page;
+    while (page_idx < new_brk_page) : (page_idx += 1) {
+        if (proc.pages_used >= proc.quotas.max_memory_pages) {
+            serial.puts("[brk: quota exceeded]\n");
+            return proc.brk; // return old brk on failure
+        }
+        const page = pmm.allocPage() orelse {
+            serial.puts("[brk: out of memory]\n");
+            return proc.brk;
+        };
+        const ptr: [*]u8 = paging.physPtr(page);
+        @memset(ptr[0..page_size], 0);
+        const vaddr = page_idx * page_size;
+        paging.mapPage(proc_pml4, vaddr, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
+            pmm.freePage(page);
+            return proc.brk;
+        };
+        proc.pages_used += 1;
+    }
+
+    proc.brk = new_brk;
+    return new_brk;
+}
+
 fn sysWait(pid_arg: u64) u64 {
     const proc = process.getCurrent() orelse return ENOSYS;
     const wait_pid: u32 = @truncate(pid_arg);
@@ -282,8 +381,12 @@ fn sysWait(pid_arg: u64) u64 {
                 found_child = true;
                 if (p.state == .zombie) {
                     if (wait_pid == 0 or p.pid == wait_pid) {
-                        // Reap this zombie
+                        // Reap this zombie — free deferred kernel stack
                         const status: u64 = p.exit_status;
+                        if (p.needs_stack_free) {
+                            process.freeKernelStack(p);
+                            p.needs_stack_free = false;
+                        }
                         p.state = .free;
                         p.parent_pid = null;
                         return status;
@@ -431,27 +534,34 @@ fn sysCreate(path_ptr: u64, path_len: u64, flags: u64) u64 {
 /// read(fd, buf, count) → bytes_read
 /// For IPC channels: sends T_READ to the server and blocks for reply.
 fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
+    const pipe_mod = @import("pipe.zig");
+
+    // For fd 0, check if process has an explicit FdEntry override.
+    // If not, use the default keyboard/console read path.
     if (fd == 0) {
-        // Console read (stdin)
-        const keyboard = @import("keyboard.zig");
-        if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
-        if (count == 0) return 0;
+        const proc0 = process.getCurrent() orelse return EBADF;
+        if (proc0.fds[0] == null) {
+            // Default: console read (stdin from keyboard)
+            const keyboard = @import("keyboard.zig");
+            if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+            if (count == 0) return 0;
 
-        // Check if data is already available
-        if (keyboard.dataAvailable()) {
-            const dest: [*]u8 = @ptrFromInt(buf_ptr);
-            const n = keyboard.read(dest, @intCast(@min(count, 4096)));
-            return n;
+            // Check if data is already available
+            if (keyboard.dataAvailable()) {
+                const dest: [*]u8 = @ptrFromInt(buf_ptr);
+                const n = keyboard.read(dest, @intCast(@min(count, 4096)));
+                return n;
+            }
+
+            // No data — block and wait for keyboard input
+            proc0.pending_op = .console_read;
+            proc0.ipc_recv_buf_ptr = buf_ptr;
+            proc0.pending_fd = @intCast(@min(count, 4096)); // stash requested size
+            keyboard.registerWaiter(@intCast(proc0.pid), buf_ptr, @intCast(@min(count, 4096)));
+            proc0.state = .blocked;
+            process.scheduleNext();
         }
-
-        // No data — block and wait for keyboard input
-        const proc = process.getCurrent() orelse return EBADF;
-        proc.pending_op = .console_read;
-        proc.ipc_recv_buf_ptr = buf_ptr;
-        proc.pending_fd = @intCast(@min(count, 4096)); // stash requested size
-        keyboard.registerWaiter(@intCast(proc.pid), buf_ptr, @intCast(@min(count, 4096)));
-        proc.state = .blocked;
-        process.scheduleNext();
+        // Fall through to normal fd table path below
     }
 
     const proc = process.getCurrent() orelse return EBADF;
@@ -459,6 +569,23 @@ fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
 
     if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
     if (count == 0) return 0;
+
+    // Pipe fd: read from pipe buffer
+    if (entry_ptr.fd_type == .pipe) {
+        const dest: [*]u8 = @ptrFromInt(buf_ptr);
+        const n = @min(count, 4096);
+        if (pipe_mod.pipeRead(entry_ptr.pipe_id, dest[0..n])) |bytes| {
+            return bytes;
+        }
+        // Block — no data available yet
+        pipe_mod.setReadWaiter(entry_ptr.pipe_id, @intCast(proc.pid));
+        proc.pending_op = .pipe_read;
+        proc.pending_fd = @intCast(fd);
+        proc.ipc_recv_buf_ptr = buf_ptr;
+        proc.syscall_ret = n;
+        proc.state = .blocked;
+        process.scheduleNext();
+    }
 
     // Net fd: dispatch to netfs
     if (entry_ptr.fd_type == .net) {
@@ -545,6 +672,18 @@ fn sysClose(fd: u64) u64 {
 
     const entry = proc.getFdEntry(@intCast(fd)) orelse return EBADF;
 
+    // Pipe fd: close the appropriate end
+    if (entry.fd_type == .pipe) {
+        const pipe_mod = @import("pipe.zig");
+        if (entry.pipe_is_read) {
+            pipe_mod.closeReadEnd(entry.pipe_id);
+        } else {
+            pipe_mod.closeWriteEnd(entry.pipe_id);
+        }
+        proc.closeFd(@intCast(fd));
+        return 0;
+    }
+
     // Net fd: dispatch to netfs
     if (entry.fd_type == .net) {
         const net = @import("net.zig");
@@ -575,6 +714,122 @@ fn sysClose(fd: u64) u64 {
     // Non-server fd: just close locally
     proc.closeFd(@intCast(fd));
     return 0;
+}
+
+/// pipe(result_ptr) → 0 on success, negative on error.
+/// Creates a pipe and writes [read_fd: u32, write_fd: u32] to result_ptr.
+fn sysPipe(result_ptr: u64) u64 {
+    if (result_ptr == 0 or result_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+
+    const proc = process.getCurrent() orelse return EBADF;
+    const pipe_mod = @import("pipe.zig");
+
+    const pipe_id = pipe_mod.alloc() orelse return ENOMEM;
+
+    const read_fd = proc.allocPipeFd(pipe_id, true) orelse {
+        pipe_mod.free(pipe_id);
+        return EMFILE;
+    };
+    const write_fd = proc.allocPipeFd(pipe_id, false) orelse {
+        proc.closeFd(read_fd);
+        pipe_mod.free(pipe_id);
+        return EMFILE;
+    };
+
+    // Write [read_fd, write_fd] as two u32 to user pointer
+    const dest: [*]u8 = @ptrFromInt(result_ptr);
+    dest[0] = @truncate(read_fd);
+    dest[1] = @truncate(read_fd >> 8);
+    dest[2] = @truncate(read_fd >> 16);
+    dest[3] = @truncate(read_fd >> 24);
+    dest[4] = @truncate(write_fd);
+    dest[5] = @truncate(write_fd >> 8);
+    dest[6] = @truncate(write_fd >> 16);
+    dest[7] = @truncate(write_fd >> 24);
+
+    return 0;
+}
+
+/// stat(fd, stat_buf_ptr) → 0 on success, negative on error.
+/// Returns file metadata (size, type) into user-provided Stat buffer.
+fn sysStat(fd: u64, stat_buf_ptr: u64) u64 {
+    const proc = process.getCurrent() orelse return ENOSYS;
+    if (stat_buf_ptr >= 0x0000_8000_0000_0000 or stat_buf_ptr == 0) return EFAULT;
+    if (fd >= 32) return EBADF;
+
+    const entry = proc.getFdEntry(@intCast(fd)) orelse return EBADF;
+
+    // Net fds: synthetic stat (size=0, type=file)
+    if (entry.fd_type == .net) {
+        const stat_ptr: *align(1) [64]u8 = @ptrFromInt(stat_buf_ptr);
+        @memset(stat_ptr, 0);
+        return 0;
+    }
+
+    const chan = ipc.getChannel(entry.channel_id) orelse return EBADF;
+
+    // Kernel-backed channel (initrd): stat from kernel data length
+    if (chan.kernel_data) |data| {
+        const stat_ptr: *align(1) [64]u8 = @ptrFromInt(stat_buf_ptr);
+        @memset(stat_ptr, 0);
+        // size at offset 0
+        const size: u32 = @intCast(data.len);
+        writeU32LE(@ptrCast(stat_ptr[0..4]), size);
+        // file_type at offset 4: 0 = file
+        return 0;
+    }
+
+    // Server-backed fd: send T_STAT with [handle: u32], block for reply
+    if (entry.server_handle > 0) {
+        proc.ipc_msg = ipc.Message.init(.t_stat);
+        writeU32LE(proc.ipc_msg.data_buf[0..4], entry.server_handle);
+        proc.ipc_msg.data_len = 4;
+
+        proc.pending_op = .stat;
+        proc.pending_fd = @intCast(fd);
+        proc.ipc_recv_buf_ptr = stat_buf_ptr;
+
+        sendToServer(chan, proc);
+        proc.state = .blocked;
+        process.scheduleNext();
+    }
+
+    return EBADF;
+}
+
+/// remove(path_ptr, path_len) → 0 or negative error.
+/// Resolve path in namespace, send T_REMOVE to the server.
+fn sysRemove(path_ptr: u64, path_len: u64) u64 {
+    const proc = process.getCurrent() orelse return ENOSYS;
+    if (path_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+    if (path_len == 0 or path_len > 256) return ENOENT;
+
+    const path: [*]const u8 = @ptrFromInt(path_ptr);
+    const path_slice = path[0..@intCast(path_len)];
+
+    const resolved = proc.ns.resolve(path_slice) orelse return ENOENT;
+
+    const chan = ipc.getChannel(resolved.channel_id) orelse return ENOENT;
+
+    // Cannot remove on kernel-backed channels
+    if (chan.kernel_data != null) return ENOSYS;
+
+    // Send T_REMOVE with path suffix
+    proc.ipc_msg = ipc.Message.init(.t_remove);
+    const suffix = resolved.suffix;
+    const suffix_len: u32 = @intCast(suffix.len);
+    if (suffix_len > 0) {
+        @memcpy(proc.ipc_msg.data_buf[0..suffix_len], suffix);
+    }
+    proc.ipc_msg.data_len = suffix_len;
+
+    proc.pending_op = .remove;
+    proc.pending_fd = 0;
+    proc.syscall_ret = 0;
+
+    sendToServer(chan, proc);
+    proc.state = .blocked;
+    process.scheduleNext();
 }
 
 /// ipc_recv(fd, msg_buf_ptr) → 0 on success, negative on error.
@@ -685,9 +940,23 @@ fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
             client_proc.syscall_ret = 0;
         },
         .stat => {
-            client_proc.syscall_ret = if (is_ok) 0 else EIO;
+            if (is_ok and reply_data_len > 0 and client_proc.ipc_recv_buf_ptr != 0) {
+                // Copy stat data to client's buffer via deferred delivery
+                client_proc.ipc_msg = ipc.Message.init(.r_ok);
+                const copy_len = @min(reply_data_len, 64);
+                client_proc.ipc_msg.data_len = copy_len;
+                @memcpy(client_proc.ipc_msg.data_buf[0..copy_len], reply_data_ptr[0..copy_len]);
+                client_proc.ipc_pending_msg = &client_proc.ipc_msg;
+                client_proc.syscall_ret = 0;
+            } else {
+                client_proc.syscall_ret = if (is_ok) 0 else EIO;
+                client_proc.ipc_recv_buf_ptr = 0;
+            }
         },
-        .console_read, .net_read, .net_connect, .net_listen, .dns_query, .icmp_read => {
+        .remove => {
+            client_proc.syscall_ret = if (is_ok) 0 else ENOENT;
+        },
+        .console_read, .net_read, .net_connect, .net_listen, .dns_query, .icmp_read, .pipe_read, .pipe_write => {
             // These don't go through IPC — should not happen here
         },
         .none => {
@@ -712,9 +981,9 @@ fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
         },
     }
 
-    // For .read with deferred delivery, keep pending_op so switchTo knows
+    // For .read/.stat with deferred delivery, keep pending_op so switchTo knows
     // to do raw data copy instead of IpcMessage copy. switchTo clears it.
-    if (client_proc.pending_op != .read or client_proc.ipc_pending_msg == null) {
+    if ((client_proc.pending_op != .read and client_proc.pending_op != .stat) or client_proc.ipc_pending_msg == null) {
         client_proc.pending_op = .none;
     }
     client_proc.state = .ready;
@@ -807,7 +1076,27 @@ const FdMapping = extern struct {
     parent_fd: u32,
 };
 
-fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64) u64 {
+/// Write data to a child process's virtual address by translating through its page tables.
+/// The kernel runs under the parent's CR3, so we can't dereference child addresses directly.
+fn writeToChildMem(child_pml4: *paging.PageTable, vaddr: u64, data: []const u8) bool {
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const page_offset = (vaddr + offset) & 0xFFF;
+        const chunk = @min(data.len - offset, mem.PAGE_SIZE - page_offset);
+
+        const phys = paging.translateVaddr(child_pml4, vaddr + offset) orelse return false;
+        const dest: [*]u8 = paging.physPtr(phys & ~@as(u64, 0xFFF));
+        @memcpy(dest[page_offset..][0..chunk], data[offset..][0..chunk]);
+        offset += chunk;
+    }
+    return true;
+}
+
+/// Static buffer for building argv layout (in .bss to avoid kernel stack use).
+/// Max 4096 bytes — one page for argv data.
+var argv_layout_buf: [4096]u8 linksection(".bss") = undefined;
+
+fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64, argv_ptr: u64) u64 {
     const parent = process.getCurrent() orelse return ENOSYS;
 
     // Validate ELF pointer
@@ -845,19 +1134,106 @@ fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64) u64 {
             return ENOMEM;
         };
     }
-    child.user_rsp = mem.USER_STACK_INIT;
+    // Set up argv layout at ARGV_BASE in child's address space.
+    // Layout: [argc: u64][argv[0]: ptr][argv[1]: ptr]...[str0\0str1\0...]
+    // Stack pointer is set to ARGV_BASE - 8 (aligned for x86_64 ABI).
+    const child_pml4 = child.pml4.?;
+    if (argv_ptr != 0 and argv_ptr < 0x0000_8000_0000_0000) {
+        // Read wire format from parent's memory: [argc: u32][total: u32][str0\0str1\0...]
+        const wire: [*]const u8 = @ptrFromInt(argv_ptr);
+        const wire_argc = @as(u32, wire[0]) |
+            (@as(u32, wire[1]) << 8) |
+            (@as(u32, wire[2]) << 16) |
+            (@as(u32, wire[3]) << 24);
+        const wire_total = @as(u32, wire[4]) |
+            (@as(u32, wire[5]) << 8) |
+            (@as(u32, wire[6]) << 16) |
+            (@as(u32, wire[7]) << 24);
+
+        if (wire_argc > 0 and wire_argc <= 64 and wire_total > 0 and wire_total <= 3000) {
+            // Build structured layout in static buffer:
+            //   [argc: u64]                        8 bytes
+            //   [argv[0]: u64] ... [argv[N-1]: u64]  argc * 8 bytes
+            //   [str0\0str1\0...]                  wire_total bytes
+            const header_size: usize = 8 + @as(usize, wire_argc) * 8;
+            const total_size = header_size + wire_total;
+
+            if (total_size <= argv_layout_buf.len) {
+                // Zero the buffer
+                @memset(argv_layout_buf[0..total_size], 0);
+
+                // Write argc as u64
+                const argc64: u64 = wire_argc;
+                argv_layout_buf[0] = @truncate(argc64);
+                argv_layout_buf[1] = @truncate(argc64 >> 8);
+                argv_layout_buf[2] = @truncate(argc64 >> 16);
+                argv_layout_buf[3] = @truncate(argc64 >> 24);
+                argv_layout_buf[4] = @truncate(argc64 >> 32);
+                argv_layout_buf[5] = @truncate(argc64 >> 40);
+                argv_layout_buf[6] = @truncate(argc64 >> 48);
+                argv_layout_buf[7] = @truncate(argc64 >> 56);
+
+                // Copy string data from wire format
+                const strings_start: usize = header_size;
+                @memcpy(argv_layout_buf[strings_start..][0..wire_total], wire[8..][0..wire_total]);
+
+                // Build pointer array: each argv[i] points to ARGV_BASE + strings_start + offset_of_string_i
+                var str_offset: usize = 0;
+                var arg_i: usize = 0;
+                while (arg_i < wire_argc and str_offset < wire_total) {
+                    const str_vaddr: u64 = mem.ARGV_BASE + strings_start + str_offset;
+                    const ptr_offset = 8 + arg_i * 8;
+                    argv_layout_buf[ptr_offset] = @truncate(str_vaddr);
+                    argv_layout_buf[ptr_offset + 1] = @truncate(str_vaddr >> 8);
+                    argv_layout_buf[ptr_offset + 2] = @truncate(str_vaddr >> 16);
+                    argv_layout_buf[ptr_offset + 3] = @truncate(str_vaddr >> 24);
+                    argv_layout_buf[ptr_offset + 4] = @truncate(str_vaddr >> 32);
+                    argv_layout_buf[ptr_offset + 5] = @truncate(str_vaddr >> 40);
+                    argv_layout_buf[ptr_offset + 6] = @truncate(str_vaddr >> 48);
+                    argv_layout_buf[ptr_offset + 7] = @truncate(str_vaddr >> 56);
+
+                    // Skip to next null terminator
+                    while (str_offset < wire_total and argv_layout_buf[strings_start + str_offset] != 0) {
+                        str_offset += 1;
+                    }
+                    str_offset += 1; // skip the null
+                    arg_i += 1;
+                }
+
+                // Write layout to child's ARGV_BASE page
+                _ = writeToChildMem(child_pml4, mem.ARGV_BASE, argv_layout_buf[0..total_size]);
+            }
+        }
+
+        // Set RSP below the argv page (aligned for x86_64 ABI)
+        child.user_rsp = mem.ARGV_BASE - 8;
+    } else {
+        // No argv: write argc=0 at ARGV_BASE, set RSP below
+        @memset(argv_layout_buf[0..8], 0);
+        _ = writeToChildMem(child_pml4, mem.ARGV_BASE, argv_layout_buf[0..8]);
+        child.user_rsp = mem.ARGV_BASE - 8;
+    }
 
     // Copy namespace from parent (Plan 9: children inherit namespace)
     parent.ns.cloneInto(&child.ns);
 
     // Copy fd mappings from parent to child
     if (fd_map_len > 0) {
+        const pipe_mod = @import("pipe.zig");
         const fd_maps: [*]const FdMapping = @ptrFromInt(fd_map_ptr);
         for (0..@intCast(fd_map_len)) |i| {
             const m = fd_maps[i];
             if (m.parent_fd < process.MAX_FDS and m.child_fd < process.MAX_FDS) {
                 if (parent.fds[m.parent_fd]) |fentry| {
                     child.fds[m.child_fd] = fentry;
+                    // Increment pipe refcount for duplicated pipe fds
+                    if (fentry.fd_type == .pipe) {
+                        if (fentry.pipe_is_read) {
+                            pipe_mod.incrementReaders(fentry.pipe_id);
+                        } else {
+                            pipe_mod.incrementWriters(fentry.pipe_id);
+                        }
+                    }
                 }
             }
         }

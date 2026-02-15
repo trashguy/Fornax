@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
 
     // ── Userspace programs ───────────────────────────────────────────
     const fornax_module = b.createModule(.{
-        .root_source_file = b.path("lib/fornax.zig"),
+        .root_source_file = b.path("lib/root.zig"),
         .target = x86_64_freestanding,
         .optimize = user_optimize,
     });
@@ -123,6 +123,84 @@ pub fn build(b: *std.Build) void {
     });
     ping_exe.image_base = user_image_base;
 
+    const echo_exe = b.addExecutable(.{
+        .name = "echo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/echo/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    echo_exe.image_base = user_image_base;
+
+    const cat_exe = b.addExecutable(.{
+        .name = "cat",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/cat/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    cat_exe.image_base = user_image_base;
+
+    const ls_exe = b.addExecutable(.{
+        .name = "ls",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/ls/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    ls_exe.image_base = user_image_base;
+
+    const rm_exe = b.addExecutable(.{
+        .name = "rm",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/rm/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    rm_exe.image_base = user_image_base;
+
+    const mkdir_exe = b.addExecutable(.{
+        .name = "mkdir",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/mkdir/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    mkdir_exe.image_base = user_image_base;
+
+    const wc_exe = b.addExecutable(.{
+        .name = "wc",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/wc/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    wc_exe.image_base = user_image_base;
+
     const ramfs_exe = b.addExecutable(.{
         .name = "ramfs",
         .root_module = b.createModule(.{
@@ -171,7 +249,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // ── Initrd: pack userspace programs into INITRD image ────────────
-    const x86_initrd = addInitrdStep(b, mkinitrd, "esp/EFI/BOOT", &.{ ramfs_exe, init_exe, fsh_exe, hello_exe, tcptest_exe, dnstest_exe, ping_exe });
+    const x86_initrd = addInitrdStep(b, mkinitrd, "esp/EFI/BOOT", &.{ ramfs_exe, init_exe, fsh_exe, hello_exe, tcptest_exe, dnstest_exe, ping_exe, echo_exe, cat_exe, ls_exe, rm_exe, mkdir_exe, wc_exe });
     x86_initrd.step.dependOn(&x86_install.step); // ensure ESP dir exists
 
     // ── aarch64 UEFI kernel ─────────────────────────────────────────

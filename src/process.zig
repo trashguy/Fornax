@@ -81,9 +81,9 @@ pub const ResourceQuotas = struct {
     cpu_priority: u8 = 128, // 0=lowest, 255=highest
 };
 
-pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, console_read, net_read, net_connect, net_listen, dns_query, icmp_read };
+pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, remove, console_read, net_read, net_connect, net_listen, dns_query, icmp_read, pipe_read, pipe_write };
 
-pub const FdType = enum(u8) { ipc, net };
+pub const FdType = enum(u8) { ipc, net, pipe };
 
 pub const NetFdKind = enum(u8) {
     tcp_clone,
@@ -114,6 +114,9 @@ pub const FdEntry = struct {
     net_kind: NetFdKind = .tcp_clone,
     net_conn: u8 = 0,
     net_read_done: bool = false,
+    /// Pipe-specific fields (only used when fd_type == .pipe)
+    pipe_id: u8 = 0,
+    pipe_is_read: bool = false,
 };
 
 pub const Process = struct {
@@ -161,6 +164,8 @@ pub const Process = struct {
     pending_op: PendingOp,
     /// Pre-allocated fd for open/create reply handling.
     pending_fd: u32,
+    /// Deferred kernel stack free (can't free while running on it).
+    needs_stack_free: bool = false,
 
     pub fn initFds(self: *Process) void {
         for (&self.fds) |*fd| {
@@ -194,6 +199,25 @@ pub const Process = struct {
                     .net_kind = kind,
                     .net_conn = conn,
                     .net_read_done = false,
+                };
+                return @intCast(i);
+            }
+        }
+        return null;
+    }
+
+    /// Allocate a pipe fd.
+    pub fn allocPipeFd(self: *Process, pipe_id: u8, is_read: bool) ?u32 {
+        for (0..MAX_FDS) |i| {
+            if (self.fds[i] == null) {
+                self.fds[i] = .{
+                    .fd_type = .pipe,
+                    .channel_id = 0,
+                    .is_server = false,
+                    .read_offset = 0,
+                    .server_handle = 0,
+                    .pipe_id = pipe_id,
+                    .pipe_is_read = is_read,
                 };
                 return @intCast(i);
             }
@@ -259,6 +283,7 @@ pub fn init() void {
         p.waiting_for_pid = null;
         p.pending_op = .none;
         p.pending_fd = 0;
+        p.needs_stack_free = false;
         p.initFds();
     }
     initialized = true;
@@ -280,6 +305,12 @@ pub fn create() ?*Process {
         }
     }
     const proc = slot orelse return null;
+
+    // Free deferred kernel stack from previous incarnation
+    if (proc.needs_stack_free) {
+        freeKernelStack(proc);
+        proc.needs_stack_free = false;
+    }
 
     // Allocate address space
     const addr_space = paging.createAddressSpace() orelse return null;
@@ -316,6 +347,7 @@ pub fn create() ?*Process {
     proc.waiting_for_pid = null;
     proc.pending_op = .none;
     proc.pending_fd = 0;
+    proc.needs_stack_free = false;
     namespace.getRootNamespace().cloneInto(&proc.ns);
     proc.ipc_msg = ipc.Message.init(.t_open);
     next_pid += 1;
@@ -349,6 +381,9 @@ pub fn killChildren(parent_pid: u32) void {
             if (ppid == parent_pid and p.state != .free) {
                 // Recurse first (kill grandchildren before child)
                 killChildren(p.pid);
+                // Free all process resources (safe — runs in parent's context)
+                freeUserMemory(p);
+                freeKernelStack(p);
                 p.state = .free;
                 p.parent_pid = null;
                 serial.puts("[killed orphan pid=");
@@ -564,12 +599,96 @@ fn switchTo(proc: *Process) noreturn {
         proc.pending_fd = 0;
     }
 
+    // Pipe read delivery — address space is active, so user pointers are valid
+    if (proc.pending_op == .pipe_read) {
+        const pipe_mod = @import("pipe.zig");
+        const fd_entry = proc.getFdEntryPtr(proc.pending_fd) orelse {
+            proc.syscall_ret = 0;
+            proc.pending_op = .none;
+            proc.ipc_recv_buf_ptr = 0;
+            proc.pending_fd = 0;
+            if (proc.saved_kernel_rsp != 0) {
+                const frame: [*]u64 = @ptrFromInt(proc.saved_kernel_rsp);
+                frame[12] = proc.syscall_ret;
+                proc.saved_kernel_rsp = 0;
+                syscall_entry.resume_from_kernel_frame(@intFromPtr(frame));
+            } else {
+                resume_user_mode(proc.user_rip, proc.user_rsp, proc.user_rflags, proc.syscall_ret);
+            }
+        };
+
+        if (pipe_mod.hasDataOrEof(fd_entry.pipe_id)) {
+            if (proc.ipc_recv_buf_ptr != 0 and proc.ipc_recv_buf_ptr < 0x0000_8000_0000_0000) {
+                const dest: [*]u8 = @ptrFromInt(proc.ipc_recv_buf_ptr);
+                const buf_size = @min(proc.syscall_ret, 4096);
+                if (pipe_mod.pipeRead(fd_entry.pipe_id, dest[0..buf_size])) |n| {
+                    proc.syscall_ret = n;
+                } else {
+                    proc.syscall_ret = 0; // EOF
+                }
+            } else {
+                proc.syscall_ret = 0;
+            }
+        } else {
+            // Still no data — re-block
+            pipe_mod.setReadWaiter(fd_entry.pipe_id, @intCast(proc.pid));
+            proc.state = .blocked;
+            current = null;
+            scheduleNext();
+        }
+        proc.ipc_recv_buf_ptr = 0;
+        proc.pending_op = .none;
+        proc.pending_fd = 0;
+    }
+
+    // Pipe write delivery — address space is active, retry the write
+    if (proc.pending_op == .pipe_write) {
+        const pipe_mod = @import("pipe.zig");
+        const fd_entry = proc.getFdEntryPtr(proc.pending_fd) orelse {
+            proc.syscall_ret = 0;
+            proc.pending_op = .none;
+            proc.ipc_recv_buf_ptr = 0;
+            proc.pending_fd = 0;
+            if (proc.saved_kernel_rsp != 0) {
+                const frame: [*]u64 = @ptrFromInt(proc.saved_kernel_rsp);
+                frame[12] = proc.syscall_ret;
+                proc.saved_kernel_rsp = 0;
+                syscall_entry.resume_from_kernel_frame(@intFromPtr(frame));
+            } else {
+                resume_user_mode(proc.user_rip, proc.user_rsp, proc.user_rflags, proc.syscall_ret);
+            }
+        };
+
+        if (pipe_mod.hasSpaceOrBroken(fd_entry.pipe_id)) {
+            if (proc.ipc_recv_buf_ptr != 0 and proc.ipc_recv_buf_ptr < 0x0000_8000_0000_0000) {
+                const src: [*]const u8 = @ptrFromInt(proc.ipc_recv_buf_ptr);
+                const n = @min(proc.syscall_ret, 4096);
+                if (pipe_mod.pipeWrite(fd_entry.pipe_id, src[0..n])) |bytes| {
+                    proc.syscall_ret = bytes;
+                } else {
+                    proc.syscall_ret = pipe_mod.EPIPE;
+                }
+            } else {
+                proc.syscall_ret = 0;
+            }
+        } else {
+            // Still full — re-block
+            pipe_mod.setWriteWaiter(fd_entry.pipe_id, @intCast(proc.pid));
+            proc.state = .blocked;
+            current = null;
+            scheduleNext();
+        }
+        proc.ipc_recv_buf_ptr = 0;
+        proc.pending_op = .none;
+        proc.pending_fd = 0;
+    }
+
     // If there's a pending IPC message to deliver, do it now
     // (address space is loaded, so user pointers are valid)
     if (proc.ipc_pending_msg) |msg| {
         if (proc.ipc_recv_buf_ptr != 0) {
-            if (proc.pending_op == .read) {
-                // Raw data delivery for read replies — copy just data, not IpcMessage wrapper
+            if (proc.pending_op == .read or proc.pending_op == .stat) {
+                // Raw data delivery for read/stat replies — copy just data, not IpcMessage wrapper
                 deliverRawData(msg, proc.ipc_recv_buf_ptr);
             } else {
                 deliverIpcMessage(msg, proc.ipc_recv_buf_ptr);
@@ -627,4 +746,30 @@ pub fn allocPageForProcess(proc: *Process) ?u64 {
     const page = pmm.allocPage() orelse return null;
     proc.pages_used += 1;
     return page;
+}
+
+/// Free the user address space (page tables and user pages).
+/// Safe to call even if pml4 is null.
+pub fn freeUserMemory(proc: *Process) void {
+    if (proc.pml4) |pml4| {
+        paging.freeAddressSpace(pml4);
+        proc.pml4 = null;
+        proc.pages_used = 0;
+    }
+}
+
+/// Free the kernel stack pages.
+/// MUST NOT be called while running on this stack.
+pub fn freeKernelStack(proc: *Process) void {
+    if (proc.kernel_stack_top == 0) return;
+
+    // kernel_stack_top points to the end of the stack allocation.
+    // Stack base = top - KERNEL_STACK_PAGES * PAGE_SIZE.
+    const stack_virt = proc.kernel_stack_top - KERNEL_STACK_PAGES * mem.PAGE_SIZE;
+    const stack_phys = if (stack_virt >= mem.KERNEL_VIRT_BASE) stack_virt - mem.KERNEL_VIRT_BASE else stack_virt;
+
+    for (0..KERNEL_STACK_PAGES) |i| {
+        pmm.freePage(stack_phys + i * mem.PAGE_SIZE);
+    }
+    proc.kernel_stack_top = 0;
 }
