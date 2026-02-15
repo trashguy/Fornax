@@ -1,4 +1,4 @@
-# Phase 3005 — Image Registry
+# Phase 3008 — Image Registry
 
 **Requires: `-Dviceroy=true` at build time.**
 
@@ -81,7 +81,7 @@ format if needed, and pushes to the local registry.
 
 ## Dependencies
 
-- Phase 201: Remote namespaces (nodes pull images over 9P)
+- Phase 3001: Remote namespaces (nodes pull images over 9P)
 - Phase 14: Container primitives (OCI image format, already done)
 - Phase 100: TCP (for external OCI import, optional)
 

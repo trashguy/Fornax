@@ -1,4 +1,4 @@
-# Phase 3000 — Service Manifests + cmd/deploy
+# Phase 3003 — Service Manifests + cmd/deploy
 
 **Requires: `-Dviceroy=true` at build time (implies `-Dcluster=true`).**
 
@@ -8,7 +8,7 @@
 
 Declarative service definitions and a deploy command. No YAML, no CRDs — plain text
 files describing what to run, how many, and where. The deploy tool reads manifests and
-talks to the cluster scheduler (Phase 202) via `/cluster/scheduler/ctl`.
+talks to the cluster scheduler (Phase 3002) via `/cluster/scheduler/ctl`.
 
 ## Design
 
@@ -50,7 +50,7 @@ deploy status                 # show all deployed services
 deploy status web             # show service detail
 deploy scale web 5            # update replica count
 deploy stop web               # tear down all replicas
-deploy logs web               # tail logs (see Phase 3006)
+deploy logs web               # tail logs (see Phase 3009)
 ```
 
 `cmd/deploy` is a thin client. It reads manifest files, writes commands to
@@ -92,8 +92,8 @@ This is the only daemon. `cmd/deploy` is stateless.
 
 ## Dependencies
 
-- Phase 202: Cluster scheduler (container placement)
-- Phase 201: Remote namespaces (9P over TCP, for cross-node operations)
+- Phase 3002: Cluster scheduler (container placement)
+- Phase 3001: Remote namespaces (9P over TCP, for cross-node operations)
 - Phase 20: Initrd or equivalent (to distribute manifest files)
 
 ## Verify

@@ -1,4 +1,4 @@
-# Phase 3004 — Secrets + Config Management
+# Phase 3007 — Secrets + Config Management
 
 **Requires: `-Dviceroy=true` at build time.**
 
@@ -82,7 +82,7 @@ deploy secret revoke web db_password  # revoke access
 - AES-256-GCM for secret encryption at rest
 - Cluster encryption key generated at cluster init, stored on each node
 - Key rotation: `write /secrets/ctl "rotate-key"` — re-encrypts all secrets
-- Transport security via 9P over TLS (Phase 201 stretch goal)
+- Transport security via 9P over TLS (Phase 3001 stretch goal)
 
 ### Why Not Environment Variables
 
@@ -93,9 +93,9 @@ deploy secret revoke web db_password  # revoke access
 
 ## Dependencies
 
-- Phase 3000: Service manifests (secret/config declarations)
-- Phase 3001: Health checks (restart services if secret injection fails)
-- Phase 201: Remote namespaces (distribute secrets across nodes)
+- Phase 3003: Service manifests (secret/config declarations)
+- Phase 3004: Health checks (restart services if secret injection fails)
+- Phase 3001: Remote namespaces (distribute secrets across nodes)
 
 ## Verify
 

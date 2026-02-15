@@ -1,4 +1,4 @@
-# Phase 3003 — Service Routing
+# Phase 3006 — Service Routing
 
 **Requires: `-Dviceroy=true` at build time.**
 
@@ -85,9 +85,9 @@ The service's internal port is only relevant to the service itself.
 
 ## Dependencies
 
-- Phase 3000: Service manifests (registration info comes from deploy server)
-- Phase 3001: Health checks (only route to healthy instances)
-- Phase 201: Remote namespaces (9P connections to service instances)
+- Phase 3003: Service manifests (registration info comes from deploy server)
+- Phase 3004: Health checks (only route to healthy instances)
+- Phase 3001: Remote namespaces (9P connections to service instances)
 
 ## Verify
 

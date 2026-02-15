@@ -1,4 +1,4 @@
-# Phase 3002 — Rolling Updates
+# Phase 3005 — Rolling Updates
 
 **Requires: `-Dviceroy=true` at build time.**
 
@@ -82,8 +82,8 @@ deploy rollback web           # revert to previous version
 
 ## Dependencies
 
-- Phase 3000: Service manifests + deployment server
-- Phase 3001: Health checks (required to verify new instances before cutting over)
+- Phase 3003: Service manifests + deployment server
+- Phase 3004: Health checks (required to verify new instances before cutting over)
 
 ## Verify
 

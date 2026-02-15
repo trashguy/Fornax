@@ -1,4 +1,4 @@
-# Phase 3006 — Observability
+# Phase 3009 — Observability
 
 **Requires: `-Dviceroy=true` at build time.**
 
@@ -120,8 +120,8 @@ just clear + print.
 
 ## Dependencies
 
-- Phase 3000: Service manifests + deployment server
-- Phase 3001: Health checks (health state feeds into top view)
+- Phase 3003: Service manifests + deployment server
+- Phase 3004: Health checks (health state feeds into top view)
 - Phase 23: TTY / console (for interactive `deploy top`)
 
 ## Verify

@@ -1,4 +1,4 @@
-# Phase 3001 — Health Checks + Auto-Recovery
+# Phase 3004 — Health Checks + Auto-Recovery
 
 **Requires: `-Dviceroy=true` at build time.**
 
@@ -66,7 +66,7 @@ max_restarts 5              # give up after 5 restarts in 60s
 
 ### Integration with srv/deploy
 
-The deployment server (Phase 3000) runs health checks for all active services.
+The deployment server (Phase 3003) runs health checks for all active services.
 It reads the health path via the service's mounted namespace (local or remote via 9P).
 
 ```
@@ -95,7 +95,7 @@ check_health(service, instance):
 
 ## Dependencies
 
-- Phase 3000: Service manifests + deployment server
+- Phase 3003: Service manifests + deployment server
 - Phase 13: VMS fault supervisor (kernel-level crash recovery, already done)
 
 ## Verify
