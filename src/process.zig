@@ -75,7 +75,7 @@ pub const ResourceQuotas = struct {
     cpu_priority: u8 = 128, // 0=lowest, 255=highest
 };
 
-pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat };
+pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, console_read };
 
 /// File descriptor entry: channel ID + which end of the channel.
 pub const FdEntry = struct {
@@ -336,35 +336,42 @@ pub fn scheduleNext() noreturn {
         }
     }
 
-    // Round-robin: scan from schedule_index
-    var checked: usize = 0;
-    while (checked < MAX_PROCESSES) : (checked += 1) {
-        schedule_index = (schedule_index + 1) % MAX_PROCESSES;
-        const proc = &processes[schedule_index];
-        if (proc.state == .ready) {
-            switchTo(proc);
+    while (true) {
+        // Round-robin: scan from schedule_index
+        var checked: usize = 0;
+        while (checked < MAX_PROCESSES) : (checked += 1) {
+            schedule_index = (schedule_index + 1) % MAX_PROCESSES;
+            const proc = &processes[schedule_index];
+            if (proc.state == .ready) {
+                switchTo(proc);
+            }
+        }
+
+        // No ready process found
+        // Check if any processes are alive (blocked or zombie awaiting reap)
+        var any_alive = false;
+        for (&processes) |*p| {
+            if (p.state == .blocked or p.state == .zombie) {
+                any_alive = true;
+                break;
+            }
+        }
+
+        if (any_alive) {
+            // All blocked — enable interrupts and halt until an IRQ fires.
+            // The IRQ handler may wake a process (e.g., keyboard input).
+            current = null;
+            asm volatile ("sti");
+            asm volatile ("hlt");
+            asm volatile ("cli");
+            // Loop back and re-scan for ready processes
+            continue;
+        } else {
+            console.puts("\n[All processes exited. System halting.]\n");
+            current = null;
+            cpu.halt();
         }
     }
-
-    // No ready process found
-    // Check if any processes are alive (blocked or zombie awaiting reap)
-    var any_alive = false;
-    for (&processes) |*p| {
-        if (p.state == .blocked or p.state == .zombie) {
-            any_alive = true;
-            break;
-        }
-    }
-
-    if (any_alive) {
-        console.puts("\n[DEADLOCK: all processes blocked, none ready]\n");
-    } else {
-        console.puts("\n[All processes exited. System halting.]\n");
-    }
-
-    // Halt
-    current = null;
-    cpu.halt();
 }
 
 /// Assembly entry point defined in entry.S — returns to userspace via IRETQ.
@@ -383,6 +390,32 @@ fn switchTo(proc: *Process) noreturn {
     // Switch address space
     if (proc.pml4) |pml4| {
         paging.switchAddressSpace(pml4);
+    }
+
+    // Console read delivery — address space is active, so user pointers are valid
+    if (proc.pending_op == .console_read) {
+        const keyboard = @import("keyboard.zig");
+        if (keyboard.dataAvailable()) {
+            if (proc.ipc_recv_buf_ptr != 0 and proc.ipc_recv_buf_ptr < 0x0000_8000_0000_0000) {
+                const dest: [*]u8 = @ptrFromInt(proc.ipc_recv_buf_ptr);
+                const buf_size = proc.pending_fd; // we stash the count in pending_fd
+                const n = keyboard.read(dest, buf_size);
+                proc.syscall_ret = n;
+            } else {
+                proc.syscall_ret = 0;
+            }
+            keyboard.clearWaiter();
+        } else {
+            // Data not ready yet (spurious wake) — re-block
+            proc.state = .blocked;
+            proc.pending_op = .console_read;
+            current = null;
+            // Return to scheduler by re-scanning
+            scheduleNext();
+        }
+        proc.ipc_recv_buf_ptr = 0;
+        proc.pending_op = .none;
+        proc.pending_fd = 0;
     }
 
     // If there's a pending IPC message to deliver, do it now

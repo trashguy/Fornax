@@ -289,7 +289,7 @@ pub fn readIsr(dev: *VirtioDevice) u8 {
     return read8(dev.io_base, REG_ISR_STATUS);
 }
 
-fn memoryBarrier() void {
+pub fn memoryBarrier() void {
     switch (@import("builtin").cpu.arch) {
         .x86_64 => asm volatile ("mfence" ::: .{ .memory = true }),
         .aarch64 => asm volatile ("dmb sy" ::: .{ .memory = true }),

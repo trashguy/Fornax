@@ -57,7 +57,7 @@ pub const ExceptionFrame = extern struct {
 };
 
 /// ISR stub address table defined in entry.S.
-extern const isr_stub_table: [32]u64;
+extern const isr_stub_table: [48]u64;
 
 /// Exception handler wrapper called from entry.S using System V ABI.
 export fn handleExceptionWrapper(frame: *ExceptionFrame) callconv(.{ .x86_64_sysv = .{} }) void {
@@ -78,8 +78,8 @@ fn setGate(vector: u8, handler_addr: u64) void {
 }
 
 pub fn init() void {
-    // Install exception handlers (vectors 0-31) from entry.S stubs
-    for (0..32) |i| {
+    // Install exception + IRQ handlers (vectors 0-47) from entry.S stubs
+    for (0..48) |i| {
         setGate(@intCast(i), isr_stub_table[i]);
     }
 
@@ -93,5 +93,5 @@ pub fn init() void {
         : [idt_ptr] "r" (&idt_ptr),
     );
 
-    console.puts("IDT: loaded (256 entries, 32 exception handlers)\n");
+    console.puts("IDT: loaded (256 entries, 48 handlers)\n");
 }

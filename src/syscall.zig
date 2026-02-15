@@ -126,6 +126,17 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, _: u64) u64
 /// fd 1/2 → direct framebuffer console + serial (bootstrap path).
 /// Other fds → IPC to file server via channel.
 fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
+    // Console control (Plan 9 style: write to fd 0)
+    if (fd == 0) {
+        const keyboard = @import("keyboard.zig");
+        if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+        if (count == 0) return 0;
+        const buf: [*]const u8 = @ptrFromInt(buf_ptr);
+        const len: usize = @intCast(@min(count, 64));
+        keyboard.handleCtl(buf[0..len]);
+        return len;
+    }
+
     // Direct framebuffer path for stdout (1) and stderr (2)
     if (fd == 1 or fd == 2) {
         if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
@@ -356,7 +367,28 @@ fn sysCreate(path_ptr: u64, path_len: u64, flags: u64) u64 {
 /// read(fd, buf, count) → bytes_read
 /// For IPC channels: sends T_READ to the server and blocks for reply.
 fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
-    if (fd == 0) return 0; // stdin: nothing to read for now
+    if (fd == 0) {
+        // Console read (stdin)
+        const keyboard = @import("keyboard.zig");
+        if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+        if (count == 0) return 0;
+
+        // Check if data is already available
+        if (keyboard.dataAvailable()) {
+            const dest: [*]u8 = @ptrFromInt(buf_ptr);
+            const n = keyboard.read(dest, @intCast(@min(count, 4096)));
+            return n;
+        }
+
+        // No data — block and wait for keyboard input
+        const proc = process.getCurrent() orelse return EBADF;
+        proc.pending_op = .console_read;
+        proc.ipc_recv_buf_ptr = buf_ptr;
+        proc.pending_fd = @intCast(@min(count, 4096)); // stash requested size
+        keyboard.registerWaiter(@intCast(proc.pid), buf_ptr, @intCast(@min(count, 4096)));
+        proc.state = .blocked;
+        process.scheduleNext();
+    }
 
     const proc = process.getCurrent() orelse return EBADF;
     const entry_ptr = proc.getFdEntryPtr(@intCast(fd)) orelse return EBADF;
@@ -552,6 +584,9 @@ fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
         },
         .stat => {
             client_proc.syscall_ret = if (is_ok) 0 else EIO;
+        },
+        .console_read => {
+            // Should not happen — console_read doesn't go through IPC
         },
         .none => {
             // Raw IPC (existing behavior for servers using ipc_recv/ipc_reply directly)

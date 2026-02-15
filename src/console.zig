@@ -67,6 +67,14 @@ pub fn putChar(c: u8) void {
         return;
     }
 
+    // Backspace: move cursor back one position
+    if (c == 0x08) {
+        if (cursor_x > 0) {
+            cursor_x -= 1;
+        }
+        return;
+    }
+
     if (cursor_x >= cols) {
         cursor_x = 0;
         cursor_y += 1;

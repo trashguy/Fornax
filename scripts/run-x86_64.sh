@@ -56,5 +56,6 @@ exec qemu-system-x86_64 \
     -serial stdio \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0 \
+    -device virtio-keyboard-pci \
     -no-reboot \
     -no-shutdown

@@ -1,5 +1,5 @@
-/// COM1 serial output (0x3F8) for QEMU `-serial stdio`.
-/// 115200 baud, 8N1. Essential for debugging.
+/// COM1 serial I/O (0x3F8) for QEMU `-serial stdio`.
+/// 115200 baud, 8N1. Output for debugging, input for console.
 const cpu = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/cpu.zig"),
     else => struct {
@@ -26,6 +26,41 @@ pub fn init() void {
     cpu.outb(COM1 + 4, 0x0B); // IRQs enabled, RTS/DSR set
 
     initialized = true;
+}
+
+/// Enable receive interrupts on COM1 and register IRQ 4 handler.
+pub fn enableRxInterrupt() void {
+    if (@import("builtin").cpu.arch != .x86_64) return;
+
+    const pic = @import("pic.zig");
+    const interrupts = @import("arch/x86_64/interrupts.zig");
+
+    // Enable "data available" interrupt (IER bit 0)
+    cpu.outb(COM1 + 1, 0x01);
+
+    // Register IRQ 4 handler
+    _ = interrupts.registerIrqHandler(4, handleIrq);
+
+    // Unmask IRQ 4 on PIC
+    pic.unmask(4);
+}
+
+fn handleIrq() bool {
+    // Check if data is available (LSR bit 0)
+    const lsr = cpu.inb(COM1 + 5);
+    if (lsr & 0x01 == 0) return false;
+
+    const keyboard = @import("keyboard.zig");
+
+    // Read all available bytes
+    var count: u32 = 0;
+    while (cpu.inb(COM1 + 5) & 0x01 != 0 and count < 16) {
+        const byte = cpu.inb(COM1);
+        keyboard.handleChar(byte);
+        count += 1;
+    }
+
+    return count > 0;
 }
 
 pub fn putChar(c: u8) void {

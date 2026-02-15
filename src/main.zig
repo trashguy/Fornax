@@ -77,6 +77,13 @@ pub fn main() noreturn {
     arch.init();
     console.puts("Architecture init complete.\n");
 
+    // Phase 23: PIC initialization (remap IRQs before any device init)
+    const pic_mod = @import("pic.zig");
+    pic_mod.init();
+
+    // Phase 23: Serial console input (COM1 IRQ 4)
+    serial.enableRxInterrupt();
+
     // Phase 9: IPC
     ipc.init();
 
@@ -101,6 +108,12 @@ pub fn main() noreturn {
         pci_mod.enumerate();
         if (virtio_net.init()) {
             console.puts("Network ready.\n");
+        }
+
+        // Phase 23: Virtio-input (keyboard)
+        const virtio_input = @import("virtio_input.zig");
+        if (!virtio_input.init()) {
+            console.puts("No keyboard device found.\n");
         }
     }
 

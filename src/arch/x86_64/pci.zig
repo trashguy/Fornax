@@ -106,7 +106,7 @@ pub fn configWrite(bus: u8, slot: u8, func: u8, offset: u8, value: u32) void {
 }
 
 /// Read a 16-bit value from PCI config (reads 32 bits, extracts the right half).
-fn configRead16(bus: u8, slot: u8, func: u8, offset: u8) u16 {
+pub fn configRead16(bus: u8, slot: u8, func: u8, offset: u8) u16 {
     const val = configRead(bus, slot, func, offset & 0xFC);
     if (offset & 2 != 0) {
         return @truncate(val >> 16);
@@ -115,7 +115,7 @@ fn configRead16(bus: u8, slot: u8, func: u8, offset: u8) u16 {
 }
 
 /// Read an 8-bit value from PCI config.
-fn configRead8(bus: u8, slot: u8, func: u8, offset: u8) u8 {
+pub fn configRead8(bus: u8, slot: u8, func: u8, offset: u8) u8 {
     const val = configRead(bus, slot, func, offset & 0xFC);
     const shift: u5 = @intCast((offset & 3) * 8);
     return @truncate(val >> shift);

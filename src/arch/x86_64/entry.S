@@ -185,6 +185,24 @@ ISR_ERR   29      # VMM Communication
 ISR_ERR   30      # Security Exception
 ISR_NOERR 31      # Reserved
 
+# IRQ stubs (vectors 32-47, remapped by PIC)
+ISR_NOERR 32      # IRQ 0 — Timer
+ISR_NOERR 33      # IRQ 1 — Keyboard
+ISR_NOERR 34      # IRQ 2 — Cascade
+ISR_NOERR 35      # IRQ 3 — COM2
+ISR_NOERR 36      # IRQ 4 — COM1
+ISR_NOERR 37      # IRQ 5 — LPT2
+ISR_NOERR 38      # IRQ 6 — Floppy
+ISR_NOERR 39      # IRQ 7 — LPT1 / Spurious
+ISR_NOERR 40      # IRQ 8 — RTC
+ISR_NOERR 41      # IRQ 9 — Free
+ISR_NOERR 42      # IRQ 10 — Free
+ISR_NOERR 43      # IRQ 11 — Free
+ISR_NOERR 44      # IRQ 12 — PS/2 Mouse
+ISR_NOERR 45      # IRQ 13 — FPU
+ISR_NOERR 46      # IRQ 14 — Primary ATA
+ISR_NOERR 47      # IRQ 15 — Secondary ATA
+
 .align 16
 isr_common:
     # Save all GPRs to build ExceptionFrame on stack
@@ -242,6 +260,10 @@ isr_stub_table:
     .quad isr_stub_20, isr_stub_21, isr_stub_22, isr_stub_23
     .quad isr_stub_24, isr_stub_25, isr_stub_26, isr_stub_27
     .quad isr_stub_28, isr_stub_29, isr_stub_30, isr_stub_31
+    .quad isr_stub_32, isr_stub_33, isr_stub_34, isr_stub_35
+    .quad isr_stub_36, isr_stub_37, isr_stub_38, isr_stub_39
+    .quad isr_stub_40, isr_stub_41, isr_stub_42, isr_stub_43
+    .quad isr_stub_44, isr_stub_45, isr_stub_46, isr_stub_47
 
 # =============================================================================
 # resume_user_mode — First-run return to userspace via IRETQ

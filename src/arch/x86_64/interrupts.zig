@@ -6,6 +6,7 @@ const cpu = @import("cpu.zig");
 const paging = @import("paging.zig");
 const supervisor = @import("../../supervisor.zig");
 const process = @import("../../process.zig");
+const pic = @import("../../pic.zig");
 
 const exception_names = [_][]const u8{
     "Division Error", // 0
@@ -42,7 +43,50 @@ const exception_names = [_][]const u8{
     "Reserved", // 31
 };
 
+/// IRQ handler function type. Returns true if it handled the IRQ.
+pub const IrqHandler = *const fn () bool;
+
+/// Handler table for IRQs 0-15 (vectors 32-47).
+/// Each slot supports up to 2 handlers for IRQ sharing.
+const MAX_HANDLERS_PER_IRQ: usize = 2;
+var irq_handlers: [16][MAX_HANDLERS_PER_IRQ]?IrqHandler = [_][MAX_HANDLERS_PER_IRQ]?IrqHandler{
+    [_]?IrqHandler{null} ** MAX_HANDLERS_PER_IRQ,
+} ** 16;
+
+/// Register an IRQ handler. Returns false if no slot available.
+pub fn registerIrqHandler(irq: u8, handler: IrqHandler) bool {
+    if (irq >= 16) return false;
+    for (&irq_handlers[irq]) |*slot| {
+        if (slot.* == null) {
+            slot.* = handler;
+            return true;
+        }
+    }
+    return false;
+}
+
 pub fn handleException(frame: *idt.ExceptionFrame) void {
+    // IRQ dispatch (vectors 32-47)
+    if (frame.vector >= 32 and frame.vector < 48) {
+        const irq: u8 = @intCast(frame.vector - 32);
+        var handled = false;
+
+        for (irq_handlers[irq]) |maybe_handler| {
+            if (maybe_handler) |handler| {
+                if (handler()) handled = true;
+            }
+        }
+
+        if (!handled) {
+            serial.puts("IRQ ");
+            serial.putDec(irq);
+            serial.puts(": unhandled\n");
+        }
+
+        pic.sendEoi(irq);
+        return;
+    }
+
     // Check if the fault came from user mode (RPL=3 in CS)
     const from_user = (frame.cs & 3) == 3;
 
