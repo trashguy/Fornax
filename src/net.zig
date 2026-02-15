@@ -84,6 +84,9 @@ pub fn poll() void {
     // Run TCP retransmit/timeout timers
     tcp.tick(timer.getTicks());
 
+    // Run ICMP timeout checks
+    icmp.checkTimeouts(timer.getTicks());
+
     // Check for pending DNS responses
     dns.checkForResponse();
 }

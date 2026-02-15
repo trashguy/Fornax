@@ -81,7 +81,7 @@ pub const ResourceQuotas = struct {
     cpu_priority: u8 = 128, // 0=lowest, 255=highest
 };
 
-pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, console_read, net_read, net_connect, net_listen, dns_query };
+pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, console_read, net_read, net_connect, net_listen, dns_query, icmp_read };
 
 pub const FdType = enum(u8) { ipc, net };
 
@@ -96,6 +96,9 @@ pub const NetFdKind = enum(u8) {
     dns_query,
     dns_ctl,
     dns_cache,
+    icmp_clone,
+    icmp_ctl,
+    icmp_data,
 };
 
 /// File descriptor entry: channel ID + which end of the channel.
@@ -474,6 +477,49 @@ fn switchTo(proc: *Process) noreturn {
             } else {
                 // Still no data — re-block
                 tcp.setReadWaiter(fd_entry.net_conn, @intCast(proc.pid));
+                proc.state = .blocked;
+                current = null;
+                scheduleNext();
+            }
+        } else {
+            proc.syscall_ret = 0;
+        }
+        proc.ipc_recv_buf_ptr = 0;
+        proc.pending_op = .none;
+        proc.pending_fd = 0;
+    }
+
+    // ICMP read delivery — address space is active, so user pointers are valid
+    if (proc.pending_op == .icmp_read) {
+        const net_mod = @import("net.zig");
+        const netfs = net_mod.netfs;
+        const icmp_mod = net_mod.icmp;
+
+        if (proc.ipc_recv_buf_ptr != 0 and proc.ipc_recv_buf_ptr < 0x0000_8000_0000_0000) {
+            const fd_entry = proc.getFdEntryPtr(proc.pending_fd) orelse {
+                proc.syscall_ret = 0;
+                proc.pending_op = .none;
+                proc.ipc_recv_buf_ptr = 0;
+                proc.pending_fd = 0;
+                if (proc.saved_kernel_rsp != 0) {
+                    const frame: [*]u64 = @ptrFromInt(proc.saved_kernel_rsp);
+                    frame[12] = proc.syscall_ret;
+                    proc.saved_kernel_rsp = 0;
+                    syscall_entry.resume_from_kernel_frame(@intFromPtr(frame));
+                } else {
+                    resume_user_mode(proc.user_rip, proc.user_rsp, proc.user_rflags, proc.syscall_ret);
+                }
+            };
+
+            const dest: [*]u8 = @ptrFromInt(proc.ipc_recv_buf_ptr);
+            const buf_size: u16 = @intCast(@min(proc.syscall_ret, 4096));
+            const result = netfs.netRead(fd_entry.net_kind, fd_entry.net_conn, dest[0..buf_size], &fd_entry.net_read_done);
+
+            if (result) |n| {
+                proc.syscall_ret = n;
+            } else {
+                // Still no data — re-block (timeout or spurious wake)
+                icmp_mod.setReadWaiter(fd_entry.net_conn, @intCast(proc.pid));
                 proc.state = .blocked;
                 current = null;
                 scheduleNext();

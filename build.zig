@@ -110,6 +110,19 @@ pub fn build(b: *std.Build) void {
     });
     dnstest_exe.image_base = user_image_base;
 
+    const ping_exe = b.addExecutable(.{
+        .name = "ping",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/ping/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    ping_exe.image_base = user_image_base;
+
     const ramfs_exe = b.addExecutable(.{
         .name = "ramfs",
         .root_module = b.createModule(.{
@@ -158,7 +171,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // ── Initrd: pack userspace programs into INITRD image ────────────
-    const x86_initrd = addInitrdStep(b, mkinitrd, "esp/EFI/BOOT", &.{ ramfs_exe, init_exe, fsh_exe, hello_exe, tcptest_exe, dnstest_exe });
+    const x86_initrd = addInitrdStep(b, mkinitrd, "esp/EFI/BOOT", &.{ ramfs_exe, init_exe, fsh_exe, hello_exe, tcptest_exe, dnstest_exe, ping_exe });
     x86_initrd.step.dependOn(&x86_install.step); // ensure ESP dir exists
 
     // ── aarch64 UEFI kernel ─────────────────────────────────────────

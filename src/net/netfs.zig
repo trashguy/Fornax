@@ -1,20 +1,24 @@
-/// Net file interface: maps /net/* paths to TCP/DNS kernel operations.
+/// Net file interface: maps /net/* paths to TCP/DNS/ICMP kernel operations.
 ///
 /// Implements the Plan 9 style file interface for network connections:
-///   /net/tcp/clone     — allocate a new TCP connection
-///   /net/tcp/N/ctl     — control (connect/announce)
-///   /net/tcp/N/data    — read/write data
-///   /net/tcp/N/listen  — accept incoming connections
-///   /net/tcp/N/status  — connection state
-///   /net/tcp/N/local   — local address
-///   /net/tcp/N/remote  — remote address
-///   /net/dns           — DNS query
-///   /net/dns/ctl       — DNS configuration
-///   /net/dns/cache     — DNS cache dump
+///   /net/tcp/clone      — allocate a new TCP connection
+///   /net/tcp/N/ctl      — control (connect/announce)
+///   /net/tcp/N/data     — read/write data
+///   /net/tcp/N/listen   — accept incoming connections
+///   /net/tcp/N/status   — connection state
+///   /net/tcp/N/local    — local address
+///   /net/tcp/N/remote   — remote address
+///   /net/dns            — DNS query
+///   /net/dns/ctl        — DNS configuration
+///   /net/dns/cache      — DNS cache dump
+///   /net/icmp/clone     — allocate a new ICMP connection
+///   /net/icmp/N/ctl     — control (connect IP)
+///   /net/icmp/N/data    — send echo request / read reply
 const serial = @import("../serial.zig");
 const process = @import("../process.zig");
 const tcp = @import("tcp.zig");
 const dns = @import("dns.zig");
+const icmp = @import("icmp.zig");
 const net = @import("../net.zig");
 const timer = @import("../timer.zig");
 
@@ -56,6 +60,17 @@ pub fn netOpen(path: []const u8) ?OpenResult {
 
     if (eql(path, "dns/cache")) {
         return .{ .kind = .dns_cache, .conn = 0 };
+    }
+
+    if (startsWith(path, "icmp/clone")) {
+        const idx = icmp.alloc() orelse return null;
+        return .{ .kind = .icmp_clone, .conn = idx };
+    }
+
+    if (startsWith(path, "icmp/")) {
+        const rest = path[5..];
+        const parsed = parseIcmpConnPath(rest) orelse return null;
+        return .{ .kind = parsed.kind, .conn = parsed.conn };
     }
 
     return null;
@@ -146,6 +161,32 @@ pub fn netRead(kind: NetFdKind, conn: u8, buf: []u8, read_done: *bool) ?u16 {
             read_done.* = true;
             return len;
         },
+        .icmp_clone => {
+            if (read_done.*) return 0;
+            const len = formatDec(buf, conn);
+            buf[len] = '\n';
+            read_done.* = true;
+            return len + 1;
+        },
+        .icmp_data => {
+            // Try to read reply text
+            if (icmp.hasReply(conn)) {
+                const n = icmp.getReplyText(conn, buf);
+                if (n > 0) return n;
+            }
+            // Check for timeout
+            if (icmp.isTimedOut(conn)) {
+                icmp.clearTimeout(conn);
+                const timeout_msg = "timeout\n";
+                @memcpy(buf[0..timeout_msg.len], timeout_msg);
+                return timeout_msg.len;
+            }
+            // No reply yet — caller should block
+            return null;
+        },
+        .icmp_ctl => {
+            return 0;
+        },
     }
 }
 
@@ -166,6 +207,16 @@ pub fn netWrite(kind: NetFdKind, conn: u8, data: []const u8) ?u16 {
         .dns_ctl => {
             return handleDnsCtlWrite(data);
         },
+        .icmp_ctl => {
+            return handleIcmpCtlWrite(conn, data);
+        },
+        .icmp_data => {
+            // Write to data triggers sending an echo request
+            if (icmp.sendEchoRequest(conn, net.getIp())) {
+                return @intCast(data.len);
+            }
+            return 0;
+        },
         else => return 0,
     }
 }
@@ -176,7 +227,10 @@ pub fn netClose(kind: NetFdKind, conn: u8) void {
         .tcp_data => {
             tcp.startClose(conn);
         },
-        else => {}, // other fd types don't need close actions
+        .icmp_data => {
+            icmp.close(conn);
+        },
+        else => {},
     }
 }
 
@@ -257,6 +311,45 @@ fn handleDnsCtlWrite(data: []const u8) ?u16 {
     }
 
     return 0;
+}
+
+fn handleIcmpCtlWrite(conn: u8, data: []const u8) ?u16 {
+    const trimmed = trimNewline(data);
+
+    if (startsWith(trimmed, "connect ")) {
+        const ip_str = trimmed[8..];
+        const ip = parseIp(ip_str) orelse {
+            serial.puts("netfs: bad icmp connect address\n");
+            return 0;
+        };
+        icmp.setDst(conn, ip);
+        return @intCast(data.len);
+    }
+
+    serial.puts("netfs: unknown icmp ctl command\n");
+    return 0;
+}
+
+fn parseIcmpConnPath(path: []const u8) ?ConnPathResult {
+    // Parse "N/subfile" where N is a decimal connection index
+    var i: usize = 0;
+    while (i < path.len and path[i] >= '0' and path[i] <= '9') : (i += 1) {}
+    if (i == 0) return null;
+
+    const conn_num = parseDec(path[0..i]) orelse return null;
+    if (conn_num >= 4) return null;
+
+    if (i >= path.len or path[i] != '/') return null;
+    const subfile = path[i + 1 ..];
+
+    const kind: NetFdKind = if (eql(subfile, "ctl"))
+        .icmp_ctl
+    else if (eql(subfile, "data"))
+        .icmp_data
+    else
+        return null;
+
+    return .{ .conn = @intCast(conn_num), .kind = kind };
 }
 
 // ── Path parsing helpers ────────────────────────────────────────────

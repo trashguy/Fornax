@@ -475,11 +475,16 @@ fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
         }
 
         // null means block — register waiter and block
-        tcp.setReadWaiter(entry_ptr.net_conn, @intCast(proc.pid));
-        proc.pending_op = .net_read;
+        if (entry_ptr.net_kind == .icmp_data) {
+            const icmp_mod = net.icmp;
+            icmp_mod.setReadWaiter(entry_ptr.net_conn, @intCast(proc.pid));
+            proc.pending_op = .icmp_read;
+        } else {
+            tcp.setReadWaiter(entry_ptr.net_conn, @intCast(proc.pid));
+            proc.pending_op = .net_read;
+        }
         proc.pending_fd = @intCast(fd);
         proc.ipc_recv_buf_ptr = buf_ptr;
-        // Stash count for when we wake up
         proc.syscall_ret = count;
         proc.state = .blocked;
         process.scheduleNext();
@@ -682,7 +687,7 @@ fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
         .stat => {
             client_proc.syscall_ret = if (is_ok) 0 else EIO;
         },
-        .console_read, .net_read, .net_connect, .net_listen, .dns_query => {
+        .console_read, .net_read, .net_connect, .net_listen, .dns_query, .icmp_read => {
             // These don't go through IPC — should not happen here
         },
         .none => {
