@@ -84,6 +84,32 @@ pub fn build(b: *std.Build) void {
     });
     hello_exe.image_base = user_image_base;
 
+    const tcptest_exe = b.addExecutable(.{
+        .name = "tcptest",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/tcptest/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    tcptest_exe.image_base = user_image_base;
+
+    const dnstest_exe = b.addExecutable(.{
+        .name = "dnstest",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/dnstest/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    dnstest_exe.image_base = user_image_base;
+
     const ramfs_exe = b.addExecutable(.{
         .name = "ramfs",
         .root_module = b.createModule(.{
@@ -132,7 +158,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // ── Initrd: pack userspace programs into INITRD image ────────────
-    const x86_initrd = addInitrdStep(b, mkinitrd, "esp/EFI/BOOT", &.{ ramfs_exe, init_exe, fsh_exe, hello_exe });
+    const x86_initrd = addInitrdStep(b, mkinitrd, "esp/EFI/BOOT", &.{ ramfs_exe, init_exe, fsh_exe, hello_exe, tcptest_exe, dnstest_exe });
     x86_initrd.step.dependOn(&x86_install.step); // ensure ESP dir exists
 
     // ── aarch64 UEFI kernel ─────────────────────────────────────────

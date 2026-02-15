@@ -81,16 +81,36 @@ pub const ResourceQuotas = struct {
     cpu_priority: u8 = 128, // 0=lowest, 255=highest
 };
 
-pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, console_read };
+pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, console_read, net_read, net_connect, net_listen, dns_query };
+
+pub const FdType = enum(u8) { ipc, net };
+
+pub const NetFdKind = enum(u8) {
+    tcp_clone,
+    tcp_ctl,
+    tcp_data,
+    tcp_listen,
+    tcp_local,
+    tcp_remote,
+    tcp_status,
+    dns_query,
+    dns_ctl,
+    dns_cache,
+};
 
 /// File descriptor entry: channel ID + which end of the channel.
 pub const FdEntry = struct {
+    fd_type: FdType = .ipc,
     channel_id: ipc.ChannelId,
     is_server: bool,
     /// Read offset for kernel-backed channels (initrd files).
     read_offset: u32,
     /// Server-assigned handle (0 = none / raw channel or kernel-backed, >0 = server file handle).
     server_handle: u32,
+    /// Net-specific fields (only used when fd_type == .net)
+    net_kind: NetFdKind = .tcp_clone,
+    net_conn: u8 = 0,
+    net_read_done: bool = false,
 };
 
 pub const Process = struct {
@@ -152,6 +172,26 @@ pub const Process = struct {
         for (3..MAX_FDS) |i| {
             if (self.fds[i] == null) {
                 self.fds[i] = .{ .channel_id = channel_id, .is_server = is_server, .read_offset = 0, .server_handle = 0 };
+                return @intCast(i);
+            }
+        }
+        return null;
+    }
+
+    /// Allocate a net fd for /net/* paths.
+    pub fn allocNetFd(self: *Process, kind: NetFdKind, conn: u8) ?u32 {
+        for (3..MAX_FDS) |i| {
+            if (self.fds[i] == null) {
+                self.fds[i] = .{
+                    .fd_type = .net,
+                    .channel_id = 0,
+                    .is_server = false,
+                    .read_offset = 0,
+                    .server_handle = 0,
+                    .net_kind = kind,
+                    .net_conn = conn,
+                    .net_read_done = false,
+                };
                 return @intCast(i);
             }
         }
@@ -364,6 +404,10 @@ pub fn scheduleNext() noreturn {
         }
 
         if (any_alive) {
+            // Poll network — processes TCP segments and timer ticks
+            const net = @import("net.zig");
+            net.poll();
+
             // All blocked — enable interrupts and halt until an IRQ fires.
             // The IRQ handler may wake a process (e.g., keyboard input).
             current = null;
@@ -396,6 +440,56 @@ fn switchTo(proc: *Process) noreturn {
     // Switch address space
     if (proc.pml4) |pml4| {
         paging.switchAddressSpace(pml4);
+    }
+
+    // Net read delivery — address space is active, so user pointers are valid
+    if (proc.pending_op == .net_read) {
+        const net_mod = @import("net.zig");
+        const netfs = net_mod.netfs;
+        const tcp = net_mod.tcp;
+
+        if (proc.ipc_recv_buf_ptr != 0 and proc.ipc_recv_buf_ptr < 0x0000_8000_0000_0000) {
+            const fd_entry = proc.getFdEntryPtr(proc.pending_fd) orelse {
+                proc.syscall_ret = 0;
+                proc.pending_op = .none;
+                proc.ipc_recv_buf_ptr = 0;
+                proc.pending_fd = 0;
+                // fall through to resume
+                if (proc.saved_kernel_rsp != 0) {
+                    const frame: [*]u64 = @ptrFromInt(proc.saved_kernel_rsp);
+                    frame[12] = proc.syscall_ret;
+                    proc.saved_kernel_rsp = 0;
+                    syscall_entry.resume_from_kernel_frame(@intFromPtr(frame));
+                } else {
+                    resume_user_mode(proc.user_rip, proc.user_rsp, proc.user_rflags, proc.syscall_ret);
+                }
+            };
+
+            const dest: [*]u8 = @ptrFromInt(proc.ipc_recv_buf_ptr);
+            const buf_size: u16 = @intCast(@min(proc.syscall_ret, 4096));
+            const result = netfs.netRead(fd_entry.net_kind, fd_entry.net_conn, dest[0..buf_size], &fd_entry.net_read_done);
+
+            if (result) |n| {
+                proc.syscall_ret = n;
+            } else {
+                // Still no data — re-block
+                tcp.setReadWaiter(fd_entry.net_conn, @intCast(proc.pid));
+                proc.state = .blocked;
+                current = null;
+                scheduleNext();
+            }
+        } else {
+            proc.syscall_ret = 0;
+        }
+        proc.ipc_recv_buf_ptr = 0;
+        proc.pending_op = .none;
+        proc.pending_fd = 0;
+    }
+
+    // Net connect/listen/dns delivery — just clear pending_op (syscall_ret already set by waker)
+    if (proc.pending_op == .net_connect or proc.pending_op == .net_listen or proc.pending_op == .dns_query) {
+        proc.pending_op = .none;
+        proc.pending_fd = 0;
     }
 
     // Console read delivery — address space is active, so user pointers are valid

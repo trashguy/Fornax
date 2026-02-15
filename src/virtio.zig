@@ -303,17 +303,11 @@ fn read8(base: u16, offset: u16) u8 {
 }
 
 fn read16(base: u16, offset: u16) u16 {
-    const lo: u16 = cpu.inb(base + offset);
-    const hi: u16 = cpu.inb(base + offset + 1);
-    return lo | (hi << 8);
+    return cpu.inw(base + offset);
 }
 
 fn read32(base: u16, offset: u16) u32 {
-    const b0: u32 = cpu.inb(base + offset);
-    const b1: u32 = cpu.inb(base + offset + 1);
-    const b2: u32 = cpu.inb(base + offset + 2);
-    const b3: u32 = cpu.inb(base + offset + 3);
-    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    return cpu.inl(base + offset);
 }
 
 fn write8(base: u16, offset: u16, val: u8) void {
@@ -321,13 +315,9 @@ fn write8(base: u16, offset: u16, val: u8) void {
 }
 
 fn write16(base: u16, offset: u16, val: u16) void {
-    cpu.outb(base + offset, @truncate(val));
-    cpu.outb(base + offset + 1, @truncate(val >> 8));
+    cpu.outw(base + offset, val);
 }
 
 fn write32(base: u16, offset: u16, val: u32) void {
-    cpu.outb(base + offset, @truncate(val));
-    cpu.outb(base + offset + 1, @truncate(val >> 8));
-    cpu.outb(base + offset + 2, @truncate(val >> 16));
-    cpu.outb(base + offset + 3, @truncate(val >> 24));
+    cpu.outl(base + offset, val);
 }

@@ -120,7 +120,11 @@ pub fn main() noreturn {
         }
     }
 
-    // Phase 16: IP stack
+    // Phase 100: Timer tick counter (for TCP retransmission)
+    const timer = @import("timer.zig");
+    timer.init();
+
+    // Phase 16+100: IP stack + TCP/DNS
     net.init();
 
     // Phase 20: Initrd

@@ -80,7 +80,10 @@ fn mmioWrite32(addr: usize, val: u32) void {
 fn resolveBarOffset(dev: *pci.PciDevice, bar_index: u8, offset: u32) ?usize {
     if (bar_index >= 6) return null;
     const bar_base = dev.memBase(@intCast(bar_index)) orelse return null;
-    return @intCast(bar_base + offset);
+    const addr = bar_base + offset;
+    // Only identity-mapped first 4 GB is accessible without extra page mappings
+    if (addr >= 0x1_0000_0000) return null;
+    return @intCast(addr);
 }
 
 /// Parse PCI capabilities to find virtio modern MMIO regions.

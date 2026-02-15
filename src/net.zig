@@ -11,6 +11,9 @@ pub const arp = @import("net/arp.zig");
 pub const ipv4 = @import("net/ipv4.zig");
 pub const icmp = @import("net/icmp.zig");
 pub const udp = @import("net/udp.zig");
+pub const tcp = @import("net/tcp.zig");
+pub const dns = @import("net/dns.zig");
+pub const netfs = @import("net/netfs.zig");
 
 var our_mac: [6]u8 = .{ 0, 0, 0, 0, 0, 0 };
 var our_ip: [4]u8 = .{ 10, 0, 2, 15 }; // QEMU user-mode default
@@ -32,6 +35,8 @@ pub fn init() void {
     printIpConsole(gateway_ip);
     console.puts("\n");
 
+    tcp.init();
+    dns.init();
     initialized = true;
 }
 
@@ -63,12 +68,24 @@ pub fn isInitialized() bool {
 }
 
 /// Poll for incoming packets and process them.
-/// Call this from the main loop or a timer interrupt.
+/// Processes up to 64 frames per call, then runs TCP timers and DNS checks.
 pub fn poll() void {
     if (!initialized) return;
 
-    const frame = virtio_net.poll() orelse return;
-    handleFrame(frame);
+    const timer = @import("timer.zig");
+
+    // Process multiple pending frames
+    var frames: usize = 0;
+    while (frames < 64) : (frames += 1) {
+        const frame = virtio_net.poll() orelse break;
+        handleFrame(frame);
+    }
+
+    // Run TCP retransmit/timeout timers
+    tcp.tick(timer.getTicks());
+
+    // Check for pending DNS responses
+    dns.checkForResponse();
 }
 
 /// Process a raw Ethernet frame.
@@ -103,6 +120,7 @@ fn handleIpv4(payload: []const u8) void {
 
     switch (ip_pkt.header.protocol) {
         ipv4.PROTO_ICMP => handleIcmp(ip_pkt.payload, ip_pkt.header),
+        ipv4.PROTO_TCP => tcp.handlePacket(ip_pkt.payload, ip_pkt.header),
         ipv4.PROTO_UDP => udp.handlePacket(ip_pkt.payload, ip_pkt.header),
         else => {
             serial.puts("ipv4: unknown protocol ");
@@ -168,7 +186,7 @@ fn printIpConsole(ip: [4]u8) void {
     console.putDec(ip[3]);
 }
 
-fn printIpSerial(ip: [4]u8) void {
+pub fn printIpSerial(ip: [4]u8) void {
     serial.putDec(ip[0]);
     serial.putChar('.');
     serial.putDec(ip[1]);

@@ -153,6 +153,43 @@ fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
     if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
     if (count == 0) return 0;
 
+    // Net fd: dispatch to netfs
+    if (entry.fd_type == .net) {
+        const net = @import("net.zig");
+        const netfs = net.netfs;
+        const tcp = net.tcp;
+        const dns = net.dns;
+
+        const buf: [*]const u8 = @ptrFromInt(buf_ptr);
+        const data_len: u16 = @intCast(@min(count, 4096));
+
+        const result = netfs.netWrite(entry.net_kind, entry.net_conn, buf[0..data_len]);
+        if (result) |n| {
+            return n;
+        }
+
+        // null means block — depends on the kind
+        if (entry.net_kind == .tcp_ctl) {
+            // Block until connect completes
+            tcp.setConnectWaiter(entry.net_conn, @intCast(proc.pid));
+            proc.pending_op = .net_connect;
+            proc.pending_fd = @intCast(fd);
+            proc.syscall_ret = data_len;
+            proc.state = .blocked;
+            process.scheduleNext();
+        } else if (entry.net_kind == .dns_query) {
+            // Block until DNS response arrives
+            dns.setWaiter(@intCast(proc.pid));
+            proc.pending_op = .dns_query;
+            proc.pending_fd = @intCast(fd);
+            proc.syscall_ret = data_len;
+            proc.state = .blocked;
+            process.scheduleNext();
+        }
+
+        return 0;
+    }
+
     const chan = ipc.getChannel(entry.channel_id) orelse return EBADF;
     const buf: [*]const u8 = @ptrFromInt(buf_ptr);
 
@@ -288,13 +325,40 @@ fn sysWait(pid_arg: u64) u64 {
 /// open(path_ptr, path_len) → fd
 /// Resolves path in the process's namespace. For kernel-backed channels (initrd),
 /// allocates fd directly. For server channels, sends T_OPEN and blocks for reply.
+/// Paths starting with /net/ are intercepted for kernel TCP/DNS.
 fn sysOpen(path_ptr: u64, path_len: u64) u64 {
     const proc = process.getCurrent() orelse return ENOSYS;
     if (path_ptr >= 0x0000_8000_0000_0000) return EFAULT;
     if (path_len == 0 or path_len > 256) return ENOENT;
 
     const path: [*]const u8 = @ptrFromInt(path_ptr);
-    const resolved = proc.ns.resolve(path[0..@intCast(path_len)]) orelse return ENOENT;
+    const path_slice = path[0..@intCast(path_len)];
+
+    // Intercept /net/* paths for kernel TCP/DNS
+    if (path_len > 5 and path_slice[0] == '/' and path_slice[1] == 'n' and
+        path_slice[2] == 'e' and path_slice[3] == 't' and path_slice[4] == '/')
+    {
+        const net = @import("net.zig");
+        const netfs = net.netfs;
+
+        const result = netfs.netOpen(path_slice[5..]) orelse return ENOENT;
+        const fd = proc.allocNetFd(result.kind, result.conn) orelse return EMFILE;
+
+        // For tcp/N/listen, block until a connection arrives
+        if (result.kind == .tcp_listen) {
+            const tcp = net.tcp;
+            tcp.setListenWaiter(result.conn, @intCast(proc.pid));
+            proc.pending_op = .net_listen;
+            proc.pending_fd = fd;
+            proc.syscall_ret = fd;
+            proc.state = .blocked;
+            process.scheduleNext();
+        }
+
+        return fd;
+    }
+
+    const resolved = proc.ns.resolve(path_slice) orelse return ENOENT;
 
     const chan = ipc.getChannel(resolved.channel_id) orelse return ENOENT;
 
@@ -396,6 +460,31 @@ fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
     if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
     if (count == 0) return 0;
 
+    // Net fd: dispatch to netfs
+    if (entry_ptr.fd_type == .net) {
+        const net = @import("net.zig");
+        const netfs = net.netfs;
+        const tcp = net.tcp;
+
+        const dest: [*]u8 = @ptrFromInt(buf_ptr);
+        const buf_size: u16 = @intCast(@min(count, 4096));
+
+        const result = netfs.netRead(entry_ptr.net_kind, entry_ptr.net_conn, dest[0..buf_size], &entry_ptr.net_read_done);
+        if (result) |n| {
+            return n;
+        }
+
+        // null means block — register waiter and block
+        tcp.setReadWaiter(entry_ptr.net_conn, @intCast(proc.pid));
+        proc.pending_op = .net_read;
+        proc.pending_fd = @intCast(fd);
+        proc.ipc_recv_buf_ptr = buf_ptr;
+        // Stash count for when we wake up
+        proc.syscall_ret = count;
+        proc.state = .blocked;
+        process.scheduleNext();
+    }
+
     const chan = ipc.getChannel(entry_ptr.channel_id) orelse return EBADF;
 
     // Kernel-backed channel (initrd file server): serve directly, no IPC
@@ -450,6 +539,14 @@ fn sysClose(fd: u64) u64 {
     if (fd >= 32) return EBADF;
 
     const entry = proc.getFdEntry(@intCast(fd)) orelse return EBADF;
+
+    // Net fd: dispatch to netfs
+    if (entry.fd_type == .net) {
+        const net = @import("net.zig");
+        net.netfs.netClose(entry.net_kind, entry.net_conn);
+        proc.closeFd(@intCast(fd));
+        return 0;
+    }
 
     // Server-backed fd: send T_CLOSE to server before closing locally
     if (entry.server_handle > 0) {
@@ -585,8 +682,8 @@ fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
         .stat => {
             client_proc.syscall_ret = if (is_ok) 0 else EIO;
         },
-        .console_read => {
-            // Should not happen — console_read doesn't go through IPC
+        .console_read, .net_read, .net_connect, .net_listen, .dns_query => {
+            // These don't go through IPC — should not happen here
         },
         .none => {
             // Raw IPC (existing behavior for servers using ipc_recv/ipc_reply directly)

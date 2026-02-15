@@ -24,33 +24,13 @@
 | 23 | TTY / interactive console (keyboard input) | Done |
 | 24 | Shell (fsh — Fornax shell, builtins + spawn) | Done |
 
-## Next: Userspace Separation (Phases 22-25)
-
-The kernel can create processes and run ELFs, but everything is baked in at
-compile time via `@embedFile`. These phases decouple userspace from the kernel
-and build toward an interactive shell.
-
-**Each phase has explicit decision points** — questions about approach and
-tradeoffs to discuss before implementing.
-
-| Phase | Description | Depends On | Key Decision |
-|-------|-------------|------------|--------------|
-| 17 | `spawn` syscall (create child process from userspace) | 10 | **Done** |
-| 18 | `exec` syscall (replace current process image) | 17 | **Done** |
-| 19 | `wait`/`exit` lifecycle (parent-child, reaping) | 17 | **Done** |
-| 20 | Initrd (ramdisk loaded by UEFI) | 17 | **Done** |
-| 21 | Init process (PID 1, userspace service spawning) | 19, 20 | **Done** |
-| 22 | Ramfs (in-memory filesystem server) | 21, 9 | **Done** |
-| 23 | TTY / interactive console (keyboard input) | 12, 22 | **Done** |
-| 24 | Shell (command prompt, spawn+wait loop) | 23, 17, 19 | **Done** |
-| 25 | Login / getty (authentication layer) | 24 | Defer? Single-user OK for now? |
-
 ## Later: Networking (100-series)
 
 | Phase | Description | Depends On |
 |-------|-------------|------------|
 | 100 | TCP | 16 |
 | 101 | DNS resolver | 16 |
+| 150 | Login / getty (Plan 9-style auth) | 24, 100 |
 
 ## Later: Clustering (200-series, optional, `-Dcluster=true`)
 
@@ -69,7 +49,7 @@ Build with: `zig build x86_64 -Dcluster=true`
 
 | Phase | Description | Depends On |
 |-------|-------------|------------|
-| 1000 | C/C++/Go support — freestanding C, minimal libc, musl port, POSIX realms | 17-25 |
+| 1000 | C/C++/Go support — freestanding C, minimal libc, musl port, POSIX realms | 17-24 |
 
 ## Future: Deployment + Orchestration (3000-series, optional, `-Dviceroy=true`)
 
@@ -135,7 +115,7 @@ Phase 18: exec   Phase 19: wait/exit         Phase 20: initrd
     └───────────────> Phase 24: shell
                               |
                               v
-                      Phase 25: login/getty (optional)
+                      Phase 150: login/getty (after networking)
 
 
 Phase 16 (done) ─────┐

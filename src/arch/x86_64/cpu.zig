@@ -28,6 +28,36 @@ pub fn inb(port: u16) u8 {
     );
 }
 
+pub fn outl(port: u16, val: u32) void {
+    asm volatile ("outl %[val], %[port]"
+        :
+        : [val] "{eax}" (val),
+          [port] "N{dx}" (port),
+    );
+}
+
+pub fn inl(port: u16) u32 {
+    return asm volatile ("inl %[port], %[val]"
+        : [val] "={eax}" (-> u32),
+        : [port] "N{dx}" (port),
+    );
+}
+
+pub fn outw(port: u16, val: u16) void {
+    asm volatile ("outw %[val], %[port]"
+        :
+        : [val] "{ax}" (val),
+          [port] "N{dx}" (port),
+    );
+}
+
+pub fn inw(port: u16) u16 {
+    return asm volatile ("inw %[port], %[val]"
+        : [val] "={ax}" (-> u16),
+        : [port] "N{dx}" (port),
+    );
+}
+
 /// Read a Model-Specific Register.
 pub fn rdmsr(msr: u32) u64 {
     var low: u32 = undefined;

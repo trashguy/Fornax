@@ -74,16 +74,8 @@ pub fn configRead(bus: u8, slot: u8, func: u8, offset: u8) u32 {
         @as(u32, func) << 8 |
         (@as(u32, offset) & 0xFC);
 
-    cpu.outb(CONFIG_ADDRESS, @truncate(address));
-    cpu.outb(CONFIG_ADDRESS + 1, @truncate(address >> 8));
-    cpu.outb(CONFIG_ADDRESS + 2, @truncate(address >> 16));
-    cpu.outb(CONFIG_ADDRESS + 3, @truncate(address >> 24));
-
-    const b0: u32 = cpu.inb(CONFIG_DATA);
-    const b1: u32 = cpu.inb(CONFIG_DATA + 1);
-    const b2: u32 = cpu.inb(CONFIG_DATA + 2);
-    const b3: u32 = cpu.inb(CONFIG_DATA + 3);
-    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    cpu.outl(CONFIG_ADDRESS, address);
+    return cpu.inl(CONFIG_DATA);
 }
 
 /// Write a 32-bit value to PCI configuration space.
@@ -94,15 +86,8 @@ pub fn configWrite(bus: u8, slot: u8, func: u8, offset: u8, value: u32) void {
         @as(u32, func) << 8 |
         (@as(u32, offset) & 0xFC);
 
-    cpu.outb(CONFIG_ADDRESS, @truncate(address));
-    cpu.outb(CONFIG_ADDRESS + 1, @truncate(address >> 8));
-    cpu.outb(CONFIG_ADDRESS + 2, @truncate(address >> 16));
-    cpu.outb(CONFIG_ADDRESS + 3, @truncate(address >> 24));
-
-    cpu.outb(CONFIG_DATA, @truncate(value));
-    cpu.outb(CONFIG_DATA + 1, @truncate(value >> 8));
-    cpu.outb(CONFIG_DATA + 2, @truncate(value >> 16));
-    cpu.outb(CONFIG_DATA + 3, @truncate(value >> 24));
+    cpu.outl(CONFIG_ADDRESS, address);
+    cpu.outl(CONFIG_DATA, value);
 }
 
 /// Read a 16-bit value from PCI config (reads 32 bits, extracts the right half).
