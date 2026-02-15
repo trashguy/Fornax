@@ -1,4 +1,4 @@
-# Phase 200: `fe` — Minimal vi-like Editor for Fornax
+# Phase 210: `fe` — Minimal vi-like Editor for Fornax
 
 ## Status: Planned
 

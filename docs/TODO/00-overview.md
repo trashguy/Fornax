@@ -5,7 +5,14 @@
 | Phase | Description | Depends On |
 |-------|-------------|------------|
 | 150 | Login / getty (Plan 9-style auth) | 24, 100 |
-| 200 | fe — minimal vi-like text editor | 24 |
+| 200 | Kernel /proc file tree | 24 |
+| 201 | Implement seek + getpid syscalls | 24 |
+| 202 | File management (cp/mv/rmdir/touch) | 24 |
+| 203 | Text processing (grep/head/tail/sed/awk/less) | 24 |
+| 204 | Process & system mgmt (ps/kill/free/df/du/top) | 200 |
+| 205 | Shell enhancements (if/while/test/&&/||) | 24 |
+| 206 | Permission stubs + ip command | 24 |
+| 210 | fe — minimal vi-like text editor | 24 |
 
 ## Future: Language Support (1000-series)
 
@@ -63,9 +70,17 @@ Build with: `zig build x86_64 -Dviceroy=true`
 ```
 Phases 1-24, 100-101 (done)
          |
-         ├─────────────────────────────────────────┐
-         v                                         v
-  Phase 150: login/getty                   Phase 200: fe editor
+         ├──────────────────────────────────────────────────────────┐
+         v                                                          v
+  Phase 150: login/getty                                    Phase 210: fe editor
+         |
+         ├──────────────────────────────────────────────────────────┐
+         v                                                          v
+  Phase 200: /proc ──────────────────┐           Phases 202, 203, 205, 206
+         |                           v           (independent of each other)
+         |                    Phase 204: ps/kill/free/df/du/top
+         v
+  Phase 201: seek + getpid
 
 
          Phases 1-24 (done)
