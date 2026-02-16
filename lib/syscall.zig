@@ -24,6 +24,8 @@ pub const SYS = enum(u64) {
     ipc_recv = 17,
     ipc_reply = 18,
     spawn = 19,
+    pread = 20,
+    pwrite = 21,
 };
 
 const ipc = @import("ipc.zig");
@@ -122,6 +124,16 @@ pub fn pipe() struct { read_fd: i32, write_fd: i32, err: i32 } {
     const result = syscall1(.pipe, @intFromPtr(&fds));
     if (result != 0) return .{ .read_fd = -1, .write_fd = -1, .err = @bitCast(@as(u32, @truncate(result))) };
     return .{ .read_fd = @bitCast(fds[0]), .write_fd = @bitCast(fds[1]), .err = 0 };
+}
+
+pub fn pread(fd: i32, buf: []u8, offset: u64) isize {
+    const result = syscall4(.pread, @bitCast(@as(i64, fd)), @intFromPtr(buf.ptr), buf.len, offset);
+    return @bitCast(@as(usize, result));
+}
+
+pub fn pwrite(fd: i32, buf: []const u8, offset: u64) isize {
+    const result = syscall4(.pwrite, @bitCast(@as(i64, fd)), @intFromPtr(buf.ptr), buf.len, offset);
+    return @bitCast(@as(usize, result));
 }
 
 /// Build a serialized argv block: [argc: u32][total_len: u32][str0\0str1\0...]

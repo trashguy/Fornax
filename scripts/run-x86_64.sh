@@ -53,6 +53,25 @@ fi
 echo "==> Using OVMF: $OVMF"
 echo "==> Launching QEMU..."
 
+DISK_IMG="$PROJECT_DIR/fornax-disk.img"
+if [ ! -f "$DISK_IMG" ]; then
+    echo "==> Creating blank 64 MB disk image..."
+    dd if=/dev/zero of="$DISK_IMG" bs=1M count=64 status=none
+fi
+
+# Auto-format if disk lacks FXFS magic
+if ! head -c 8 "$DISK_IMG" | grep -q "FXFS0001" 2>/dev/null; then
+    MKFXFS="$PROJECT_DIR/zig-out/bin/mkfxfs"
+    if [ ! -f "$MKFXFS" ]; then
+        echo "==> Building mkfxfs..."
+        (cd "$PROJECT_DIR" && zig build mkfxfs)
+    fi
+    if [ -f "$MKFXFS" ]; then
+        echo "==> Formatting disk with fxfs..."
+        "$MKFXFS" "$DISK_IMG"
+    fi
+fi
+
 exec qemu-system-x86_64 \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF" \
     -drive format=raw,file=fat:rw:"$PROJECT_DIR/zig-out/esp" \
@@ -61,5 +80,7 @@ exec qemu-system-x86_64 \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0 \
     -device virtio-keyboard-pci \
+    -drive file="$DISK_IMG",format=raw,if=none,id=blk0 \
+    -device virtio-blk-pci,drive=blk0 \
     -no-reboot \
     -no-shutdown

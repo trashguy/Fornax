@@ -11,6 +11,7 @@ const process = @import("process.zig");
 const supervisor = @import("supervisor.zig");
 const container = @import("container.zig");
 const virtio_net = @import("virtio_net.zig");
+const virtio_blk = @import("virtio_blk.zig");
 const net = @import("net.zig");
 const initrd = @import("initrd.zig");
 const elf = @import("elf.zig");
@@ -113,6 +114,11 @@ pub fn main() noreturn {
             console.puts("Network ready.\n");
         }
 
+        // Phase 300: Virtio-blk
+        if (virtio_blk.init()) {
+            console.puts("Block device ready.\n");
+        }
+
         // Phase 23: Virtio-input (keyboard)
         const virtio_input = @import("virtio_input.zig");
         if (!virtio_input.init()) {
@@ -133,6 +139,7 @@ pub fn main() noreturn {
     // Phase 21: Mount initrd files at /boot/ and spawn init
     initrd.mountFiles();
     spawnRamfs();
+    spawnFxfs();
     spawnInit();
 
     console.puts("Kernel initialized.\n");
@@ -211,6 +218,88 @@ fn spawnRamfs() void {
     serial.puts("]\n");
 
     console.puts("Spawned ramfs (PID ");
+    console.putDec(proc.pid);
+    console.puts(")\n");
+}
+
+fn spawnFxfs() void {
+    // Only spawn fxfs if virtio-blk is available
+    if (!virtio_blk.isInitialized()) return;
+
+    const fxfs_elf = initrd.findFile("fxfs") orelse {
+        serial.puts("No fxfs in initrd — running without persistent filesystem.\n");
+        return;
+    };
+
+    const proc = process.create() orelse {
+        console.puts("Failed to create fxfs process!\n");
+        return;
+    };
+
+    const load_result = elf.load(proc.pml4.?, fxfs_elf) catch {
+        console.puts("Failed to load fxfs ELF!\n");
+        proc.state = .dead;
+        return;
+    };
+
+    proc.user_rip = load_result.entry_point;
+    proc.brk = load_result.brk;
+
+    // Allocate user stack
+    for (0..process.USER_STACK_PAGES) |i| {
+        const page = pmm.allocPage() orelse {
+            console.puts("Failed to allocate fxfs stack!\n");
+            proc.state = .dead;
+            return;
+        };
+        const ptr: [*]u8 = paging.physPtr(page);
+        @memset(ptr[0..mem.PAGE_SIZE], 0);
+        const vaddr = mem.USER_STACK_TOP - (process.USER_STACK_PAGES - i) * mem.PAGE_SIZE;
+        paging.mapPage(proc.pml4.?, vaddr, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
+            console.puts("Failed to map fxfs stack!\n");
+            proc.state = .dead;
+            return;
+        };
+    }
+    proc.user_rsp = mem.USER_STACK_INIT;
+
+    // Create IPC channel for fxfs
+    const chan = ipc.channelCreate() catch {
+        console.puts("Failed to create fxfs channel!\n");
+        proc.state = .dead;
+        return;
+    };
+
+    // Server end as fd 3
+    proc.setFd(3, chan.server, true);
+
+    // Block device as fd 4
+    proc.fds[4] = .{
+        .fd_type = .blk,
+        .channel_id = 0,
+        .is_server = false,
+        .read_offset = 0,
+        .server_handle = 0,
+    };
+
+    // Mount client end at "/disk/" in root namespace
+    const root_ns = namespace.getRootNamespace();
+    root_ns.mount("/disk/", chan.client, .{ .replace = true }) catch {
+        console.puts("Failed to mount fxfs at /disk/!\n");
+        proc.state = .dead;
+        return;
+    };
+
+    proc.parent_pid = null;
+    root_ns.cloneInto(&proc.ns);
+
+    serial.puts("[fxfs: pid=");
+    serial.putDec(proc.pid);
+    serial.puts(" entry=0x");
+    serial.putHex(load_result.entry_point);
+    serial.puts("]\n");
+
+    console.puts("Spawned fxfs (PID ");
     console.putDec(proc.pid);
     console.puts(")\n");
 }

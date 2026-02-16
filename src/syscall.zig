@@ -37,6 +37,8 @@ pub const SYS = enum(u64) {
     ipc_recv = 17,
     ipc_reply = 18,
     spawn = 19,
+    pread = 20,
+    pwrite = 21,
 };
 
 /// Error return values.
@@ -78,6 +80,9 @@ fn sendToServer(chan: *ipc.Channel, proc: *process.Process) void {
             server_proc.syscall_ret = 0;
             chan.server.recv_waiting = false;
             chan.server.blocked_pid = 0;
+            // Message delivered via ipc_pending_msg — clear pending_msg so
+            // the server's next sysIpcRecv doesn't re-deliver it.
+            chan.client.pending_msg = null;
         }
     }
 }
@@ -117,6 +122,8 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         .spawn => sysSpawn(arg0, arg1, arg2, arg3, arg4),
         .brk => sysBrk(arg0),
         .pipe => sysPipe(arg0),
+        .pread => sysPread(arg0, arg1, arg2, arg3),
+        .pwrite => sysPwrite(arg0, arg1, arg2, arg3),
         .mount, .bind, .unmount, .rfork => {
             serial.puts("syscall: unimplemented nr=");
             serial.putDec(nr);
@@ -437,6 +444,17 @@ fn sysOpen(path_ptr: u64, path_len: u64) u64 {
     const path: [*]const u8 = @ptrFromInt(path_ptr);
     const path_slice = path[0..@intCast(path_len)];
 
+    // Intercept /dev/blk0 for block device
+    if (path_len == 9 and path_slice[0] == '/' and path_slice[1] == 'd' and
+        path_slice[2] == 'e' and path_slice[3] == 'v' and path_slice[4] == '/' and
+        path_slice[5] == 'b' and path_slice[6] == 'l' and path_slice[7] == 'k' and
+        path_slice[8] == '0')
+    {
+        const virtio_blk = @import("virtio_blk.zig");
+        if (!virtio_blk.isInitialized()) return ENOENT;
+        return proc.allocBlkFd() orelse return EMFILE;
+    }
+
     // Intercept /net/* paths for kernel TCP/DNS
     if (path_len > 5 and path_slice[0] == '/' and path_slice[1] == 'n' and
         path_slice[2] == 'e' and path_slice[3] == 't' and path_slice[4] == '/')
@@ -663,6 +681,70 @@ fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
     sendToServer(chan, proc);
     proc.state = .blocked;
     process.scheduleNext();
+}
+
+fn sysPread(fd: u64, buf_ptr: u64, count: u64, offset: u64) u64 {
+    const virtio_blk = @import("virtio_blk.zig");
+
+    const proc = process.getCurrent() orelse return EBADF;
+    const entry_ptr = proc.getFdEntryPtr(@intCast(fd)) orelse return EBADF;
+
+    if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+    if (count == 0) return 0;
+
+    if (entry_ptr.fd_type != .blk) return EBADF;
+
+    // Block device: offset and count must be 4096-aligned
+    if (offset % 4096 != 0 or count % 4096 != 0) return EINVAL;
+
+    const block_start = offset / 4096;
+    const block_count = count / 4096;
+    var bytes_read: u64 = 0;
+    var i: u64 = 0;
+
+    while (i < block_count) : (i += 1) {
+        const dest: [*]u8 = @ptrFromInt(buf_ptr + i * 4096);
+        const buf: *[4096]u8 = @ptrCast(dest);
+        if (!virtio_blk.readBlock(block_start + i, buf)) {
+            if (bytes_read > 0) return bytes_read;
+            return EIO;
+        }
+        bytes_read += 4096;
+    }
+
+    return bytes_read;
+}
+
+fn sysPwrite(fd: u64, buf_ptr: u64, count: u64, offset: u64) u64 {
+    const virtio_blk = @import("virtio_blk.zig");
+
+    const proc = process.getCurrent() orelse return EBADF;
+    const entry_ptr = proc.getFdEntryPtr(@intCast(fd)) orelse return EBADF;
+
+    if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+    if (count == 0) return 0;
+
+    if (entry_ptr.fd_type != .blk) return EBADF;
+
+    // Block device: offset and count must be 4096-aligned
+    if (offset % 4096 != 0 or count % 4096 != 0) return EINVAL;
+
+    const block_start = offset / 4096;
+    const block_count = count / 4096;
+    var bytes_written: u64 = 0;
+    var i: u64 = 0;
+
+    while (i < block_count) : (i += 1) {
+        const src: [*]const u8 = @ptrFromInt(buf_ptr + i * 4096);
+        const buf: *const [4096]u8 = @ptrCast(src);
+        if (!virtio_blk.writeBlock(block_start + i, buf)) {
+            if (bytes_written > 0) return bytes_written;
+            return EIO;
+        }
+        bytes_written += 4096;
+    }
+
+    return bytes_written;
 }
 
 /// close(fd) → 0 or error
@@ -902,9 +984,6 @@ fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
         },
         .read => {
             if (is_ok) {
-                serial.puts("[ipc_reply .read: data_len=");
-                serial.putDec(reply_data_len);
-                serial.puts("]\n");
                 if (reply_data_len > 0 and client_proc.ipc_recv_buf_ptr != 0) {
                     // Copy reply data to client's buffer via deferred delivery
                     client_proc.ipc_msg = ipc.Message.init(.r_ok);

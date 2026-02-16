@@ -83,7 +83,7 @@ pub const ResourceQuotas = struct {
 
 pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, remove, console_read, net_read, net_connect, net_listen, dns_query, icmp_read, pipe_read, pipe_write };
 
-pub const FdType = enum(u8) { ipc, net, pipe };
+pub const FdType = enum(u8) { ipc, net, pipe, blk };
 
 pub const NetFdKind = enum(u8) {
     tcp_clone,
@@ -218,6 +218,22 @@ pub const Process = struct {
                     .server_handle = 0,
                     .pipe_id = pipe_id,
                     .pipe_is_read = is_read,
+                };
+                return @intCast(i);
+            }
+        }
+        return null;
+    }
+
+    pub fn allocBlkFd(self: *Process) ?u32 {
+        for (3..MAX_FDS) |i| {
+            if (self.fds[i] == null) {
+                self.fds[i] = .{
+                    .fd_type = .blk,
+                    .channel_id = 0,
+                    .is_server = false,
+                    .read_offset = 0,
+                    .server_handle = 0,
                 };
                 return @intCast(i);
             }

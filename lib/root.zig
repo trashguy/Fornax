@@ -31,6 +31,8 @@ pub const ipc_reply = syscall.ipc_reply;
 pub const spawn = syscall.spawn;
 pub const exec = syscall.exec;
 pub const pipe = syscall.pipe;
+pub const pread = syscall.pread;
+pub const pwrite = syscall.pwrite;
 
 // Re-export IPC types at top level.
 pub const IpcMessage = ipc.IpcMessage;

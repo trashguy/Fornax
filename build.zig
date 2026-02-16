@@ -22,6 +22,15 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // ── Host tool: mkfxfs ──────────────────────────────────────────
+    const mkfxfs = b.addExecutable(.{
+        .name = "mkfxfs",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/mkfxfs.zig"),
+            .target = b.graph.host,
+        }),
+    });
+
     // ── Userspace freestanding x86_64 target ─────────────────────────
     // No float feature restrictions — userspace runs with full CPU features.
     // The kernel disables SSE/AVX to avoid managing FPU state in ring 0,
@@ -214,6 +223,19 @@ pub fn build(b: *std.Build) void {
     });
     ramfs_exe.image_base = user_image_base;
 
+    const fxfs_exe = b.addExecutable(.{
+        .name = "fxfs",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("srv/fxfs/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    fxfs_exe.image_base = user_image_base;
+
     // ── x86_64 UEFI kernel ──────────────────────────────────────────
     const x86_64_target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
@@ -249,7 +271,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // ── Initrd: pack userspace programs into INITRD image ────────────
-    const x86_initrd = addInitrdStep(b, mkinitrd, "esp/EFI/BOOT", &.{ ramfs_exe, init_exe, fsh_exe, hello_exe, tcptest_exe, dnstest_exe, ping_exe, echo_exe, cat_exe, ls_exe, rm_exe, mkdir_exe, wc_exe });
+    const x86_initrd = addInitrdStep(b, mkinitrd, "esp/EFI/BOOT", &.{ ramfs_exe, fxfs_exe, init_exe, fsh_exe, hello_exe, tcptest_exe, dnstest_exe, ping_exe, echo_exe, cat_exe, ls_exe, rm_exe, mkdir_exe, wc_exe });
     x86_initrd.step.dependOn(&x86_install.step); // ensure ESP dir exists
 
     // ── aarch64 UEFI kernel ─────────────────────────────────────────
@@ -280,6 +302,10 @@ pub fn build(b: *std.Build) void {
     aarch64_initrd.step.dependOn(&aarch64_install.step);
 
     // ── Named steps ─────────────────────────────────────────────────
+    const mkfxfs_install = b.addInstallArtifact(mkfxfs, .{});
+    const mkfxfs_step = b.step("mkfxfs", "Build mkfxfs disk formatter");
+    mkfxfs_step.dependOn(&mkfxfs_install.step);
+
     const x86_step = b.step("x86_64", "Build x86_64 UEFI kernel");
     x86_step.dependOn(&x86_install.step);
     x86_step.dependOn(&x86_initrd.step);

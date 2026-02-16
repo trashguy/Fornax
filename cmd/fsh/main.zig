@@ -898,13 +898,16 @@ fn executeLine(tokens: []const []const u8) void {
 
         const pid = runExternalWithFds(cmd, clean_args[0..clean_argc], fd_map_buf[0..fd_map_len]);
 
-        if (in_fd >= 0) _ = fx.close(in_fd);
-        if (out_fd >= 0) _ = fx.close(out_fd);
-
         if (pid >= 0) {
             const status = fx.wait(@intCast(pid));
             last_exit_status = @truncate(status);
         }
+
+        // Close redirect fds AFTER wait — closing before wait races with
+        // the child's use of the same IPC channel (T_CLOSE frees the server
+        // handle, and the channel's single client endpoint gets clobbered).
+        if (in_fd >= 0) _ = fx.close(in_fd);
+        if (out_fd >= 0) _ = fx.close(out_fd);
     } else {
         runPipeline(&stages, n_stages);
     }

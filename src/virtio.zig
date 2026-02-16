@@ -267,6 +267,55 @@ pub fn addBuffer(vq: *Virtqueue, phys_addr: u64, len: u32, device_writable: bool
     return idx;
 }
 
+/// Add a 3-descriptor chain to the virtqueue (for virtio-blk requests).
+/// Returns the head descriptor index, or null if not enough descriptors.
+pub fn addBufferChain3(
+    vq: *Virtqueue,
+    addr0: u64,
+    len0: u32,
+    writable0: bool,
+    addr1: u64,
+    len1: u32,
+    writable1: bool,
+    addr2: u64,
+    len2: u32,
+    writable2: bool,
+) ?u16 {
+    const head = vq.next_desc;
+    if (head + 2 >= vq.size) return null;
+
+    // Descriptor 0 -> 1 -> 2
+    vq.desc[head] = .{
+        .addr = addr0,
+        .len = len0,
+        .flags = (if (writable0) VRING_DESC_F_WRITE else 0) | VRING_DESC_F_NEXT,
+        .next = head + 1,
+    };
+    vq.desc[head + 1] = .{
+        .addr = addr1,
+        .len = len1,
+        .flags = (if (writable1) VRING_DESC_F_WRITE else 0) | VRING_DESC_F_NEXT,
+        .next = head + 2,
+    };
+    vq.desc[head + 2] = .{
+        .addr = addr2,
+        .len = len2,
+        .flags = if (writable2) VRING_DESC_F_WRITE else 0,
+        .next = 0,
+    };
+
+    // Add head to available ring
+    const avail_idx = vq.avail.idx;
+    vq.avail_ring[avail_idx % vq.size] = head;
+
+    memoryBarrier();
+
+    vq.avail.idx = avail_idx +% 1;
+    vq.next_desc = head + 3;
+
+    return head;
+}
+
 /// Notify the device that there are new available buffers.
 pub fn notify(vq: *Virtqueue) void {
     write16(vq.io_base, REG_QUEUE_NOTIFY, vq.queue_index);

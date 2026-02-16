@@ -40,6 +40,13 @@ pub const PciDevice = struct {
             (self.device_id == 0x1000 or self.device_id == 0x1041);
     }
 
+    /// Check if this is a virtio-blk device.
+    /// Legacy device ID 0x1001 or modern 0x1042.
+    pub fn isVirtioBlk(self: *const PciDevice) bool {
+        return self.vendor_id == 0x1AF4 and
+            (self.device_id == 0x1001 or self.device_id == 0x1042);
+    }
+
     /// Get the I/O port base from BAR0 (for legacy virtio devices).
     pub fn ioBase(self: *const PciDevice) ?u16 {
         const bar0 = self.bar[0];
@@ -197,6 +204,13 @@ pub fn findDevice(vendor_id: u16, device_id: u16) ?*PciDevice {
 pub fn findVirtioNet() ?*PciDevice {
     for (0..device_count) |i| {
         if (devices[i].isVirtioNet()) return &devices[i];
+    }
+    return null;
+}
+
+pub fn findVirtioBlk() ?*PciDevice {
+    for (0..device_count) |i| {
+        if (devices[i].isVirtioBlk()) return &devices[i];
     }
     return null;
 }

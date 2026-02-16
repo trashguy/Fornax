@@ -1,5 +1,5 @@
-.PHONY: all x86_64 aarch64 run run-x86_64 run-aarch64 disk disk-x86_64 disk-aarch64 clean help
-.PHONY: release release-x86_64 release-aarch64 run-release
+.PHONY: all x86_64 aarch64 run run-x86_64 run-aarch64 disk disk-x86_64 disk-aarch64 clean clean-disk help
+.PHONY: release release-x86_64 release-aarch64 run-release disk-img disk-format
 
 all: x86_64 aarch64
 
@@ -37,6 +37,20 @@ disk-x86_64: x86_64
 disk-aarch64: aarch64
 	./scripts/make-disk-image.sh aarch64
 
+disk-img:
+	@if [ ! -f fornax-disk.img ]; then \
+		echo "Creating blank 64 MB disk image..."; \
+		dd if=/dev/zero of=fornax-disk.img bs=1M count=64 status=none; \
+	fi
+
+disk-format: disk-img
+	zig build mkfxfs
+	@echo "hello from fxfs" > /tmp/fxfs-hello.txt
+	./zig-out/bin/mkfxfs fornax-disk.img --add /tmp/fxfs-hello.txt:/hello.txt
+
+clean-disk:
+	rm -f fornax-disk.img
+
 clean:
 	rm -rf zig-out .zig-cache *.img
 
@@ -50,4 +64,5 @@ help:
 	@echo "  make run-release     Run x86_64 in QEMU (ReleaseSafe kernel)"
 	@echo "  make run-aarch64     Run aarch64 in QEMU"
 	@echo "  make disk            Create x86_64 bootable disk image"
+	@echo "  make clean-disk      Remove disk image (re-created and formatted on next run)"
 	@echo "  make clean           Remove build artifacts and disk images"
