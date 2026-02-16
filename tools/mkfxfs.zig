@@ -1,6 +1,6 @@
 /// mkfxfs — Fornax filesystem formatter.
 ///
-/// Usage: mkfxfs <disk-image> [--add <host-file>:<fs-path>] ...
+/// Usage: mkfxfs <disk-image> [--offset <bytes>] [--size <bytes>] [--add <host-file>:<fs-path>] ...
 ///
 /// Creates an fxfs-formatted disk image with:
 ///   Block 0:      Primary superblock
@@ -186,13 +186,13 @@ pub fn main() !void {
 
     const args = try std.process.argsAlloc(alloc);
     if (args.len < 2) {
-        std.debug.print("Usage: mkfxfs <disk-image> [--add <host-file>:<fs-path>] ...\n", .{});
+        std.debug.print("Usage: mkfxfs <disk-image> [--offset <bytes>] [--size <bytes>] [--add <host-file>:<fs-path>] ...\n", .{});
         std.process.exit(1);
     }
 
     const image_path = args[1];
 
-    // Parse --add arguments
+    // Parse arguments
     const AddEntry = struct {
         host_path: []const u8,
         fs_path: []const u8,
@@ -200,9 +200,23 @@ pub fn main() !void {
     };
 
     var add_entries: std.ArrayList(AddEntry) = .empty;
+    var partition_offset: u64 = 0; // byte offset within the image
+    var partition_size: u64 = 0; // byte size of partition (0 = auto from file)
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--add") and i + 1 < args.len) {
+        if (std.mem.eql(u8, args[i], "--offset") and i + 1 < args.len) {
+            i += 1;
+            partition_offset = std.fmt.parseInt(u64, args[i], 10) catch {
+                std.debug.print("Error: invalid --offset value\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--size") and i + 1 < args.len) {
+            i += 1;
+            partition_size = std.fmt.parseInt(u64, args[i], 10) catch {
+                std.debug.print("Error: invalid --size value\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--add") and i + 1 < args.len) {
             i += 1;
             const spec = args[i];
             // Split on ':'
@@ -218,17 +232,29 @@ pub fn main() !void {
         }
     }
 
+    // Validate offset alignment
+    if (partition_offset % BLOCK_SIZE != 0) {
+        std.debug.print("Error: --offset must be {d}-aligned\n", .{BLOCK_SIZE});
+        std.process.exit(1);
+    }
+
     // Open/create the image file
     const file = try std.fs.cwd().openFile(image_path, .{ .mode = .read_write });
     defer file.close();
 
     const file_size = try file.getEndPos();
-    if (file_size < BLOCK_SIZE * 4) {
-        std.debug.print("Error: image file too small (need at least 16 KB)\n", .{});
+    if (file_size < partition_offset + BLOCK_SIZE * 4) {
+        std.debug.print("Error: image file too small (need at least 16 KB at offset)\n", .{});
         std.process.exit(1);
     }
 
-    const total_blocks = file_size / BLOCK_SIZE;
+    // Calculate available size
+    const available_size = if (partition_size > 0)
+        @min(partition_size, file_size - partition_offset)
+    else
+        file_size - partition_offset;
+
+    const total_blocks = available_size / BLOCK_SIZE;
     const bitmap_blocks = (total_blocks + (BLOCK_SIZE * 8) - 1) / (BLOCK_SIZE * 8);
     const bitmap_start: u64 = 2; // blocks 0,1 are superblocks
     const data_start: u64 = bitmap_start + bitmap_blocks;
@@ -315,7 +341,7 @@ pub fn main() !void {
                 const remaining = entry.data.len - offset;
                 const to_copy = @min(remaining, BLOCK_SIZE);
                 @memcpy(data_block[0..to_copy], entry.data[offset..][0..to_copy]);
-                try file.seekTo((first_data_block + db) * BLOCK_SIZE);
+                try file.seekTo(partition_offset + (first_data_block + db) * BLOCK_SIZE);
                 try file.writeAll(&data_block);
                 offset += to_copy;
             }
@@ -329,11 +355,11 @@ pub fn main() !void {
 
     // Finalize and write root leaf
     const root_data = leaf.finalize();
-    try file.seekTo(root_block * BLOCK_SIZE);
+    try file.seekTo(partition_offset + root_block * BLOCK_SIZE);
     try file.writeAll(&root_data);
 
     // Write bitmap
-    try file.seekTo(bitmap_start * BLOCK_SIZE);
+    try file.seekTo(partition_offset + bitmap_start * BLOCK_SIZE);
     try file.writeAll(bitmap);
 
     // Build superblock using packed byte-level writes
@@ -355,14 +381,17 @@ pub fn main() !void {
     writeU32LE(sb_buf[72..76], sb_cksum);
 
     // Write primary superblock (block 0)
-    try file.seekTo(0);
+    try file.seekTo(partition_offset);
     try file.writeAll(&sb_buf);
 
     // Write backup superblock (block 1)
-    try file.seekTo(BLOCK_SIZE);
+    try file.seekTo(partition_offset + BLOCK_SIZE);
     try file.writeAll(&sb_buf);
 
     std.debug.print("mkfxfs: formatted {s}\n", .{image_path});
+    if (partition_offset > 0) {
+        std.debug.print("  partition offset: {d} bytes\n", .{partition_offset});
+    }
     std.debug.print("  total blocks: {d}\n", .{total_blocks});
     std.debug.print("  bitmap blocks: {d} (starts at block {d})\n", .{ bitmap_blocks, bitmap_start });
     std.debug.print("  data starts at block: {d}\n", .{data_start});

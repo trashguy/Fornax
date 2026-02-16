@@ -117,6 +117,12 @@ pub fn main() noreturn {
         // Phase 300: Virtio-blk
         if (virtio_blk.init()) {
             console.puts("Block device ready.\n");
+
+            // Phase 305: GPT partition table
+            const gpt = @import("gpt.zig");
+            if (gpt.init()) {
+                console.puts("GPT partition table loaded.\n");
+            }
         }
 
         // Phase 23: Virtio-input (keyboard)
@@ -139,6 +145,7 @@ pub fn main() noreturn {
     // Phase 21: Mount initrd files at /boot/ and spawn init
     initrd.mountFiles();
     spawnRamfs();
+    spawnPartfs();
     spawnFxfs();
     spawnInit();
 
@@ -222,6 +229,88 @@ fn spawnRamfs() void {
     console.puts(")\n");
 }
 
+fn spawnPartfs() void {
+    // Only spawn partfs if virtio-blk is available
+    if (!virtio_blk.isInitialized()) return;
+
+    const partfs_elf = initrd.findFile("partfs") orelse {
+        serial.puts("No partfs in initrd — running without /dev/.\n");
+        return;
+    };
+
+    const proc = process.create() orelse {
+        console.puts("Failed to create partfs process!\n");
+        return;
+    };
+
+    const load_result = elf.load(proc.pml4.?, partfs_elf) catch {
+        console.puts("Failed to load partfs ELF!\n");
+        proc.state = .dead;
+        return;
+    };
+
+    proc.user_rip = load_result.entry_point;
+    proc.brk = load_result.brk;
+
+    // Allocate user stack
+    for (0..process.USER_STACK_PAGES) |i| {
+        const page = pmm.allocPage() orelse {
+            console.puts("Failed to allocate partfs stack!\n");
+            proc.state = .dead;
+            return;
+        };
+        const ptr: [*]u8 = paging.physPtr(page);
+        @memset(ptr[0..mem.PAGE_SIZE], 0);
+        const vaddr = mem.USER_STACK_TOP - (process.USER_STACK_PAGES - i) * mem.PAGE_SIZE;
+        paging.mapPage(proc.pml4.?, vaddr, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
+            console.puts("Failed to map partfs stack!\n");
+            proc.state = .dead;
+            return;
+        };
+    }
+    proc.user_rsp = mem.USER_STACK_INIT;
+
+    // Create IPC channel for partfs
+    const chan = ipc.channelCreate() catch {
+        console.puts("Failed to create partfs channel!\n");
+        proc.state = .dead;
+        return;
+    };
+
+    // Server end as fd 3
+    proc.setFd(3, chan.server, true);
+
+    // Block device as fd 4 (raw, whole disk — partfs reads GPT itself)
+    proc.fds[4] = .{
+        .fd_type = .blk,
+        .channel_id = 0,
+        .is_server = false,
+        .read_offset = 0,
+        .server_handle = 0,
+    };
+
+    // Mount client end at "/dev/" in root namespace
+    const root_ns = namespace.getRootNamespace();
+    root_ns.mount("/dev/", chan.client, .{ .replace = true }) catch {
+        console.puts("Failed to mount partfs at /dev/!\n");
+        proc.state = .dead;
+        return;
+    };
+
+    proc.parent_pid = null;
+    root_ns.cloneInto(&proc.ns);
+
+    serial.puts("[partfs: pid=");
+    serial.putDec(proc.pid);
+    serial.puts(" entry=0x");
+    serial.putHex(load_result.entry_point);
+    serial.puts("]\n");
+
+    console.puts("Spawned partfs (PID ");
+    console.putDec(proc.pid);
+    console.puts(")\n");
+}
+
 fn spawnFxfs() void {
     // Only spawn fxfs if virtio-blk is available
     if (!virtio_blk.isInitialized()) return;
@@ -273,14 +362,32 @@ fn spawnFxfs() void {
     // Server end as fd 3
     proc.setFd(3, chan.server, true);
 
-    // Block device as fd 4
-    proc.fds[4] = .{
-        .fd_type = .blk,
-        .channel_id = 0,
-        .is_server = false,
-        .read_offset = 0,
-        .server_handle = 0,
-    };
+    // Block device as fd 4 (with partition offset if GPT detected)
+    const gpt = @import("gpt.zig");
+    if (gpt.isInitialized() and gpt.getPartitionCount() > 0) {
+        const part = gpt.getPartition(0).?;
+        proc.fds[4] = .{
+            .fd_type = .blk,
+            .channel_id = 0,
+            .is_server = false,
+            .read_offset = 0,
+            .server_handle = 0,
+            .blk_offset = part.first_lba * 512,
+            .blk_size = (part.last_lba - part.first_lba + 1) * 512,
+        };
+        serial.puts("[fxfs: using partition 1 at LBA ");
+        serial.putDec(part.first_lba);
+        serial.puts("]\n");
+    } else {
+        // Fallback: whole disk (backward compatible with unpartitioned disks)
+        proc.fds[4] = .{
+            .fd_type = .blk,
+            .channel_id = 0,
+            .is_server = false,
+            .read_offset = 0,
+            .server_handle = 0,
+        };
+    }
 
     // Mount client end at "/disk/" in root namespace
     const root_ns = namespace.getRootNamespace();

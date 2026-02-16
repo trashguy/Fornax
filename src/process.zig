@@ -117,6 +117,10 @@ pub const FdEntry = struct {
     /// Pipe-specific fields (only used when fd_type == .pipe)
     pipe_id: u8 = 0,
     pipe_is_read: bool = false,
+    /// Block device partition offset (bytes). Added to pread/pwrite offset.
+    blk_offset: u64 = 0,
+    /// Block device partition size (bytes). 0 = whole device (no bounds check).
+    blk_size: u64 = 0,
 };
 
 pub const Process = struct {

@@ -908,8 +908,49 @@ fn commitTransaction() bool {
 var msg: fx.IpcMessage linksection(".bss") = undefined;
 var reply: fx.IpcMessage linksection(".bss") = undefined;
 
+fn ctlAppendStr(buf: []u8, pos: usize, s: []const u8) usize {
+    if (pos + s.len > buf.len) return pos;
+    @memcpy(buf[pos..][0..s.len], s);
+    return pos + s.len;
+}
+
+fn ctlAppendDec(buf: []u8, pos: usize, val: u64) usize {
+    if (val == 0) {
+        if (pos < buf.len) {
+            buf[pos] = '0';
+            return pos + 1;
+        }
+        return pos;
+    }
+    var tmp: [20]u8 = undefined;
+    var len: usize = 0;
+    var v = val;
+    while (v > 0) : (v /= 10) {
+        tmp[len] = '0' + @as(u8, @intCast(v % 10));
+        len += 1;
+    }
+    if (pos + len > buf.len) return pos;
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        buf[pos + i] = tmp[len - 1 - i];
+    }
+    return pos + len;
+}
+
 fn handleOpen(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
     const path = req.data[0..req.data_len];
+
+    // Virtual "ctl" file for filesystem stats
+    if (fx.str.eql(path, "ctl")) {
+        const handle = allocHandle(0xFFFF_FFFF_FFFF_FFFF) orelse {
+            resp.* = fx.IpcMessage.init(fx.R_ERROR);
+            return;
+        };
+        resp.* = fx.IpcMessage.init(fx.R_OK);
+        writeU32LE(resp.data[0..4], handle);
+        resp.data_len = 4;
+        return;
+    }
 
     const inode_nr = resolvePath(path) orelse {
         resp.* = fx.IpcMessage.init(fx.R_ERROR);
@@ -946,6 +987,27 @@ fn handleRead(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
         resp.* = fx.IpcMessage.init(fx.R_ERROR);
         return;
     };
+
+    // Virtual ctl file: return filesystem stats
+    if (h.inode_nr == 0xFFFF_FFFF_FFFF_FFFF) {
+        resp.* = fx.IpcMessage.init(fx.R_OK);
+        var ctl_buf: [256]u8 = undefined;
+        var pos: usize = 0;
+        pos = ctlAppendStr(&ctl_buf, pos, "TOTAL=");
+        pos = ctlAppendDec(&ctl_buf, pos, sb_total_blocks);
+        pos = ctlAppendStr(&ctl_buf, pos, "\nFREE=");
+        pos = ctlAppendDec(&ctl_buf, pos, sb_free_blocks);
+        pos = ctlAppendStr(&ctl_buf, pos, "\nBSIZE=4096\n");
+        if (offset >= pos) {
+            resp.data_len = 0;
+            return;
+        }
+        const remaining = pos - offset;
+        const to_copy: u32 = @intCast(@min(remaining, @min(count, 4096)));
+        @memcpy(resp.data[0..to_copy], ctl_buf[offset..][0..to_copy]);
+        resp.data_len = to_copy;
+        return;
+    }
 
     const inode = readInode(h.inode_nr) orelse {
         resp.* = fx.IpcMessage.init(fx.R_ERROR);
@@ -1055,6 +1117,16 @@ fn handleStat(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
         resp.* = fx.IpcMessage.init(fx.R_ERROR);
         return;
     };
+
+    // Virtual ctl file stat
+    if (h.inode_nr == 0xFFFF_FFFF_FFFF_FFFF) {
+        resp.* = fx.IpcMessage.init(fx.R_OK);
+        @memset(resp.data[0..64], 0);
+        writeU32LE(resp.data[0..4], 256); // approximate size
+        writeU32LE(resp.data[4..8], 0); // file
+        resp.data_len = 64;
+        return;
+    }
 
     const inode = readInode(h.inode_nr) orelse {
         resp.* = fx.IpcMessage.init(fx.R_ERROR);

@@ -31,6 +31,15 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // ── Host tool: mkgpt ───────────────────────────────────────────
+    const mkgpt = b.addExecutable(.{
+        .name = "mkgpt",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/mkgpt.zig"),
+            .target = b.graph.host,
+        }),
+    });
+
     // ── Userspace freestanding x86_64 target ─────────────────────────
     // No float feature restrictions — userspace runs with full CPU features.
     // The kernel disables SSE/AVX to avoid managing FPU state in ring 0,
@@ -210,6 +219,32 @@ pub fn build(b: *std.Build) void {
     });
     wc_exe.image_base = user_image_base;
 
+    const lsblk_exe = b.addExecutable(.{
+        .name = "lsblk",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/lsblk/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    lsblk_exe.image_base = user_image_base;
+
+    const df_exe = b.addExecutable(.{
+        .name = "df",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/df/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    df_exe.image_base = user_image_base;
+
     const ramfs_exe = b.addExecutable(.{
         .name = "ramfs",
         .root_module = b.createModule(.{
@@ -235,6 +270,19 @@ pub fn build(b: *std.Build) void {
         }),
     });
     fxfs_exe.image_base = user_image_base;
+
+    const partfs_exe = b.addExecutable(.{
+        .name = "partfs",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("srv/partfs/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    partfs_exe.image_base = user_image_base;
 
     // ── x86_64 UEFI kernel ──────────────────────────────────────────
     const x86_64_target = b.resolveTargetQuery(.{
@@ -271,7 +319,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // ── Initrd: pack userspace programs into INITRD image ────────────
-    const x86_initrd = addInitrdStep(b, mkinitrd, "esp/EFI/BOOT", &.{ ramfs_exe, fxfs_exe, init_exe, fsh_exe, hello_exe, tcptest_exe, dnstest_exe, ping_exe, echo_exe, cat_exe, ls_exe, rm_exe, mkdir_exe, wc_exe });
+    const x86_initrd = addInitrdStep(b, mkinitrd, "esp/EFI/BOOT", &.{ ramfs_exe, fxfs_exe, partfs_exe, init_exe, fsh_exe, hello_exe, tcptest_exe, dnstest_exe, ping_exe, echo_exe, cat_exe, ls_exe, rm_exe, mkdir_exe, wc_exe, lsblk_exe, df_exe });
     x86_initrd.step.dependOn(&x86_install.step); // ensure ESP dir exists
 
     // ── aarch64 UEFI kernel ─────────────────────────────────────────
@@ -305,6 +353,10 @@ pub fn build(b: *std.Build) void {
     const mkfxfs_install = b.addInstallArtifact(mkfxfs, .{});
     const mkfxfs_step = b.step("mkfxfs", "Build mkfxfs disk formatter");
     mkfxfs_step.dependOn(&mkfxfs_install.step);
+
+    const mkgpt_install = b.addInstallArtifact(mkgpt, .{});
+    const mkgpt_step = b.step("mkgpt", "Build mkgpt partition tool");
+    mkgpt_step.dependOn(&mkgpt_install.step);
 
     const x86_step = b.step("x86_64", "Build x86_64 UEFI kernel");
     x86_step.dependOn(&x86_install.step);

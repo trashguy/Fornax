@@ -694,11 +694,21 @@ fn sysPread(fd: u64, buf_ptr: u64, count: u64, offset: u64) u64 {
 
     if (entry_ptr.fd_type != .blk) return EBADF;
 
-    // Block device: offset and count must be 4096-aligned
-    if (offset % 4096 != 0 or count % 4096 != 0) return EINVAL;
+    // Bounds check: if blk_size set, cap read at partition boundary
+    var actual_count = count;
+    if (entry_ptr.blk_size > 0) {
+        if (offset >= entry_ptr.blk_size) return 0; // EOF
+        actual_count = @min(count, entry_ptr.blk_size - offset);
+    }
 
-    const block_start = offset / 4096;
-    const block_count = count / 4096;
+    // Apply partition offset
+    const real_offset = offset + entry_ptr.blk_offset;
+
+    // Block device: offset and count must be 4096-aligned
+    if (real_offset % 4096 != 0 or actual_count % 4096 != 0) return EINVAL;
+
+    const block_start = real_offset / 4096;
+    const block_count = actual_count / 4096;
     var bytes_read: u64 = 0;
     var i: u64 = 0;
 
@@ -726,11 +736,21 @@ fn sysPwrite(fd: u64, buf_ptr: u64, count: u64, offset: u64) u64 {
 
     if (entry_ptr.fd_type != .blk) return EBADF;
 
-    // Block device: offset and count must be 4096-aligned
-    if (offset % 4096 != 0 or count % 4096 != 0) return EINVAL;
+    // Bounds check: if blk_size set, cap write at partition boundary
+    var actual_count = count;
+    if (entry_ptr.blk_size > 0) {
+        if (offset >= entry_ptr.blk_size) return 0;
+        actual_count = @min(count, entry_ptr.blk_size - offset);
+    }
 
-    const block_start = offset / 4096;
-    const block_count = count / 4096;
+    // Apply partition offset
+    const real_offset = offset + entry_ptr.blk_offset;
+
+    // Block device: offset and count must be 4096-aligned
+    if (real_offset % 4096 != 0 or actual_count % 4096 != 0) return EINVAL;
+
+    const block_start = real_offset / 4096;
+    const block_count = actual_count / 4096;
     var bytes_written: u64 = 0;
     var i: u64 = 0;
 
