@@ -38,13 +38,9 @@ fn loadBin(name: []const u8) ?[]const u8 {
 export fn _start() noreturn {
     out.puts("init: started\n");
 
-    // Ensure standard directories exist
+    // Ensure standard directories exist (dev/proc/net/tmp baked into rootfs image)
     _ = fx.mkdir("/var");
     _ = fx.mkdir("/var/log");
-    _ = fx.mkdir("/dev");
-    _ = fx.mkdir("/proc");
-    _ = fx.mkdir("/net");
-    _ = fx.mkdir("/tmp");
 
     while (true) {
         const elf_data = loadBin("fsh") orelse {

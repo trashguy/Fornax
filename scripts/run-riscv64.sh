@@ -31,7 +31,7 @@ echo "==> Creating 64 MB disk image..."
 dd if=/dev/zero of="$DISK_IMG" bs=1M count=64 status=none
 
 # Create rootfs staging directories
-mkdir -p "$ROOTFS_DIR/etc" "$ROOTFS_DIR/tmp" "$ROOTFS_DIR/proc"
+mkdir -p "$ROOTFS_DIR/etc" "$ROOTFS_DIR/tmp" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/dev" "$ROOTFS_DIR/net"
 
 # Create placeholder fstab
 cat > "$ROOTFS_DIR/etc/fstab" << 'FSTAB'
