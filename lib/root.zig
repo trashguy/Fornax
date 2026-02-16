@@ -34,6 +34,8 @@ pub const pipe = syscall.pipe;
 pub const pread = syscall.pread;
 pub const pwrite = syscall.pwrite;
 pub const klog = syscall.klog;
+pub const SysInfo = syscall.SysInfo;
+pub const sysinfo = syscall.sysinfo;
 
 // Re-export IPC types at top level.
 pub const IpcMessage = ipc.IpcMessage;

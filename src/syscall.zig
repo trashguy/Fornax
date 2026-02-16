@@ -40,6 +40,7 @@ pub const SYS = enum(u64) {
     pread = 20,
     pwrite = 21,
     klog = 22,
+    sysinfo = 23,
 };
 
 /// Error return values.
@@ -126,6 +127,7 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         .pread => sysPread(arg0, arg1, arg2, arg3),
         .pwrite => sysPwrite(arg0, arg1, arg2, arg3),
         .klog => sysKlog(arg0, arg1, arg2),
+        .sysinfo => sysSysinfo(arg0),
         .mount, .bind, .unmount, .rfork => {
             klog.warn("syscall: unimplemented nr=");
             klog.warnDec(nr);
@@ -777,6 +779,19 @@ fn sysKlog(buf_ptr: u64, buf_len: u64, offset: u64) u64 {
     const n = @min(buf_len, 4096);
 
     return klog.read(dest[0..n], offset);
+}
+
+/// sysinfo(info_ptr) → 0 or error
+/// Writes SysInfo struct { total_pages: u64, free_pages: u64, page_size: u64 } to user buffer.
+fn sysSysinfo(info_ptr: u64) u64 {
+    if (info_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+    if (info_ptr % 8 != 0) return EFAULT;
+
+    const ptr: *[3]u64 = @ptrFromInt(info_ptr);
+    ptr[0] = pmm.getTotalPages();
+    ptr[1] = pmm.getFreePages();
+    ptr[2] = 4096;
+    return 0;
 }
 
 /// close(fd) → 0 or error

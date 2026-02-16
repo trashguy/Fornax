@@ -9,6 +9,7 @@ var bitmap: [*]u8 = undefined;
 var bitmap_size: usize = 0; // in bytes
 var total_pages: usize = 0;
 var free_pages: usize = 0;
+var usable_pages: usize = 0;
 var initialized: bool = false;
 
 pub const PmmError = error{
@@ -85,6 +86,7 @@ pub fn init(memory_map: boot.MemoryMap) PmmError!void {
         }
     }
 
+    usable_pages = free_pages;
     initialized = true;
 
     // Print summary
@@ -114,6 +116,14 @@ pub fn freePage(phys_addr: usize) void {
         markFree(page);
         free_pages += 1;
     }
+}
+
+pub fn getTotalPages() usize {
+    return usable_pages;
+}
+
+pub fn getFreePages() usize {
+    return free_pages;
 }
 
 fn isFree(page: usize) bool {

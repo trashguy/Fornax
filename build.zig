@@ -258,6 +258,32 @@ pub fn build(b: *std.Build) void {
     });
     dmesg_exe.image_base = user_image_base;
 
+    const tree_exe = b.addExecutable(.{
+        .name = "tree",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/tree/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    tree_exe.image_base = user_image_base;
+
+    const free_exe = b.addExecutable(.{
+        .name = "free",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/free/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    free_exe.image_base = user_image_base;
+
     const fxfs_exe = b.addExecutable(.{
         .name = "fxfs",
         .root_module = b.createModule(.{
@@ -326,7 +352,7 @@ pub fn build(b: *std.Build) void {
     const disk_programs: []const *std.Build.Step.Compile = &.{
         fsh_exe,  echo_exe,    cat_exe,  ls_exe,
         rm_exe,   mkdir_exe,   wc_exe,   lsblk_exe,
-        df_exe,   dmesg_exe,   ping_exe, hello_exe,
+        df_exe,   dmesg_exe,   tree_exe, free_exe, ping_exe, hello_exe,
         tcptest_exe, dnstest_exe,
     };
     for (disk_programs) |prog| {

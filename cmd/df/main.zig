@@ -22,6 +22,14 @@ fn getValue(text: []const u8, key: []const u8) ?[]const u8 {
 }
 
 /// Format blocks as human-readable size.
+fn padRight(s: []const u8, width: usize) void {
+    out.puts(s);
+    var i: usize = s.len;
+    while (i < width) : (i += 1) {
+        out.putc(' ');
+    }
+}
+
 fn formatBlockSize(blocks: u64, bsize: u64, buf: []u8) []const u8 {
     const bytes = blocks * bsize;
     var pos: usize = 0;
@@ -109,7 +117,11 @@ export fn _start() noreturn {
     const avail_str = formatBlockSize(free, bsize, &avail_buf);
 
     out.puts("Filesystem    Size  Used  Avail  Mounted on\n");
-    out.print("/dev/blk0p1   {s: <5} {s: <5} {s: <6} /\n", .{ size_str, used_str, avail_str });
+    out.puts("/dev/blk0p1   ");
+    padRight(size_str, 6);
+    padRight(used_str, 6);
+    padRight(avail_str, 7);
+    out.puts("/\n");
 
     fx.exit(0);
 }

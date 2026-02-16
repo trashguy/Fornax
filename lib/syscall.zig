@@ -27,6 +27,7 @@ pub const SYS = enum(u64) {
     pread = 20,
     pwrite = 21,
     klog = 22,
+    sysinfo = 23,
 };
 
 const ipc = @import("ipc.zig");
@@ -139,6 +140,19 @@ pub fn pwrite(fd: i32, buf: []const u8, offset: u64) isize {
 
 pub fn klog(buf: []u8, offset: u64) usize {
     return syscall3(.klog, @intFromPtr(buf.ptr), buf.len, offset);
+}
+
+pub const SysInfo = extern struct {
+    total_pages: u64,
+    free_pages: u64,
+    page_size: u64,
+};
+
+pub fn sysinfo() ?SysInfo {
+    var buf: [3]u64 = undefined;
+    const result = syscall1(.sysinfo, @intFromPtr(&buf));
+    if (result != 0) return null;
+    return .{ .total_pages = buf[0], .free_pages = buf[1], .page_size = buf[2] };
 }
 
 /// Build a serialized argv block: [argc: u32][total_len: u32][str0\0str1\0...]
