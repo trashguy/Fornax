@@ -8,8 +8,7 @@
 /// After init(), all page table access goes through the higher-half mapping
 /// so that user-space ELF mappings (which overwrite identity-map entries)
 /// cannot corrupt the kernel's view of physical memory during syscalls.
-const console = @import("../../console.zig");
-const serial = @import("../../serial.zig");
+const klog = @import("../../klog.zig");
 const pmm = @import("../../pmm.zig");
 const mem = @import("../../mem.zig");
 
@@ -67,7 +66,7 @@ pub inline fn physPtr(phys: u64) [*]u8 {
 pub fn init() void {
     // Allocate PML4
     const pml4_page = pmm.allocPage() orelse {
-        console.puts("Paging: failed to allocate PML4!\n");
+        klog.err("Paging: failed to allocate PML4!\n");
         return;
     };
     kernel_pml4_phys = pml4_page;
@@ -77,14 +76,14 @@ pub fn init() void {
     // Identity map first 4 GB using 2MB huge pages
     // PML4[0] → PDPT → PD entries with HUGE_PAGE
     mapHugeRegion(pml4, 0, 0, 4 * 1024 / 2) orelse {
-        console.puts("Paging: failed to map identity region!\n");
+        klog.err("Paging: failed to map identity region!\n");
         return;
     };
 
     // Higher-half map: virtual 0xFFFF_8000_0000_0000 → physical 0, 4 GB
     // PML4 index for 0xFFFF_8000_0000_0000 = 256
     mapHugeRegion(pml4, mem.KERNEL_VIRT_BASE, 0, 4 * 1024 / 2) orelse {
-        console.puts("Paging: failed to map higher-half region!\n");
+        klog.err("Paging: failed to map higher-half region!\n");
         return;
     };
 
@@ -96,7 +95,7 @@ pub fn init() void {
 
     initialized = true;
 
-    console.puts("Paging: 4GB identity + higher-half mapped, CR3 switched\n");
+    klog.info("Paging: 4GB identity + higher-half mapped, CR3 switched\n");
 }
 
 /// Map `count` 2MB huge pages starting at `virt_base` → `phys_base`.

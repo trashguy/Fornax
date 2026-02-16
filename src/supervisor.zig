@@ -6,8 +6,7 @@
 ///
 /// Design: crash isolation — a GPU driver crash restarts the server,
 /// never locks the system.
-const console = @import("console.zig");
-const serial = @import("serial.zig");
+const klog = @import("klog.zig");
 const process = @import("process.zig");
 const namespace = @import("namespace.zig");
 const ipc = @import("ipc.zig");
@@ -69,9 +68,9 @@ pub fn init() void {
         s.mount_path_len = 0;
     }
     initialized = true;
-    console.puts("Supervisor: initialized (max ");
-    console.putDec(MAX_SERVICES);
-    console.puts(" services)\n");
+    klog.info("Supervisor: initialized (max ");
+    klog.infoDec(MAX_SERVICES);
+    klog.info(" services)\n");
 }
 
 /// Register a file server for supervision (without spawning it).
@@ -116,17 +115,17 @@ pub fn spawnService(name: []const u8, elf_data: []const u8, mount_path: []const 
 fn spawnServiceProcess(svc: *SupervisedService) bool {
     // Create process
     const proc = process.create() orelse {
-        serial.puts("[supervisor] Failed to create process for '");
-        serial.puts(svc.name[0..svc.name_len]);
-        serial.puts("'\n");
+        klog.err("[supervisor] Failed to create process for '");
+        klog.err(svc.name[0..svc.name_len]);
+        klog.err("'\n");
         return false;
     };
 
     // Load ELF into process address space
     const load_result = elf.load(proc.pml4.?, svc.elf_data) catch {
-        serial.puts("[supervisor] ELF load failed for '");
-        serial.puts(svc.name[0..svc.name_len]);
-        serial.puts("'\n");
+        klog.err("[supervisor] ELF load failed for '");
+        klog.err(svc.name[0..svc.name_len]);
+        klog.err("'\n");
         proc.state = .dead;
         return false;
     };
@@ -137,9 +136,9 @@ fn spawnServiceProcess(svc: *SupervisedService) bool {
     // Allocate user stack
     for (0..USER_STACK_PAGES) |i| {
         const page = pmm.allocPage() orelse {
-            serial.puts("[supervisor] Stack alloc failed for '");
-            serial.puts(svc.name[0..svc.name_len]);
-            serial.puts("'\n");
+            klog.err("[supervisor] Stack alloc failed for '");
+            klog.err(svc.name[0..svc.name_len]);
+            klog.err("'\n");
             proc.state = .dead;
             return false;
         };
@@ -148,9 +147,9 @@ fn spawnServiceProcess(svc: *SupervisedService) bool {
 
         const virt = mem.USER_STACK_TOP - (USER_STACK_PAGES - i) * mem.PAGE_SIZE;
         paging.mapPage(proc.pml4.?, virt, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
-            serial.puts("[supervisor] Stack map failed for '");
-            serial.puts(svc.name[0..svc.name_len]);
-            serial.puts("'\n");
+            klog.err("[supervisor] Stack map failed for '");
+            klog.err(svc.name[0..svc.name_len]);
+            klog.err("'\n");
             proc.state = .dead;
             return false;
         };
@@ -159,9 +158,9 @@ fn spawnServiceProcess(svc: *SupervisedService) bool {
 
     // Create IPC channel for this service
     const chan_pair = ipc.channelCreate() catch {
-        serial.puts("[supervisor] Channel create failed for '");
-        serial.puts(svc.name[0..svc.name_len]);
-        serial.puts("'\n");
+        klog.err("[supervisor] Channel create failed for '");
+        klog.err(svc.name[0..svc.name_len]);
+        klog.err("'\n");
         proc.state = .dead;
         return false;
     };
@@ -172,9 +171,9 @@ fn spawnServiceProcess(svc: *SupervisedService) bool {
     // Mount the client end in the root namespace
     const root_ns = namespace.getRootNamespace();
     root_ns.mount(svc.mount_path[0..svc.mount_path_len], chan_pair.client, .{ .replace = true }) catch {
-        serial.puts("[supervisor] Mount failed for '");
-        serial.puts(svc.name[0..svc.name_len]);
-        serial.puts("'\n");
+        klog.err("[supervisor] Mount failed for '");
+        klog.err(svc.name[0..svc.name_len]);
+        klog.err("'\n");
         proc.state = .dead;
         return false;
     };
@@ -182,13 +181,13 @@ fn spawnServiceProcess(svc: *SupervisedService) bool {
     svc.pid = proc.pid;
     svc.channel_id = chan_pair.server;
 
-    serial.puts("[supervisor] Spawned '");
-    serial.puts(svc.name[0..svc.name_len]);
-    serial.puts("' (pid=");
-    serial.putDec(proc.pid);
-    serial.puts(", channel=");
-    serial.putDec(chan_pair.server);
-    serial.puts(")\n");
+    klog.debug("[supervisor] Spawned '");
+    klog.debug(svc.name[0..svc.name_len]);
+    klog.debug("' (pid=");
+    klog.debugDec(proc.pid);
+    klog.debug(", channel=");
+    klog.debugDec(chan_pair.server);
+    klog.debug(")\n");
 
     return true;
 }
@@ -202,19 +201,19 @@ pub fn handleProcessFault(pid: u32) bool {
     for (&services) |*s| {
         if (!s.active) continue;
         if (s.pid == pid) {
-            serial.puts("[supervisor] Service '");
-            serial.puts(s.name[0..s.name_len]);
-            serial.puts("' crashed (pid=");
-            serial.putDec(pid);
-            serial.puts(", restarts=");
-            serial.putDec(s.restart_count);
-            serial.puts(")\n");
+            klog.warn("[supervisor] Service '");
+            klog.warn(s.name[0..s.name_len]);
+            klog.warn("' crashed (pid=");
+            klog.warnDec(pid);
+            klog.warn(", restarts=");
+            klog.warnDec(s.restart_count);
+            klog.warn(")\n");
 
             if (s.restart_count >= s.max_restarts) {
-                serial.puts("[supervisor] Max restarts exceeded, giving up\n");
-                console.puts("[supervisor] Service '");
-                console.puts(s.name[0..s.name_len]);
-                console.puts("' permanently failed\n");
+                klog.err("[supervisor] Max restarts exceeded, giving up\n");
+                klog.err("[supervisor] Service '");
+                klog.err(s.name[0..s.name_len]);
+                klog.err("' permanently failed\n");
                 s.pid = null;
                 return true;
             }
@@ -230,9 +229,9 @@ pub fn handleProcessFault(pid: u32) bool {
 
 /// Restart a supervised service: mark old dead, create new process, load ELF, re-mount.
 fn restartService(svc: *SupervisedService) void {
-    serial.puts("[supervisor] Restarting '");
-    serial.puts(svc.name[0..svc.name_len]);
-    serial.puts("'...\n");
+    klog.debug("[supervisor] Restarting '");
+    klog.debug(svc.name[0..svc.name_len]);
+    klog.debug("'...\n");
 
     // Mark old process as dead
     if (svc.pid) |old_pid| {
@@ -243,15 +242,15 @@ fn restartService(svc: *SupervisedService) void {
 
     // Spawn new process with same ELF and mount path
     if (spawnServiceProcess(svc)) {
-        console.puts("[supervisor] Restarted '");
-        console.puts(svc.name[0..svc.name_len]);
-        console.puts("' (restart #");
-        console.putDec(svc.restart_count);
-        console.puts(")\n");
+        klog.info("[supervisor] Restarted '");
+        klog.info(svc.name[0..svc.name_len]);
+        klog.info("' (restart #");
+        klog.infoDec(svc.restart_count);
+        klog.info(")\n");
     } else {
-        console.puts("[supervisor] Failed to restart '");
-        console.puts(svc.name[0..svc.name_len]);
-        console.puts("'\n");
+        klog.err("[supervisor] Failed to restart '");
+        klog.err(svc.name[0..svc.name_len]);
+        klog.err("'\n");
         svc.pid = null;
     }
 }

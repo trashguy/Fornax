@@ -245,10 +245,10 @@ pub fn build(b: *std.Build) void {
     });
     df_exe.image_base = user_image_base;
 
-    const ramfs_exe = b.addExecutable(.{
-        .name = "ramfs",
+    const dmesg_exe = b.addExecutable(.{
+        .name = "dmesg",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("srv/ramfs/main.zig"),
+            .root_source_file = b.path("cmd/dmesg/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
             .imports = &.{
@@ -256,7 +256,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    ramfs_exe.image_base = user_image_base;
+    dmesg_exe.image_base = user_image_base;
 
     const fxfs_exe = b.addExecutable(.{
         .name = "fxfs",
@@ -318,9 +318,23 @@ pub fn build(b: *std.Build) void {
         .dest_sub_path = "BOOTX64.EFI",
     });
 
-    // ── Initrd: pack userspace programs into INITRD image ────────────
-    const x86_initrd = addInitrdStep(b, mkinitrd, "esp/EFI/BOOT", &.{ ramfs_exe, fxfs_exe, partfs_exe, init_exe, fsh_exe, hello_exe, tcptest_exe, dnstest_exe, ping_exe, echo_exe, cat_exe, ls_exe, rm_exe, mkdir_exe, wc_exe, lsblk_exe, df_exe });
+    // ── Initrd: boot-critical servers only ───────────────────────────
+    const x86_initrd = addInitrdStep(b, mkinitrd, "esp/EFI/BOOT", &.{ init_exe, partfs_exe, fxfs_exe });
     x86_initrd.step.dependOn(&x86_install.step); // ensure ESP dir exists
+
+    // ── Rootfs: install disk-bound programs to zig-out/rootfs/bin/ ──
+    const disk_programs: []const *std.Build.Step.Compile = &.{
+        fsh_exe,  echo_exe,    cat_exe,  ls_exe,
+        rm_exe,   mkdir_exe,   wc_exe,   lsblk_exe,
+        df_exe,   dmesg_exe,   ping_exe, hello_exe,
+        tcptest_exe, dnstest_exe,
+    };
+    for (disk_programs) |prog| {
+        const install = b.addInstallArtifact(prog, .{
+            .dest_dir = .{ .override = .{ .custom = "rootfs/bin" } },
+        });
+        x86_initrd.step.dependOn(&install.step);
+    }
 
     // ── aarch64 UEFI kernel ─────────────────────────────────────────
     const aarch64_target = b.resolveTargetQuery(.{

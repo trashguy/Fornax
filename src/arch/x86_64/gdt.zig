@@ -1,4 +1,4 @@
-const console = @import("../../console.zig");
+const klog = @import("../../klog.zig");
 const pmm = @import("../../pmm.zig");
 
 const GdtEntry = packed struct {
@@ -107,7 +107,7 @@ var tss: Tss = .{};
 pub fn init() void {
     // Allocate a kernel stack for the TSS (used when transitioning from Ring 3 → Ring 0)
     const kernel_stack_page = pmm.allocPage() orelse {
-        console.puts("GDT: failed to alloc TSS kernel stack!\n");
+        klog.err("GDT: failed to alloc TSS kernel stack!\n");
         return;
     };
     // Stack grows down, point to top of page
@@ -153,7 +153,7 @@ pub fn init() void {
         : [sel] "r" (TSS_SEL),
     );
 
-    console.puts("GDT: loaded (7 entries + TSS)\n");
+    klog.info("GDT: loaded (7 entries + TSS)\n");
 }
 
 /// Update the kernel stack pointer in the TSS.

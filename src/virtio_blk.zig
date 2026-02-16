@@ -5,9 +5,8 @@
 ///
 /// virtio-blk legacy device config (at io_base + 0x14):
 ///   0x14  capacity  — total sectors (u64, 512 bytes each)
-const console = @import("console.zig");
-const serial = @import("serial.zig");
 const pmm = @import("pmm.zig");
+const klog = @import("klog.zig");
 const virtio = @import("virtio.zig");
 
 const pci = switch (@import("builtin").cpu.arch) {
@@ -61,18 +60,18 @@ pub fn init() bool {
     if (@import("builtin").cpu.arch != .x86_64) return false;
 
     const pci_dev = pci.findVirtioBlk() orelse {
-        serial.puts("virtio-blk: no device found\n");
+        klog.debug("virtio-blk: no device found\n");
         return false;
     };
 
-    serial.puts("virtio-blk: found at PCI slot ");
-    serial.putDec(pci_dev.slot);
-    serial.puts(", io_base=");
-    serial.putHex(pci_dev.ioBase() orelse 0);
-    serial.puts("\n");
+    klog.debug("virtio-blk: found at PCI slot ");
+    klog.debugDec(pci_dev.slot);
+    klog.debug(", io_base=");
+    klog.debugHex(pci_dev.ioBase() orelse 0);
+    klog.debug("\n");
 
     var dev = virtio.initDevice(pci_dev) orelse {
-        serial.puts("virtio-blk: device init failed\n");
+        klog.err("virtio-blk: device init failed\n");
         return false;
     };
 
@@ -82,7 +81,7 @@ pub fn init() bool {
     // Set up the single request queue (queue 0)
     blk_dev.queue = virtio.setupQueue(&dev, 0);
     if (blk_dev.queue == null) {
-        serial.puts("virtio-blk: failed to setup queue\n");
+        klog.err("virtio-blk: failed to setup queue\n");
         return false;
     }
 
@@ -95,19 +94,13 @@ pub fn init() bool {
     blk_dev.dev = dev;
     blk_dev.initialized = true;
 
-    console.puts("virtio-blk: ");
-    serial.puts("virtio-blk: ");
     const sectors = blk_dev.capacity;
     const mb = sectors / 2048; // sectors * 512 / 1048576
-    serial.putDec(sectors);
-    serial.puts(" sectors (");
-    serial.putDec(mb);
-    serial.puts(" MB)\n");
-    // Console output
-    console.putDec(sectors);
-    console.puts(" sectors (");
-    console.putDec(mb);
-    console.puts(" MB)\n");
+    klog.info("virtio-blk: ");
+    klog.infoDec(sectors);
+    klog.info(" sectors (");
+    klog.infoDec(mb);
+    klog.info(" MB)\n");
 
     return true;
 }
@@ -144,7 +137,7 @@ pub fn readBlock(block: u64, buf: *[4096]u8) bool {
 
     // 3-descriptor chain: header (r), data (w), status (w)
     // All addresses are physical (identity-mapped) — safe for DMA
-    _ = virtio.addBufferChain3(
+    const head = virtio.addBufferChain3(
         vq,
         req_phys,
         @sizeOf(VirtioBlkReq),
@@ -167,13 +160,17 @@ pub fn readBlock(block: u64, buf: *[4096]u8) bool {
     var spins: u32 = 0;
     while (virtio.pollUsed(vq) == null) : (spins += 1) {
         if (spins > 10_000_000) {
-            serial.puts("virtio-blk: read timeout\n");
+            klog.err("virtio-blk: read timeout\n");
             pmm.freePage(data_phys);
             pmm.freePage(req_phys);
             return false;
         }
         asm volatile ("pause");
     }
+
+    // Reclaim descriptors — synchronous polling means no other requests
+    // are outstanding, so we can reuse from this head index onward.
+    vq.next_desc = head;
 
     const status = req_ptr[16];
 
@@ -245,7 +242,7 @@ pub fn writeBlock(block: u64, buf: *const [4096]u8) bool {
     var spins: u32 = 0;
     while (virtio.pollUsed(vq) == null) : (spins += 1) {
         if (spins > 10_000_000) {
-            serial.puts("virtio-blk: write timeout\n");
+            klog.err("virtio-blk: write timeout\n");
             pmm.freePage(data_phys);
             pmm.freePage(req_phys);
             return false;

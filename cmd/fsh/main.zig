@@ -2,7 +2,7 @@
 ///
 /// rc-inspired interactive shell with quoting, variables, line editing,
 /// and command history. Reads commands from stdin, executes builtins or
-/// spawns programs from /boot/<name>.
+/// spawns programs from /bin/<name>.
 /// Supports pipes (|), redirects (< >), semicolons (;), single/double
 /// quotes, and $VAR expansion.
 const fx = @import("fornax");
@@ -629,7 +629,7 @@ fn loadElf(name: []const u8) ?[]const u8 {
         _ = p.normalize();
         return loadElfFromPath(p.slice());
     }
-    var p = fx.path.PathBuf.from("/boot/");
+    var p = fx.path.PathBuf.from("/bin/");
     _ = p.appendRaw(name);
     return loadElfFromPath(p.slice());
 }
@@ -954,6 +954,7 @@ fn executeTokens(tokens: []const []const u8) void {
 // ── Entry point ────────────────────────────────────────────────────
 
 export fn _start() noreturn {
+    builtinClear();
     out.puts("fsh: Fornax shell\n");
     envInit();
 

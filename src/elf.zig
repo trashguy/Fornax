@@ -2,7 +2,6 @@
 ///
 /// Loads PT_LOAD segments from an ELF binary into a process's address space.
 /// Only supports statically-linked ELF64 executables.
-const console = @import("console.zig");
 const pmm = @import("pmm.zig");
 const mem = @import("mem.zig");
 

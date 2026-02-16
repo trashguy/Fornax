@@ -1,5 +1,5 @@
-const console = @import("../../console.zig");
 const serial = @import("../../serial.zig");
+const klog = @import("../../klog.zig");
 const gdt = @import("gdt.zig");
 const idt = @import("idt.zig");
 const cpu = @import("cpu.zig");
@@ -92,9 +92,9 @@ pub fn handleException(frame: *idt.ExceptionFrame) void {
         }
 
         if (!handled) {
-            serial.puts("IRQ ");
-            serial.putDec(irq);
-            serial.puts(": unhandled\n");
+            klog.debug("IRQ ");
+            klog.debugDec(irq);
+            klog.debug(": unhandled\n");
         }
 
         pic.sendEoi(irq);
@@ -106,21 +106,21 @@ pub fn handleException(frame: *idt.ExceptionFrame) void {
 
     if (from_user) {
         // User-mode fault — kill the process, don't panic the kernel
-        serial.puts("\n--- USER EXCEPTION ---\n");
-        serial.puts("Vector: ");
-        serial.putDec(frame.vector);
-        serial.puts(" (");
+        klog.debug("\n--- USER EXCEPTION ---\n");
+        klog.debug("Vector: ");
+        klog.debugDec(frame.vector);
+        klog.debug(" (");
         if (frame.vector < 32) {
-            serial.puts(exception_names[frame.vector]);
+            klog.debug(exception_names[frame.vector]);
         }
-        serial.puts(")\nRIP: ");
-        serial.putHex(frame.rip);
-        serial.puts("\n");
+        klog.debug(")\nRIP: ");
+        klog.debugHex(frame.rip);
+        klog.debug("\n");
 
         if (frame.vector == 14) {
-            serial.puts("CR2: ");
-            serial.putHex(cpu.readCr2());
-            serial.puts("\n");
+            klog.debug("CR2: ");
+            klog.debugHex(cpu.readCr2());
+            klog.debug("\n");
         }
 
         // Get the faulting process
@@ -133,19 +133,19 @@ pub fn handleException(frame: *idt.ExceptionFrame) void {
             // Whether supervised or not, mark the process dead
             proc.state = .dead;
 
-            console.puts("[Process ");
-            console.putDec(pid);
-            console.puts(" faulted: ");
+            klog.warn("[Process ");
+            klog.warnDec(pid);
+            klog.warn(" faulted: ");
             if (frame.vector < 32) {
-                console.puts(exception_names[frame.vector]);
+                klog.warn(exception_names[frame.vector]);
             }
-            console.puts("]\n");
+            klog.warn("]\n");
 
             // Schedule the next process
             process.scheduleNext();
         } else {
             // No current process — shouldn't happen, but handle gracefully
-            console.puts("[User fault with no current process]\n");
+            klog.err("[User fault with no current process]\n");
             cpu.halt();
         }
     } else {
@@ -184,5 +184,5 @@ pub fn init() void {
     gdt.init();
     idt.init();
     paging.init();
-    console.puts("x86_64: GDT + IDT + paging initialized\n");
+    klog.info("x86_64: GDT + IDT + paging initialized\n");
 }

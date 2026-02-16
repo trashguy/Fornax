@@ -10,8 +10,7 @@
 ///   [0..64)   name: null-terminated, zero-padded
 ///   [64..68)  offset: u32
 ///   [68..72)  size: u32
-const serial = @import("serial.zig");
-const console = @import("console.zig");
+const klog = @import("klog.zig");
 const ipc = @import("ipc.zig");
 const namespace = @import("namespace.zig");
 
@@ -52,25 +51,25 @@ var dir_listing: [MAX_DIR_ENTRIES]BootDirEntry = undefined;
 /// Returns false if the image is missing or invalid.
 pub fn init(base: ?[*]const u8, size: usize) bool {
     const b = base orelse {
-        serial.puts("initrd: no image loaded\n");
+        klog.debug("initrd: no image loaded\n");
         return false;
     };
 
     if (size < 12) {
-        serial.puts("initrd: image too small\n");
+        klog.err("initrd: image too small\n");
         return false;
     }
 
     // Check magic
     if (!eql(b[0..8], MAGIC)) {
-        serial.puts("initrd: bad magic\n");
+        klog.err("initrd: bad magic\n");
         return false;
     }
 
     const count = readU32(b[8..12]);
     const header_size = 12 + @as(usize, count) * @sizeOf(Entry);
     if (header_size > size) {
-        serial.puts("initrd: truncated header\n");
+        klog.err("initrd: truncated header\n");
         return false;
     }
 
@@ -80,18 +79,18 @@ pub fn init(base: ?[*]const u8, size: usize) bool {
     entries = @ptrCast(@alignCast(b + 12));
     ready = true;
 
-    console.puts("initrd: ");
-    console.putDec(count);
-    console.puts(" files\n");
+    klog.info("initrd: ");
+    klog.infoDec(count);
+    klog.info(" files\n");
 
     // Log file names
     for (0..count) |i| {
         const e = &entries[i];
-        serial.puts("  ");
-        serial.puts(entryName(e));
-        serial.puts(" (");
-        serial.putDec(e.size);
-        serial.puts(" bytes)\n");
+        klog.debug("  ");
+        klog.debug(entryName(e));
+        klog.debug(" (");
+        klog.debugDec(e.size);
+        klog.debug(" bytes)\n");
     }
 
     return true;
@@ -130,9 +129,9 @@ pub fn mountFiles() void {
 
         // Create kernel-backed channel for this file
         const chan_id = ipc.channelCreateKernelBacked(data) catch {
-            serial.puts("initrd: failed to create channel for ");
-            serial.puts(name);
-            serial.puts("\n");
+            klog.err("initrd: failed to create channel for ");
+            klog.err(name);
+            klog.err("\n");
             continue;
         };
 
@@ -144,15 +143,15 @@ pub fn mountFiles() void {
         const path_len = prefix.len + name.len;
 
         root_ns.mount(path_buf[0..path_len], chan_id, .{ .replace = true }) catch {
-            serial.puts("initrd: failed to mount /boot/");
-            serial.puts(name);
-            serial.puts("\n");
+            klog.err("initrd: failed to mount /boot/");
+            klog.err(name);
+            klog.err("\n");
             continue;
         };
 
-        serial.puts("initrd: mounted /boot/");
-        serial.puts(name);
-        serial.puts("\n");
+        klog.debug("initrd: mounted /boot/");
+        klog.debug(name);
+        klog.debug("\n");
 
         // Build DirEntry for directory listing (same 72-byte layout)
         if (i < MAX_DIR_ENTRIES) {
@@ -168,14 +167,14 @@ pub fn mountFiles() void {
     if (dir_count > 0) {
         const dir_bytes: []const u8 = @as([*]const u8, @ptrCast(&dir_listing))[0 .. @as(usize, dir_count) * @sizeOf(BootDirEntry)];
         const dir_chan = ipc.channelCreateKernelBacked(dir_bytes) catch {
-            serial.puts("initrd: failed to create /boot dir channel\n");
+            klog.err("initrd: failed to create /boot dir channel\n");
             return;
         };
         root_ns.mount("/boot", dir_chan, .{ .replace = true }) catch {
-            serial.puts("initrd: failed to mount /boot dir\n");
+            klog.err("initrd: failed to mount /boot dir\n");
             return;
         };
-        serial.puts("initrd: mounted /boot directory\n");
+        klog.debug("initrd: mounted /boot directory\n");
     }
 }
 

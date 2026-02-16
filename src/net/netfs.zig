@@ -14,7 +14,7 @@
 ///   /net/icmp/clone     — allocate a new ICMP connection
 ///   /net/icmp/N/ctl     — control (connect IP)
 ///   /net/icmp/N/data    — send echo request / read reply
-const serial = @import("../serial.zig");
+const klog = @import("../klog.zig");
 const process = @import("../process.zig");
 const tcp = @import("tcp.zig");
 const dns = @import("dns.zig");
@@ -244,11 +244,11 @@ fn handleCtlWrite(conn: u8, data: []const u8) ?u16 {
     if (startsWith(trimmed, "connect ")) {
         const args = trimmed[8..];
         const parsed = parseAddr(args) orelse {
-            serial.puts("netfs: bad connect address\n");
+            klog.debug("netfs: bad connect address\n");
             return 0;
         };
         if (!tcp.connect(conn, parsed.ip, parsed.port)) {
-            serial.puts("netfs: connect failed\n");
+            klog.debug("netfs: connect failed\n");
             return 0;
         }
         // Caller should block until ESTABLISHED
@@ -263,17 +263,17 @@ fn handleCtlWrite(conn: u8, data: []const u8) ?u16 {
             port_str = args[2..];
         }
         const port = parseDec(port_str) orelse {
-            serial.puts("netfs: bad announce port\n");
+            klog.debug("netfs: bad announce port\n");
             return 0;
         };
         if (!tcp.announce(conn, @intCast(port))) {
-            serial.puts("netfs: announce failed\n");
+            klog.debug("netfs: announce failed\n");
             return 0;
         }
         return @intCast(data.len);
     }
 
-    serial.puts("netfs: unknown ctl command\n");
+    klog.debug("netfs: unknown ctl command\n");
     return 0;
 }
 
@@ -319,14 +319,14 @@ fn handleIcmpCtlWrite(conn: u8, data: []const u8) ?u16 {
     if (startsWith(trimmed, "connect ")) {
         const ip_str = trimmed[8..];
         const ip = parseIp(ip_str) orelse {
-            serial.puts("netfs: bad icmp connect address\n");
+            klog.debug("netfs: bad icmp connect address\n");
             return 0;
         };
         icmp.setDst(conn, ip);
         return @intCast(data.len);
     }
 
-    serial.puts("netfs: unknown icmp ctl command\n");
+    klog.debug("netfs: unknown icmp ctl command\n");
     return 0;
 }
 

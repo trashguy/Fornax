@@ -2,9 +2,8 @@
 ///
 /// Each process has its own address space, kernel stack, file descriptor table,
 /// and namespace (mount table).
-const console = @import("console.zig");
-const serial = @import("serial.zig");
 const pmm = @import("pmm.zig");
+const klog = @import("klog.zig");
 const mem = @import("mem.zig");
 const ipc = @import("ipc.zig");
 const namespace = @import("namespace.zig");
@@ -307,9 +306,9 @@ pub fn init() void {
         p.initFds();
     }
     initialized = true;
-    console.puts("Process: initialized (max ");
-    console.putDec(MAX_PROCESSES);
-    console.puts(")\n");
+    klog.info("Process: initialized (max ");
+    klog.infoDec(MAX_PROCESSES);
+    klog.info(")\n");
 }
 
 /// Allocate a new process with its own address space and kernel stack.
@@ -406,9 +405,9 @@ pub fn killChildren(parent_pid: u32) void {
                 freeKernelStack(p);
                 p.state = .free;
                 p.parent_pid = null;
-                serial.puts("[killed orphan pid=");
-                serial.putDec(p.pid);
-                serial.puts("]\n");
+                klog.debug("[killed orphan pid=");
+                klog.debugDec(p.pid);
+                klog.debug("]\n");
             }
         }
     }
@@ -475,7 +474,7 @@ pub fn scheduleNext() noreturn {
             // Loop back and re-scan for ready processes
             continue;
         } else {
-            console.puts("\n[All processes exited. System halting.]\n");
+            klog.err("\n[All processes exited. System halting.]\n");
             current = null;
             cpu.halt();
         }

@@ -2,7 +2,7 @@
 ///
 /// Parses and builds IPv4 packets. Computes header checksums.
 /// Minimal implementation: no fragmentation, no options.
-const serial = @import("../serial.zig");
+const klog = @import("../klog.zig");
 
 pub const PROTO_ICMP: u8 = 1;
 pub const PROTO_TCP: u8 = 6;
@@ -47,7 +47,7 @@ pub fn parse(data: []const u8) ?ParseResult {
 
     // Verify checksum
     if (computeChecksum(data[0..header_len]) != 0) {
-        serial.puts("ipv4: bad checksum\n");
+        klog.debug("ipv4: bad checksum\n");
         return null;
     }
 

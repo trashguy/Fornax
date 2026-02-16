@@ -4,8 +4,7 @@
 /// Enumerates bus 0 to discover devices. Sufficient for QEMU which
 /// puts all devices on bus 0.
 const cpu = @import("cpu.zig");
-const console = @import("../../console.zig");
-const serial = @import("../../serial.zig");
+const klog = @import("../../klog.zig");
 
 const CONFIG_ADDRESS: u16 = 0x0CF8;
 const CONFIG_DATA: u16 = 0x0CFC;
@@ -127,7 +126,7 @@ var device_count: u8 = 0;
 /// Enumerate PCI bus 0 and discover all devices.
 pub fn enumerate() void {
     device_count = 0;
-    serial.puts("PCI: scanning bus 0...\n");
+    klog.debug("PCI: scanning bus 0...\n");
 
     for (0..32) |slot_usize| {
         const slot: u8 = @intCast(slot_usize);
@@ -165,29 +164,29 @@ pub fn enumerate() void {
             }
         }
 
-        serial.puts("  [");
-        serial.putDec(slot_usize);
-        serial.puts("] ");
-        serial.putHex(vendor_id);
-        serial.puts(":");
-        serial.putHex(device_id);
-        serial.puts(" class=");
-        serial.putHex(dev.class_code);
-        serial.puts(":");
-        serial.putHex(dev.subclass);
+        klog.debug("  [");
+        klog.debugDec(slot_usize);
+        klog.debug("] ");
+        klog.debugHex(vendor_id);
+        klog.debug(":");
+        klog.debugHex(device_id);
+        klog.debug(" class=");
+        klog.debugHex(dev.class_code);
+        klog.debug(":");
+        klog.debugHex(dev.subclass);
         if (dev.isVirtioNet()) {
-            serial.puts(" (virtio-net)");
+            klog.debug(" (virtio-net)");
         } else if (dev.isVirtio()) {
-            serial.puts(" (virtio)");
+            klog.debug(" (virtio)");
         }
-        serial.puts("\n");
+        klog.debug("\n");
 
         device_count += 1;
     }
 
-    console.puts("PCI: found ");
-    console.putDec(device_count);
-    console.puts(" devices\n");
+    klog.info("PCI: found ");
+    klog.infoDec(device_count);
+    klog.info(" devices\n");
 }
 
 /// Find the first device matching a vendor/device ID pair.

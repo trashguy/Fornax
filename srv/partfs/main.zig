@@ -443,8 +443,6 @@ fn appendDec(buf: []u8, pos: usize, val: u64) usize {
 // ── Entry point ────────────────────────────────────────────────────
 
 export fn _start() noreturn {
-    _ = fx.write(1, "partfs: starting\n");
-
     // Initialize handles
     for (0..MAX_HANDLES) |i| {
         handles[i] = .{ .kind = .disk, .part_idx = 0, .active = false };
@@ -463,8 +461,6 @@ export fn _start() noreturn {
 
     // Parse GPT from block device
     parseGpt();
-
-    _ = fx.write(1, "partfs: ready\n");
 
     // Server loop
     while (true) {

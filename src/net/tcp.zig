@@ -3,7 +3,7 @@
 /// Minimal TCP implementation with connection state machine, retransmission,
 /// and ring buffers. Supports connect, listen, send, and receive.
 const ipv4 = @import("ipv4.zig");
-const serial = @import("../serial.zig");
+const klog = @import("../klog.zig");
 const timer = @import("../timer.zig");
 const process = @import("../process.zig");
 
@@ -165,11 +165,11 @@ pub fn connect(idx: u8, ip: [4]u8, port: u16) bool {
     c.retransmit_tick = timer.getTicks();
     c.retransmit_count = 0;
 
-    serial.puts("tcp: SYN sent to ");
-    net.printIpSerial(ip);
-    serial.puts(":");
-    serial.putDec(port);
-    serial.puts("\n");
+    klog.debug("tcp: SYN sent to ");
+    net.printIpDebug(ip);
+    klog.debug(":");
+    klog.debugDec(port);
+    klog.debug("\n");
     return true;
 }
 
@@ -182,9 +182,9 @@ pub fn announce(idx: u8, port: u16) bool {
     c.local_port = port;
     c.state = .listen;
 
-    serial.puts("tcp: listening on port ");
-    serial.putDec(port);
-    serial.puts("\n");
+    klog.debug("tcp: listening on port ");
+    klog.debugDec(port);
+    klog.debug("\n");
     return true;
 }
 
@@ -288,9 +288,9 @@ pub fn setListenWaiter(idx: u8, pid: u16) void {
 pub fn handlePacket(payload: []const u8, ip_hdr: ipv4.Header) void {
     if (payload.len < HEADER_SIZE) return;
 
-    serial.puts("tcp: rx from ");
-    net.printIpSerial(ip_hdr.src);
-    serial.puts("\n");
+    klog.debug("tcp: rx from ");
+    net.printIpDebug(ip_hdr.src);
+    klog.debug("\n");
 
     const src_port = be16(payload[0..2]);
     const dst_port = be16(payload[2..4]);
@@ -307,7 +307,7 @@ pub fn handlePacket(payload: []const u8, ip_hdr: ipv4.Header) void {
 
     // Verify TCP checksum
     if (!verifyChecksum(payload, ip_hdr)) {
-        serial.puts("tcp: bad checksum\n");
+        klog.debug("tcp: bad checksum\n");
         return;
     }
 
@@ -351,14 +351,14 @@ pub fn tick(now: u32) void {
             .syn_sent => {
                 if (now -% c.retransmit_tick >= c.rto) {
                     if (c.retransmit_count >= MAX_RETRIES) {
-                        serial.puts("tcp: connect timeout\n");
+                        klog.debug("tcp: connect timeout\n");
                         wakeWaiter(&c.connect_waiter_pid, true);
                         freeConn(c);
                     } else {
                         // Retransmit SYN
-                        serial.puts("tcp: retransmit SYN #");
-                        serial.putDec(c.retransmit_count + 1);
-                        serial.puts("\n");
+                        klog.debug("tcp: retransmit SYN #");
+                        klog.debugDec(c.retransmit_count + 1);
+                        klog.debug("\n");
                         sendSyn(c);
                         c.retransmit_count += 1;
                         c.retransmit_tick = now;
@@ -371,7 +371,7 @@ pub fn tick(now: u32) void {
                 if (c.tx_len > 0 and seqDiff(c.snd_nxt, c.snd_una) > 0) {
                     if (now -% c.retransmit_tick >= c.rto) {
                         if (c.retransmit_count >= MAX_RETRIES) {
-                            serial.puts("tcp: retransmit timeout\n");
+                            klog.debug("tcp: retransmit timeout\n");
                             wakeWaiter(&c.read_waiter_pid, true);
                             sendRst(c);
                             freeConn(c);
@@ -412,7 +412,7 @@ fn handleSegment(c: *Connection, idx: u8, seq: u32, ack: u32, flags: u8, window:
 
     // RST handling — always process
     if (flags & RST != 0) {
-        serial.puts("tcp: received RST\n");
+        klog.debug("tcp: received RST\n");
         wakeWaiter(&c.connect_waiter_pid, true);
         wakeWaiter(&c.read_waiter_pid, true);
         wakeWaiter(&c.listen_waiter_pid, true);
@@ -433,7 +433,7 @@ fn handleSegment(c: *Connection, idx: u8, seq: u32, ack: u32, flags: u8, window:
                     c.rto = INITIAL_RTO;
                     c.tx_len = 0;
                     sendAck(c);
-                    serial.puts("tcp: connected\n");
+                    klog.debug("tcp: connected\n");
                     wakeWaiter(&c.connect_waiter_pid, false);
                 }
             }
@@ -445,7 +445,7 @@ fn handleSegment(c: *Connection, idx: u8, seq: u32, ack: u32, flags: u8, window:
                 c.state = .established;
                 c.retransmit_count = 0;
                 c.rto = INITIAL_RTO;
-                serial.puts("tcp: accept complete\n");
+                klog.debug("tcp: accept complete\n");
                 // Wake the listener's waiter
                 if (c.parent_idx != 0xFF and c.parent_idx < MAX_CONNECTIONS) {
                     wakeWaiter(&connections[c.parent_idx].listen_waiter_pid, false);
@@ -539,7 +539,7 @@ fn handleEstablished(c: *Connection, seq: u32, ack: u32, flags: u8, window: u16,
         c.state = .close_wait;
         // Wake reader with EOF
         wakeWaiter(&c.read_waiter_pid, false);
-        serial.puts("tcp: remote closed (FIN)\n");
+        klog.debug("tcp: remote closed (FIN)\n");
     }
 }
 
@@ -577,7 +577,7 @@ fn handleListenSegment(listener: *Connection, listener_idx: u8, seq: u32, flags:
 
     // Allocate a child connection
     const child_idx = alloc() orelse {
-        serial.puts("tcp: listen: no free connections\n");
+        klog.debug("tcp: listen: no free connections\n");
         return;
     };
     const child = &connections[child_idx];
@@ -595,13 +595,13 @@ fn handleListenSegment(listener: *Connection, listener_idx: u8, seq: u32, flags:
     // Send SYN+ACK
     sendFlags(child, SYN | ACK, child.snd_una);
 
-    serial.puts("tcp: SYN+ACK sent to ");
-    net.printIpSerial(ip_hdr.src);
-    serial.puts(":");
-    serial.putDec(src_port);
-    serial.puts(" (child conn ");
-    serial.putDec(child_idx);
-    serial.puts(")\n");
+    klog.debug("tcp: SYN+ACK sent to ");
+    net.printIpDebug(ip_hdr.src);
+    klog.debug(":");
+    klog.debugDec(src_port);
+    klog.debug(" (child conn ");
+    klog.debugDec(child_idx);
+    klog.debug(")\n");
 }
 
 // ── Segment building ────────────────────────────────────────────────

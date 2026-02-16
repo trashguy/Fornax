@@ -4,7 +4,6 @@
 /// Convention: RAX=nr, RDI=a0, RSI=a1, RDX=a2, R10=a3, R8=a4
 const std = @import("std");
 const console = @import("console.zig");
-const serial = @import("serial.zig");
 const process = @import("process.zig");
 const ipc = @import("ipc.zig");
 const namespace = @import("namespace.zig");
@@ -15,6 +14,7 @@ const paging = switch (@import("builtin").cpu.arch) {
 };
 const pmm = @import("pmm.zig");
 const mem = @import("mem.zig");
+const klog = @import("klog.zig");
 
 pub const SYS = enum(u64) {
     open = 0,
@@ -39,6 +39,7 @@ pub const SYS = enum(u64) {
     spawn = 19,
     pread = 20,
     pwrite = 21,
+    klog = 22,
 };
 
 /// Error return values.
@@ -94,9 +95,9 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
     process.saveCurrentContext();
 
     const sys = std.meta.intToEnum(SYS, nr) catch {
-        serial.puts("syscall: unknown nr=");
-        serial.putDec(nr);
-        serial.puts("\n");
+        klog.warn("syscall: unknown nr=");
+        klog.warnDec(nr);
+        klog.warn("\n");
         return ENOSYS;
     };
 
@@ -112,9 +113,9 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         .stat => sysStat(arg0, arg1),
         .remove => sysRemove(arg0, arg1),
         .seek => {
-            serial.puts("syscall: unimplemented nr=");
-            serial.putDec(nr);
-            serial.puts("\n");
+            klog.warn("syscall: unimplemented nr=");
+            klog.warnDec(nr);
+            klog.warn("\n");
             return ENOSYS;
         },
         .exec => sysExec(arg0, arg1),
@@ -124,10 +125,11 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         .pipe => sysPipe(arg0),
         .pread => sysPread(arg0, arg1, arg2, arg3),
         .pwrite => sysPwrite(arg0, arg1, arg2, arg3),
+        .klog => sysKlog(arg0, arg1, arg2),
         .mount, .bind, .unmount, .rfork => {
-            serial.puts("syscall: unimplemented nr=");
-            serial.putDec(nr);
-            serial.puts("\n");
+            klog.warn("syscall: unimplemented nr=");
+            klog.warnDec(nr);
+            klog.warn("\n");
             return ENOSYS;
         },
     };
@@ -263,11 +265,11 @@ fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
 fn sysExit(status: u64) noreturn {
     const proc = process.getCurrent() orelse process.scheduleNext();
 
-    serial.puts("[Process ");
-    serial.putDec(proc.pid);
-    serial.puts(" exited with status ");
-    serial.putDec(status);
-    serial.puts("]\n");
+    klog.debug("[Process ");
+    klog.debugDec(proc.pid);
+    klog.debug(" exited with status ");
+    klog.debugDec(status);
+    klog.debug("]\n");
 
     proc.exit_status = @truncate(status);
 
@@ -354,11 +356,11 @@ fn sysBrk(new_brk: u64) u64 {
     var page_idx = old_brk_page;
     while (page_idx < new_brk_page) : (page_idx += 1) {
         if (proc.pages_used >= proc.quotas.max_memory_pages) {
-            serial.puts("[brk: quota exceeded]\n");
+            klog.debug("[brk: quota exceeded]\n");
             return proc.brk; // return old brk on failure
         }
         const page = pmm.allocPage() orelse {
-            serial.puts("[brk: out of memory]\n");
+            klog.debug("[brk: out of memory]\n");
             return proc.brk;
         };
         const ptr: [*]u8 = paging.physPtr(page);
@@ -421,14 +423,14 @@ fn sysWait(pid_arg: u64) u64 {
     // No zombie found — block until a child exits
     proc.state = .blocked;
     proc.waiting_for_pid = wait_pid;
-    serial.puts("[pid=");
-    serial.putDec(proc.pid);
-    serial.puts(" blocked in wait");
+    klog.debug("[pid=");
+    klog.debugDec(proc.pid);
+    klog.debug(" blocked in wait");
     if (wait_pid != 0) {
-        serial.puts(" for pid=");
-        serial.putDec(wait_pid);
+        klog.debug(" for pid=");
+        klog.debugDec(wait_pid);
     }
-    serial.puts("]\n");
+    klog.debug("]\n");
     process.scheduleNext();
 }
 
@@ -765,6 +767,16 @@ fn sysPwrite(fd: u64, buf_ptr: u64, count: u64, offset: u64) u64 {
     }
 
     return bytes_written;
+}
+
+fn sysKlog(buf_ptr: u64, buf_len: u64, offset: u64) u64 {
+    if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+    if (buf_len == 0) return 0;
+
+    const dest: [*]u8 = @ptrFromInt(buf_ptr);
+    const n = @min(buf_len, 4096);
+
+    return klog.read(dest[0..n], offset);
 }
 
 /// close(fd) → 0 or error
@@ -1160,11 +1172,11 @@ fn sysExec(elf_ptr: u64, elf_len: u64) u64 {
 
     // FDs and namespace inherited (Plan 9)
 
-    serial.puts("[exec: pid=");
-    serial.putDec(proc.pid);
-    serial.puts(" new entry=0x");
-    serial.putHex(load_result.entry_point);
-    serial.puts("]\n");
+    klog.debug("[exec: pid=");
+    klog.debugDec(proc.pid);
+    klog.debug(" new entry=");
+    klog.debugHex(load_result.entry_point);
+    klog.debug("]\n");
 
     process.scheduleNext(); // noreturn — process resumes with new image
 }
@@ -1338,13 +1350,13 @@ fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64, argv_p
         }
     }
 
-    serial.puts("[spawn: parent=");
-    serial.putDec(parent.pid);
-    serial.puts(" child=");
-    serial.putDec(child.pid);
-    serial.puts(" entry=0x");
-    serial.putHex(load_result.entry_point);
-    serial.puts("]\n");
+    klog.debug("[spawn: parent=");
+    klog.debugDec(parent.pid);
+    klog.debug(" child=");
+    klog.debugDec(child.pid);
+    klog.debug(" entry=");
+    klog.debugHex(load_result.entry_point);
+    klog.debug("]\n");
 
     return child.pid;
 }

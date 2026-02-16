@@ -6,8 +6,8 @@
 /// send() blocks until a receiver calls recv().
 /// recv() blocks until a sender calls send().
 /// Transfer happens at rendezvous — no kernel buffering.
-const console = @import("console.zig");
 const heap = @import("heap.zig");
+const klog = @import("klog.zig");
 
 /// Maximum number of channels system-wide.
 const MAX_CHANNELS = 256;
@@ -112,9 +112,9 @@ var initialized: bool = false;
 
 pub fn init() void {
     initialized = true;
-    console.puts("IPC: initialized (");
-    console.putDec(MAX_CHANNELS);
-    console.puts(" channels)\n");
+    klog.info("IPC: initialized (");
+    klog.infoDec(MAX_CHANNELS);
+    klog.info(" channels)\n");
 }
 
 pub const IpcError = error{

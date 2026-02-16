@@ -33,6 +33,7 @@ pub const exec = syscall.exec;
 pub const pipe = syscall.pipe;
 pub const pread = syscall.pread;
 pub const pwrite = syscall.pwrite;
+pub const klog = syscall.klog;
 
 // Re-export IPC types at top level.
 pub const IpcMessage = ipc.IpcMessage;

@@ -12,9 +12,8 @@
 ///   0x12  device_status    (R/W) — device status register
 ///   0x13  isr_status       (R)   — interrupt status
 ///   0x14+ device-specific config (varies by device type)
-const console = @import("console.zig");
-const serial = @import("serial.zig");
 const pmm = @import("pmm.zig");
+const klog = @import("klog.zig");
 
 const pci = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/pci.zig"),
@@ -123,7 +122,7 @@ pub const VirtioDevice = struct {
 /// Initialize a legacy virtio device via PCI.
 pub fn initDevice(pci_dev: *pci.PciDevice) ?VirtioDevice {
     const io_base = pci_dev.ioBase() orelse {
-        serial.puts("virtio: device has no I/O BAR\n");
+        klog.debug("virtio: device has no I/O BAR\n");
         return null;
     };
 
@@ -142,9 +141,9 @@ pub fn initDevice(pci_dev: *pci.PciDevice) ?VirtioDevice {
     // Read device features
     const device_features = read32(io_base, REG_DEVICE_FEATURES);
 
-    serial.puts("virtio: device features = ");
-    serial.putHex(device_features);
-    serial.puts("\n");
+    klog.debug("virtio: device features = ");
+    klog.debugHex(device_features);
+    klog.debug("\n");
 
     return VirtioDevice{
         .io_base = io_base,
@@ -163,9 +162,9 @@ pub fn finishInit(dev: *VirtioDevice, wanted_features: u32) void {
     // Mark driver OK
     write8(dev.io_base, REG_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK);
 
-    serial.puts("virtio: negotiated features = ");
-    serial.putHex(dev.negotiated_features);
-    serial.puts(", status = DRIVER_OK\n");
+    klog.debug("virtio: negotiated features = ");
+    klog.debugHex(dev.negotiated_features);
+    klog.debug(", status = DRIVER_OK\n");
 }
 
 /// Set up a virtqueue.
@@ -176,17 +175,17 @@ pub fn setupQueue(dev: *VirtioDevice, queue_index: u16) ?Virtqueue {
     // Read queue size
     const queue_size = read16(dev.io_base, REG_QUEUE_SIZE);
     if (queue_size == 0) {
-        serial.puts("virtio: queue ");
-        serial.putDec(queue_index);
-        serial.puts(" size is 0\n");
+        klog.debug("virtio: queue ");
+        klog.debugDec(queue_index);
+        klog.debug(" size is 0\n");
         return null;
     }
 
-    serial.puts("virtio: queue ");
-    serial.putDec(queue_index);
-    serial.puts(" size = ");
-    serial.putDec(queue_size);
-    serial.puts("\n");
+    klog.debug("virtio: queue ");
+    klog.debugDec(queue_index);
+    klog.debug(" size = ");
+    klog.debugDec(queue_size);
+    klog.debug("\n");
 
     // Calculate memory layout sizes
     // Descriptor table: 16 bytes per entry

@@ -1,8 +1,7 @@
 /// Kernel bump allocator backed by PMM.
 /// No free for MVP — just bumps forward. Good enough for kernel init structures.
 const pmm = @import("pmm.zig");
-const console = @import("console.zig");
-const serial = @import("serial.zig");
+const klog = @import("klog.zig");
 
 const page_size = 4096;
 
@@ -18,7 +17,7 @@ pub fn init() void {
     // Allocate contiguous-ish pages from PMM
     // For MVP, grab the first page and use it as the base, then grab more
     const first = pmm.allocPage() orelse {
-        console.puts("Heap: failed to allocate from PMM!\n");
+        klog.err("Heap: failed to allocate from PMM!\n");
         return;
     };
     arena_base = first;
@@ -42,11 +41,11 @@ pub fn init() void {
     offset = 0;
     initialized = true;
 
-    console.puts("Heap: ");
-    console.putDec(arena_size / 1024);
-    console.puts(" KB arena at ");
-    console.putHex(arena_base);
-    console.puts("\n");
+    klog.info("Heap: ");
+    klog.infoDec(arena_size / 1024);
+    klog.info(" KB arena at ");
+    klog.infoHex(arena_base);
+    klog.info("\n");
 }
 
 pub fn alloc(size: usize) ?[*]u8 {

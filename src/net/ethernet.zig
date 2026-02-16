@@ -1,8 +1,6 @@
 /// Ethernet frame parsing and building.
 ///
 /// Frame layout: [dst MAC 6][src MAC 6][EtherType 2][payload 46-1500]
-const serial = @import("../serial.zig");
-
 pub const ETHER_ARP: u16 = 0x0806;
 pub const ETHER_IPV4: u16 = 0x0800;
 

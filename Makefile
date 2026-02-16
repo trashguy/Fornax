@@ -43,10 +43,11 @@ disk-img:
 		dd if=/dev/zero of=fornax-disk.img bs=1M count=64 status=none; \
 	fi
 
-disk-format: disk-img
-	zig build mkfxfs
-	@echo "hello from fxfs" > /tmp/fxfs-hello.txt
-	./zig-out/bin/mkfxfs fornax-disk.img --add /tmp/fxfs-hello.txt:/hello.txt
+disk-format: disk-img x86_64
+	zig build mkfxfs mkgpt
+	./zig-out/bin/mkgpt fornax-disk.img
+	$(eval DISK_SIZE := $(shell stat -c%s fornax-disk.img 2>/dev/null || stat -f%z fornax-disk.img))
+	./zig-out/bin/mkfxfs fornax-disk.img --offset 1048576 --size $$(( $(DISK_SIZE) - 1048576 - 33 * 512 )) --populate zig-out/rootfs
 
 clean-disk:
 	rm -f fornax-disk.img

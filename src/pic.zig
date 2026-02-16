@@ -4,8 +4,7 @@
 /// All IRQs masked initially; unmask individually as drivers register.
 
 const cpu = @import("arch/x86_64/cpu.zig");
-const serial = @import("serial.zig");
-const console = @import("console.zig");
+const klog = @import("klog.zig");
 
 const PIC1_CMD: u16 = 0x20;
 const PIC1_DATA: u16 = 0x21;
@@ -50,7 +49,7 @@ pub fn init() void {
     cpu.outb(PIC1_DATA, 0xFF);
     cpu.outb(PIC2_DATA, 0xFF);
 
-    console.puts("PIC: remapped IRQs 0-15 → vectors 32-47\n");
+    klog.info("PIC: remapped IRQs 0-15 → vectors 32-47\n");
 }
 
 pub fn unmask(irq: u8) void {
@@ -65,9 +64,9 @@ pub fn unmask(irq: u8) void {
         const master_mask = cpu.inb(PIC1_DATA);
         cpu.outb(PIC1_DATA, master_mask & ~@as(u8, 4));
     }
-    serial.puts("PIC: unmasked IRQ ");
-    serial.putDec(irq);
-    serial.puts("\n");
+    klog.debug("PIC: unmasked IRQ ");
+    klog.debugDec(irq);
+    klog.debug("\n");
 }
 
 pub fn mask(irq: u8) void {

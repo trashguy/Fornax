@@ -1,4 +1,4 @@
-const console = @import("../../console.zig");
+const klog = @import("../../klog.zig");
 
 const IdtEntry = packed struct {
     offset_low: u16,
@@ -93,5 +93,5 @@ pub fn init() void {
         : [idt_ptr] "r" (&idt_ptr),
     );
 
-    console.puts("IDT: loaded (256 entries, 48 handlers)\n");
+    klog.info("IDT: loaded (256 entries, 48 handlers)\n");
 }

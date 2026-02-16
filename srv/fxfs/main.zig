@@ -1561,8 +1561,6 @@ fn formatDisk() bool {
 // ── Entry point ────────────────────────────────────────────────────
 
 export fn _start() noreturn {
-    _ = fx.write(1, "fxfs: starting\n");
-
     // Initialize
     cacheInit();
     for (0..MAX_HANDLES) |i| {
@@ -1581,8 +1579,6 @@ export fn _start() noreturn {
             fx.exit(1);
         }
     }
-
-    _ = fx.write(1, "fxfs: ready\n");
 
     // Server loop
     while (true) {

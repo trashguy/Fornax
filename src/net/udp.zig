@@ -4,7 +4,7 @@
 /// Each "connection" is an entry that binds a local port and optionally
 /// a remote address/port.
 const ipv4 = @import("ipv4.zig");
-const serial = @import("../serial.zig");
+const klog = @import("../klog.zig");
 
 const HEADER_SIZE = 8; // src_port(2) + dst_port(2) + length(2) + checksum(2)
 const MAX_CONNECTIONS = 16;
@@ -137,9 +137,9 @@ pub fn handlePacket(payload: []const u8, ip_hdr: ipv4.Header) void {
         return;
     }
 
-    serial.puts("udp: no listener for port ");
-    serial.putDec(dst_port);
-    serial.puts("\n");
+    klog.debug("udp: no listener for port ");
+    klog.debugDec(dst_port);
+    klog.debug("\n");
 }
 
 /// Check if a connection has received data. Returns the data slice or null.

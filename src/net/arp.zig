@@ -3,7 +3,7 @@
 /// Resolves IPv4 addresses to MAC addresses. Maintains a small cache.
 /// Handles ARP requests (replies to queries for our IP) and stores
 /// results from ARP replies.
-const serial = @import("../serial.zig");
+const klog = @import("../klog.zig");
 const ethernet = @import("ethernet.zig");
 
 const ARP_REQUEST: u16 = 1;
@@ -68,7 +68,7 @@ pub fn handlePacket(
     if (operation == ARP_REQUEST) {
         // Is this asking for our MAC?
         if (ipEqual(target_ip[0..4].*, our_ip)) {
-            serial.puts("arp: request for our IP, sending reply\n");
+            klog.debug("arp: request for our IP, sending reply\n");
             return buildReply(reply_buf, our_mac, our_ip, sender_mac[0..6].*, sender_ip[0..4].*);
         }
     }

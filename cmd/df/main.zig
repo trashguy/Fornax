@@ -1,6 +1,6 @@
 /// df — report filesystem disk space usage.
 ///
-/// Reads /disk/ctl for filesystem stats and displays usage table.
+/// Reads /ctl for filesystem stats and displays usage table.
 const fx = @import("fornax");
 
 const out = fx.io.Writer.stdout;
@@ -80,16 +80,16 @@ fn appendDec(buf: []u8, pos: usize, val: u64) usize {
 export fn _start() noreturn {
     var info_buf: [512]u8 = undefined;
 
-    const fd = fx.open("/disk/ctl");
+    const fd = fx.open("/ctl");
     if (fd < 0) {
-        _ = fx.write(2, "df: cannot open /disk/ctl\n");
+        _ = fx.write(2, "df: cannot open /ctl\n");
         fx.exit(1);
     }
     const n = fx.read(fd, &info_buf);
     _ = fx.close(fd);
 
     if (n <= 0) {
-        _ = fx.write(2, "df: cannot read /disk/ctl\n");
+        _ = fx.write(2, "df: cannot read /ctl\n");
         fx.exit(1);
     }
 
@@ -109,7 +109,7 @@ export fn _start() noreturn {
     const avail_str = formatBlockSize(free, bsize, &avail_buf);
 
     out.puts("Filesystem    Size  Used  Avail  Mounted on\n");
-    out.print("/dev/blk0p1   {s: <5} {s: <5} {s: <6} /disk\n", .{ size_str, used_str, avail_str });
+    out.print("/dev/blk0p1   {s: <5} {s: <5} {s: <6} /\n", .{ size_str, used_str, avail_str });
 
     fx.exit(0);
 }

@@ -8,7 +8,6 @@
 ///   REPLACE — new mount replaces the old entry
 ///   BEFORE  — new mount searched first in union
 ///   AFTER   — new mount searched after existing
-const console = @import("console.zig");
 const ipc = @import("ipc.zig");
 const heap = @import("heap.zig");
 

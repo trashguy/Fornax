@@ -4,7 +4,7 @@
 /// addressed to us, we build an echo reply. Also provides connection
 /// tracking for outgoing echo requests (userspace ping).
 const ipv4 = @import("ipv4.zig");
-const serial = @import("../serial.zig");
+const klog = @import("../klog.zig");
 const process = @import("../process.zig");
 const timer = @import("../timer.zig");
 
@@ -118,11 +118,11 @@ pub fn sendEchoRequest(idx: u8, our_ip: [4]u8) bool {
     stats.echo_requests_tx += 1;
     c.next_seq +%= 1;
 
-    serial.puts("icmp: sent echo request to ");
+    klog.debug("icmp: sent echo request to ");
     printIp(c.dst_ip);
-    serial.puts(" seq=");
-    serial.putDec(c.next_seq -% 1);
-    serial.puts("\n");
+    klog.debug(" seq=");
+    klog.debugDec(c.next_seq -% 1);
+    klog.debug("\n");
 
     return true;
 }
@@ -204,7 +204,7 @@ pub fn checkTimeouts(current_tick: u32) void {
         if (!c.in_use or c.waiter_pid == 0) continue;
         if (!c.got_reply and current_tick -% c.send_tick >= TIMEOUT_TICKS) {
             // Timeout — wake waiter with timeout indication
-            serial.puts("icmp: timeout for echo request\n");
+            klog.debug("icmp: timeout for echo request\n");
             c.timed_out = true;
             wakeWaiter(&c.waiter_pid);
         }
@@ -226,9 +226,9 @@ fn matchEchoReply(payload: []const u8, ip_hdr: ipv4.Header) void {
             c.reply_ttl = ip_hdr.ttl;
             c.reply_src = ip_hdr.src;
             c.reply_seq = reply_seq;
-            serial.puts("icmp: matched echo reply to conn, seq=");
-            serial.putDec(reply_seq);
-            serial.puts("\n");
+            klog.debug("icmp: matched echo reply to conn, seq=");
+            klog.debugDec(reply_seq);
+            klog.debug("\n");
             wakeWaiter(&c.waiter_pid);
             return;
         }
@@ -260,7 +260,7 @@ pub fn handlePacket(
 
     // Verify ICMP checksum
     if (ipv4.computeChecksum(payload) != 0) {
-        serial.puts("icmp: bad checksum\n");
+        klog.debug("icmp: bad checksum\n");
         return null;
     }
 
@@ -268,9 +268,9 @@ pub fn handlePacket(
 
     if (icmp_type == TYPE_ECHO_REQUEST) {
         stats.echo_requests_rx += 1;
-        serial.puts("icmp: echo request from ");
+        klog.debug("icmp: echo request from ");
         printIp(ip_hdr.src);
-        serial.puts("\n");
+        klog.debug("\n");
 
         // Build echo reply: same payload, swap type
         return buildEchoReply(reply_buf, our_ip, ip_hdr.src, payload);
@@ -278,9 +278,9 @@ pub fn handlePacket(
 
     if (icmp_type == TYPE_ECHO_REPLY) {
         stats.echo_replies_rx += 1;
-        serial.puts("icmp: echo reply from ");
+        klog.debug("icmp: echo reply from ");
         printIp(ip_hdr.src);
-        serial.puts("\n");
+        klog.debug("\n");
 
         // Try to match to a connection
         matchEchoReply(payload, ip_hdr);
@@ -343,11 +343,11 @@ fn formatIp(buf: []u8, ip: [4]u8) u16 {
 }
 
 fn printIp(ip: [4]u8) void {
-    serial.putDec(ip[0]);
-    serial.putChar('.');
-    serial.putDec(ip[1]);
-    serial.putChar('.');
-    serial.putDec(ip[2]);
-    serial.putChar('.');
-    serial.putDec(ip[3]);
+    klog.debugDec(ip[0]);
+    klog.debug(".");
+    klog.debugDec(ip[1]);
+    klog.debug(".");
+    klog.debugDec(ip[2]);
+    klog.debug(".");
+    klog.debugDec(ip[3]);
 }

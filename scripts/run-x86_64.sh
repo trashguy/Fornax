@@ -51,48 +51,43 @@ if [ -z "$OVMF" ]; then
 fi
 
 echo "==> Using OVMF: $OVMF"
-echo "==> Launching QEMU..."
 
+# ── Disk image: always recreate with fresh rootfs ─────────────────────
 DISK_IMG="$PROJECT_DIR/fornax-disk.img"
-if [ ! -f "$DISK_IMG" ]; then
-    echo "==> Creating blank 64 MB disk image..."
-    dd if=/dev/zero of="$DISK_IMG" bs=1M count=64 status=none
-fi
+ROOTFS_DIR="$PROJECT_DIR/zig-out/rootfs"
 
-# Check for GPT signature ("EFI PART" at byte 512)
-GPT_SIG=$(dd if="$DISK_IMG" bs=1 skip=512 count=8 2>/dev/null)
-if [ "$GPT_SIG" != "EFI PART" ]; then
-    MKGPT="$PROJECT_DIR/zig-out/bin/mkgpt"
-    if [ ! -f "$MKGPT" ]; then
-        echo "==> Building mkgpt..."
-        (cd "$PROJECT_DIR" && zig build mkgpt)
-    fi
-    if [ -f "$MKGPT" ]; then
-        echo "==> Creating GPT partition table..."
-        "$MKGPT" "$DISK_IMG"
-    fi
-fi
+# Build host tools (always rebuild to pick up changes)
+MKGPT="$PROJECT_DIR/zig-out/bin/mkgpt"
+MKFXFS="$PROJECT_DIR/zig-out/bin/mkfxfs"
+echo "==> Building mkgpt + mkfxfs..."
+(cd "$PROJECT_DIR" && zig build mkgpt mkfxfs)
 
-# Check for FXFS at partition 1 start (LBA 2048 = byte 1048576)
-FXFS_SIG=$(dd if="$DISK_IMG" bs=1 skip=1048576 count=8 2>/dev/null)
-if [ "$FXFS_SIG" != "FXFS0001" ]; then
-    MKFXFS="$PROJECT_DIR/zig-out/bin/mkfxfs"
-    if [ ! -f "$MKFXFS" ]; then
-        echo "==> Building mkfxfs..."
-        (cd "$PROJECT_DIR" && zig build mkfxfs)
-    fi
-    if [ -f "$MKFXFS" ]; then
-        # Get partition end from GPT: LBA 2048 to last_usable_lba
-        # For a 64 MB disk (131072 sectors), partition ends at sector 131038
-        # Size = (131038 - 2048 + 1) * 512 bytes
-        DISK_SIZE=$(stat -c%s "$DISK_IMG" 2>/dev/null || stat -f%z "$DISK_IMG" 2>/dev/null)
-        PART_OFFSET=1048576
-        # Partition size = disk_size - offset - backup GPT overhead (33 sectors)
-        PART_SIZE=$(( DISK_SIZE - PART_OFFSET - 33 * 512 ))
-        echo "==> Formatting partition 1 with fxfs (offset=$PART_OFFSET, size=$PART_SIZE)..."
-        "$MKFXFS" "$DISK_IMG" --offset "$PART_OFFSET" --size "$PART_SIZE"
-    fi
-fi
+# Always recreate disk with fresh binaries
+rm -f "$DISK_IMG"
+echo "==> Creating 64 MB disk image..."
+dd if=/dev/zero of="$DISK_IMG" bs=1M count=64 status=none
+
+# Create rootfs staging directories
+mkdir -p "$ROOTFS_DIR/etc" "$ROOTFS_DIR/tmp"
+
+# Create placeholder fstab
+cat > "$ROOTFS_DIR/etc/fstab" << 'FSTAB'
+# /etc/fstab - Fornax filesystem table
+# Root (/) and /dev/ are kernel-mounted
+FSTAB
+
+# GPT partition table
+echo "==> Creating GPT partition table..."
+"$MKGPT" "$DISK_IMG"
+
+# Format with fxfs + populate from rootfs
+DISK_SIZE=$(stat -c%s "$DISK_IMG" 2>/dev/null || stat -f%z "$DISK_IMG" 2>/dev/null)
+PART_OFFSET=1048576
+PART_SIZE=$(( DISK_SIZE - PART_OFFSET - 33 * 512 ))
+echo "==> Formatting partition 1 with fxfs (offset=$PART_OFFSET, size=$PART_SIZE)..."
+"$MKFXFS" "$DISK_IMG" --offset "$PART_OFFSET" --size "$PART_SIZE" --populate "$ROOTFS_DIR"
+
+echo "==> Launching QEMU..."
 
 exec qemu-system-x86_64 \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF" \

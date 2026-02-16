@@ -4,8 +4,7 @@
 /// initializes via modern virtio transport, and reads EV_KEY events
 /// from the event queue (queue 0).
 
-const serial = @import("serial.zig");
-const console = @import("console.zig");
+const klog = @import("klog.zig");
 const pci = @import("arch/x86_64/pci.zig");
 const virtio = @import("virtio.zig");
 const virtio_modern = @import("virtio_modern.zig");
@@ -37,19 +36,19 @@ var eventq: ?virtio.Virtqueue = null;
 pub fn init() bool {
     // Find virtio-input device: vendor 0x1AF4, device 0x1052
     const pci_dev = pci.findDevice(0x1AF4, 0x1052) orelse {
-        serial.puts("virtio-input: no device found\n");
+        klog.debug("virtio-input: no device found\n");
         return false;
     };
 
-    serial.puts("virtio-input: found device at slot ");
-    serial.putDec(pci_dev.slot);
-    serial.puts(" IRQ ");
-    serial.putDec(pci_dev.interrupt_line);
-    serial.puts("\n");
+    klog.debug("virtio-input: found device at slot ");
+    klog.debugDec(pci_dev.slot);
+    klog.debug(" IRQ ");
+    klog.debugDec(pci_dev.interrupt_line);
+    klog.debug("\n");
 
     // Initialize via modern transport
     var dev = virtio_modern.initDevice(pci_dev) orelse {
-        serial.puts("virtio-input: modern init failed\n");
+        klog.err("virtio-input: modern init failed\n");
         return false;
     };
 
@@ -58,7 +57,7 @@ pub fn init() bool {
 
     // Set up event queue (queue 0)
     var vq = virtio_modern.setupQueue(&dev, EVENT_QUEUE) orelse {
-        serial.puts("virtio-input: failed to setup event queue\n");
+        klog.err("virtio-input: failed to setup event queue\n");
         return false;
     };
 
@@ -78,14 +77,14 @@ pub fn init() bool {
     // Register IRQ handler
     const irq = pci_dev.interrupt_line;
     if (!interrupts.registerIrqHandler(irq, handleIrq)) {
-        serial.puts("virtio-input: failed to register IRQ handler\n");
+        klog.err("virtio-input: failed to register IRQ handler\n");
         return false;
     }
 
     // Unmask the IRQ
     pic.unmask(irq);
 
-    console.puts("Keyboard ready.\n");
+    klog.info("Keyboard ready.\n");
     return true;
 }
 

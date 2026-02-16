@@ -2,7 +2,7 @@
 ///
 /// Uses the existing kernel UDP stack. Queries a nameserver (default 10.0.2.3,
 /// QEMU user-mode DNS forwarder) and caches results with TTL expiry.
-const serial = @import("../serial.zig");
+const klog = @import("../klog.zig");
 const process = @import("../process.zig");
 const timer = @import("../timer.zig");
 
@@ -50,7 +50,7 @@ pub fn init() void {
         // Bind to a known port so responses are delivered back to us
         _ = udp.bind(conn, 10000);
     } else {
-        serial.puts("dns: failed to allocate UDP connection\n");
+        klog.warn("dns: failed to allocate UDP connection\n");
     }
 }
 
@@ -98,9 +98,9 @@ pub fn query(name: []const u8) bool {
     const src_port = 10000 + @as(u16, @intCast(conn));
     _ = net.sendUdp(nameserver, src_port, DNS_PORT, buf[0..len]);
 
-    serial.puts("dns: query sent for ");
-    serial.puts(name);
-    serial.puts("\n");
+    klog.debug("dns: query sent for ");
+    klog.debug(name);
+    klog.debug("\n");
     return true;
 }
 
@@ -128,7 +128,7 @@ pub fn checkForResponse() void {
         const now = timer.getTicks();
         if (now -% pending_send_tick >= DNS_RETRY_TICKS) {
             if (pending_retries >= DNS_MAX_RETRIES) {
-                serial.puts("dns: query timeout\n");
+                klog.debug("dns: query timeout\n");
                 wakeWaiter(true);
                 pending_name_len = 0;
                 return;
@@ -145,9 +145,9 @@ pub fn checkForResponse() void {
             pending_send_tick = now;
             pending_retries += 1;
 
-            serial.puts("dns: retry #");
-            serial.putDec(pending_retries);
-            serial.puts("\n");
+            klog.debug("dns: retry #");
+            klog.debugDec(pending_retries);
+            klog.debug("\n");
         }
     }
 }
@@ -243,7 +243,7 @@ fn parseResponse(data: []const u8) void {
 
     const ancount = be16(data[6..8]);
     if (ancount == 0) {
-        serial.puts("dns: no answers\n");
+        klog.debug("dns: no answers\n");
         wakeWaiter(true);
         return;
     }
@@ -296,11 +296,11 @@ fn parseResponse(data: []const u8) void {
             cacheInsert(pending_name[0..pending_name_len], ip, ttl);
             pending_result = ip;
 
-            serial.puts("dns: resolved ");
-            serial.puts(pending_name[0..pending_name_len]);
-            serial.puts(" -> ");
-            net.printIpSerial(ip);
-            serial.puts("\n");
+            klog.debug("dns: resolved ");
+            klog.debug(pending_name[0..pending_name_len]);
+            klog.debug(" -> ");
+            net.printIpDebug(ip);
+            klog.debug("\n");
 
             wakeWaiter(false);
             return;
@@ -308,7 +308,7 @@ fn parseResponse(data: []const u8) void {
         pos += rdlength;
     }
 
-    serial.puts("dns: no A record found\n");
+    klog.debug("dns: no A record found\n");
     wakeWaiter(true);
 }
 

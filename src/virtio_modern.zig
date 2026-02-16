@@ -3,8 +3,7 @@
 /// Parses PCI capability list (cap_id=0x09) to find common_cfg, notify, isr,
 /// and device_cfg MMIO structures. Used for virtio-input which is modern-only.
 
-const serial = @import("serial.zig");
-const console = @import("console.zig");
+const klog = @import("klog.zig");
 const pci = @import("arch/x86_64/pci.zig");
 const pmm = @import("pmm.zig");
 const virtio = @import("virtio.zig");
@@ -91,7 +90,7 @@ pub fn initDevice(pci_dev: *pci.PciDevice) ?VirtioModernDevice {
     // Check PCI status register for capability list support
     const status = pci.configRead16(pci_dev.bus, pci_dev.slot, pci_dev.func, 0x06);
     if (status & 0x10 == 0) {
-        serial.puts("virtio-modern: no capabilities list\n");
+        klog.debug("virtio-modern: no capabilities list\n");
         return null;
     }
 
@@ -124,23 +123,23 @@ pub fn initDevice(pci_dev: *pci.PciDevice) ?VirtioModernDevice {
             switch (cfg_type) {
                 VIRTIO_PCI_CAP_COMMON_CFG => {
                     common_cfg = addr;
-                    serial.puts("virtio-modern: common_cfg at BAR");
-                    serial.putDec(bar_index);
-                    serial.puts("+");
-                    serial.putHex(bar_offset);
-                    serial.puts("\n");
+                    klog.debug("virtio-modern: common_cfg at BAR");
+                    klog.debugDec(bar_index);
+                    klog.debug("+");
+                    klog.debugHex(bar_offset);
+                    klog.debug("\n");
                 },
                 VIRTIO_PCI_CAP_NOTIFY_CFG => {
                     notify_base = addr;
                     // The notify_off_multiplier is at cap_offset + 16 (after the standard 16-byte cap)
                     notify_off_multiplier = pci.configRead(pci_dev.bus, pci_dev.slot, pci_dev.func, cap_offset + 16);
-                    serial.puts("virtio-modern: notify at BAR");
-                    serial.putDec(bar_index);
-                    serial.puts("+");
-                    serial.putHex(bar_offset);
-                    serial.puts(" mult=");
-                    serial.putDec(notify_off_multiplier);
-                    serial.puts("\n");
+                    klog.debug("virtio-modern: notify at BAR");
+                    klog.debugDec(bar_index);
+                    klog.debug("+");
+                    klog.debugHex(bar_offset);
+                    klog.debug(" mult=");
+                    klog.debugDec(notify_off_multiplier);
+                    klog.debug("\n");
                 },
                 VIRTIO_PCI_CAP_ISR_CFG => {
                     isr_base = addr;
@@ -156,15 +155,15 @@ pub fn initDevice(pci_dev: *pci.PciDevice) ?VirtioModernDevice {
     }
 
     const common = common_cfg orelse {
-        serial.puts("virtio-modern: no common_cfg found\n");
+        klog.debug("virtio-modern: no common_cfg found\n");
         return null;
     };
     const notify = notify_base orelse {
-        serial.puts("virtio-modern: no notify region found\n");
+        klog.debug("virtio-modern: no notify region found\n");
         return null;
     };
     const isr = isr_base orelse {
-        serial.puts("virtio-modern: no ISR region found\n");
+        klog.debug("virtio-modern: no ISR region found\n");
         return null;
     };
 
@@ -179,9 +178,9 @@ pub fn initDevice(pci_dev: *pci.PciDevice) ?VirtioModernDevice {
     mmioWrite32(common + COMMON_DFSELECT, 0);
     const device_features = mmioRead32(common + COMMON_DF);
 
-    serial.puts("virtio-modern: features = ");
-    serial.putHex(device_features);
-    serial.puts("\n");
+    klog.debug("virtio-modern: features = ");
+    klog.debugHex(device_features);
+    klog.debug("\n");
 
     return VirtioModernDevice{
         .pci_dev = pci_dev,
@@ -208,7 +207,7 @@ pub fn finishInit(dev: *VirtioModernDevice, wanted_features: u32) void {
     // Verify FEATURES_OK stuck
     const status = mmioRead8(dev.common_cfg + COMMON_STATUS);
     if (status & STATUS_FEATURES_OK == 0) {
-        serial.puts("virtio-modern: FEATURES_OK not accepted\n");
+        klog.err("virtio-modern: FEATURES_OK not accepted\n");
         mmioWrite8(dev.common_cfg + COMMON_STATUS, 0x80); // FAILED
         return;
     }
@@ -216,9 +215,9 @@ pub fn finishInit(dev: *VirtioModernDevice, wanted_features: u32) void {
     // DRIVER_OK
     mmioWrite8(dev.common_cfg + COMMON_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
 
-    serial.puts("virtio-modern: DRIVER_OK, negotiated=");
-    serial.putHex(negotiated);
-    serial.puts("\n");
+    klog.debug("virtio-modern: DRIVER_OK, negotiated=");
+    klog.debugHex(negotiated);
+    klog.debug("\n");
 }
 
 /// Set up a virtqueue. Returns a Virtqueue struct compatible with legacy ring format.
@@ -231,17 +230,17 @@ pub fn setupQueue(dev: *VirtioModernDevice, queue_index: u16) ?virtio.Virtqueue 
     // Read queue size
     const queue_size = mmioRead16(common + COMMON_QSIZE);
     if (queue_size == 0) {
-        serial.puts("virtio-modern: queue ");
-        serial.putDec(queue_index);
-        serial.puts(" size is 0\n");
+        klog.debug("virtio-modern: queue ");
+        klog.debugDec(queue_index);
+        klog.debug(" size is 0\n");
         return null;
     }
 
-    serial.puts("virtio-modern: queue ");
-    serial.putDec(queue_index);
-    serial.puts(" size = ");
-    serial.putDec(queue_size);
-    serial.puts("\n");
+    klog.debug("virtio-modern: queue ");
+    klog.debugDec(queue_index);
+    klog.debug(" size = ");
+    klog.debugDec(queue_size);
+    klog.debug("\n");
 
     // Allocate descriptor table, available ring, and used ring separately
     // Descriptor table: 16 bytes per entry

@@ -1,4 +1,4 @@
-const console = @import("../../console.zig");
+const klog = @import("../../klog.zig");
 const cpu = @import("cpu.zig");
 
 /// AArch64 exception vector table.
@@ -44,30 +44,30 @@ fn handleException(vector_index: u64) void {
     const elr = cpu.readElr();
     const far = cpu.readFar();
 
-    console.puts("\n--- EXCEPTION ---\n");
+    klog.err("\n--- EXCEPTION ---\n");
 
     if (vector_index < 16) {
-        console.puts("Type: ");
-        console.puts(vector_names[vector_index]);
+        klog.err("Type: ");
+        klog.err(vector_names[vector_index]);
     } else {
-        console.puts("Vector: ");
-        console.putDec(vector_index);
+        klog.err("Vector: ");
+        klog.errDec(vector_index);
     }
-    console.puts("\n");
+    klog.err("\n");
 
-    console.puts("ESR_EL1: ");
-    console.putHex(esr);
-    console.puts("\nELR_EL1: ");
-    console.putHex(elr);
-    console.puts("\nFAR_EL1: ");
-    console.putHex(far);
+    klog.err("ESR_EL1: ");
+    klog.errHex(esr);
+    klog.err("\nELR_EL1: ");
+    klog.errHex(elr);
+    klog.err("\nFAR_EL1: ");
+    klog.errHex(far);
 
     // Decode exception class from ESR bits [31:26]
     const ec = (esr >> 26) & 0x3F;
-    console.puts("\nException class: ");
-    console.putHex(ec);
-    console.puts(" (");
-    console.puts(switch (ec) {
+    klog.err("\nException class: ");
+    klog.errHex(ec);
+    klog.err(" (");
+    klog.err(switch (ec) {
         0x00 => "Unknown",
         0x01 => "WFI/WFE trapped",
         0x15 => "SVC (AArch64)",
@@ -79,9 +79,9 @@ fn handleException(vector_index: u64) void {
         0x2C => "FP/SIMD trapped",
         else => "Other",
     });
-    console.puts(")\n");
+    klog.err(")\n");
 
-    console.puts("--- Halting ---\n");
+    klog.err("--- Halting ---\n");
     cpu.halt();
 }
 
@@ -94,5 +94,5 @@ pub fn init() void {
     );
     cpu.isb();
 
-    console.puts("aarch64: exception vectors installed\n");
+    klog.info("aarch64: exception vectors installed\n");
 }

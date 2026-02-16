@@ -1,13 +1,13 @@
 /// mkfxfs — Fornax filesystem formatter.
 ///
-/// Usage: mkfxfs <disk-image> [--offset <bytes>] [--size <bytes>] [--add <host-file>:<fs-path>] ...
+/// Usage: mkfxfs <disk-image> [--offset <bytes>] [--size <bytes>] [--add <host-file>:<fs-path>] [--populate <dir>] ...
 ///
 /// Creates an fxfs-formatted disk image with:
 ///   Block 0:      Primary superblock
 ///   Block 1:      Backup superblock
 ///   Block 2..B:   Allocation bitmap (1 bit per block)
 ///   Block B+1:    Root B-tree leaf node (inode 1 = root directory)
-///   Optional:     Files added via --add flags
+///   Optional:     Files added via --add or --populate flags
 ///
 /// On-disk format uses packed byte-level layout (no alignment padding).
 /// Must match srv/fxfs/main.zig exactly.
@@ -178,6 +178,16 @@ const LeafBuilder = struct {
     }
 };
 
+// ── Sortable item for deferred leaf insertion ───────────────────────
+const SortableItem = struct {
+    key: Key,
+    data: []const u8,
+
+    fn orderLessThan(_: void, a: SortableItem, b: SortableItem) bool {
+        return a.key.lessThan(b.key);
+    }
+};
+
 // ── Main ────────────────────────────────────────────────────────────
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -186,7 +196,7 @@ pub fn main() !void {
 
     const args = try std.process.argsAlloc(alloc);
     if (args.len < 2) {
-        std.debug.print("Usage: mkfxfs <disk-image> [--offset <bytes>] [--size <bytes>] [--add <host-file>:<fs-path>] ...\n", .{});
+        std.debug.print("Usage: mkfxfs <disk-image> [--offset <bytes>] [--size <bytes>] [--add <host-file>:<fs-path>] [--populate <dir>] ...\n", .{});
         std.process.exit(1);
     }
 
@@ -200,6 +210,7 @@ pub fn main() !void {
     };
 
     var add_entries: std.ArrayList(AddEntry) = .empty;
+    var populate_dirs: std.ArrayList([]const u8) = .empty;
     var partition_offset: u64 = 0; // byte offset within the image
     var partition_size: u64 = 0; // byte size of partition (0 = auto from file)
     var i: usize = 2;
@@ -223,12 +234,15 @@ pub fn main() !void {
             if (std.mem.indexOfScalar(u8, spec, ':')) |colon| {
                 const host = spec[0..colon];
                 const fs = spec[colon + 1 ..];
-                const data = try std.fs.cwd().readFileAlloc(alloc, host, 1024 * 1024);
+                const data = try std.fs.cwd().readFileAlloc(alloc, host, 4 * 1024 * 1024);
                 try add_entries.append(alloc, .{ .host_path = host, .fs_path = fs, .data = data });
             } else {
                 std.debug.print("Error: --add argument must be <host-path>:<fs-path>\n", .{});
                 std.process.exit(1);
             }
+        } else if (std.mem.eql(u8, args[i], "--populate") and i + 1 < args.len) {
+            i += 1;
+            try populate_dirs.append(alloc, args[i]);
         }
     }
 
@@ -284,20 +298,50 @@ pub fn main() !void {
     // Next inode: 2 (inode 1 = root dir)
     var next_inode: u64 = 2;
 
-    // Build root leaf node
-    var leaf = LeafBuilder.init(1); // generation 1
+    // Collect all items for sorted insertion
+    var items: std.ArrayList(SortableItem) = .empty;
 
     // Inode 1: root directory
-    var inode_buf: [INODE_ITEM_SIZE]u8 = [_]u8{0} ** INODE_ITEM_SIZE;
-    writeInodeItem(&inode_buf, S_IFDIR | 0o755, 0, 0, 2, 0);
-    try leaf.addItem(.{ .inode_nr = 1, .item_type = INODE_ITEM, .offset = 0 }, &inode_buf);
+    var root_inode_buf: [INODE_ITEM_SIZE]u8 = [_]u8{0} ** INODE_ITEM_SIZE;
+    writeInodeItem(&root_inode_buf, S_IFDIR | 0o755, 0, 0, 2, 0);
+    const root_inode_data = try alloc.dupe(u8, &root_inode_buf);
+    try items.append(alloc, .{
+        .key = .{ .inode_nr = 1, .item_type = INODE_ITEM, .offset = 0 },
+        .data = root_inode_data,
+    });
 
-    // Add files from --add entries
+    // Directory inode tracking: maps directory path (relative, no leading /)
+    // to its inode number. Root dir "" = inode 1.
+    var dir_inodes = std.StringHashMap(u64).init(alloc);
+    try dir_inodes.put("", 1);
+
+    var dir_ctx = DirContext{
+        .dir_inodes = &dir_inodes,
+        .items = &items,
+        .next_inode = &next_inode,
+        .allocator = alloc,
+    };
+
+    // Collect files from --add entries
     for (add_entries.items) |entry| {
-        // Strip leading / from fs_path
         var name = entry.fs_path;
         if (name.len > 0 and name[0] == '/') name = name[1..];
-        if (name.len == 0 or name.len > 255) continue;
+        if (name.len == 0) continue;
+
+        // Split into directory and basename
+        const dir_path = if (std.mem.lastIndexOfScalar(u8, name, '/')) |slash|
+            name[0..slash]
+        else
+            "";
+        const basename = if (std.mem.lastIndexOfScalar(u8, name, '/')) |slash|
+            name[slash + 1 ..]
+        else
+            name;
+
+        if (basename.len == 0 or basename.len > 255) continue;
+
+        // Ensure parent directory exists
+        const parent_inode = try ensureDirectory(&dir_ctx, dir_path);
 
         const file_inode = next_inode;
         next_inode += 1;
@@ -305,23 +349,31 @@ pub fn main() !void {
         // Create inode for the file
         var file_inode_buf: [INODE_ITEM_SIZE]u8 = [_]u8{0} ** INODE_ITEM_SIZE;
         writeInodeItem(&file_inode_buf, S_IFREG | 0o644, 0, 0, 1, entry.data.len);
-        try leaf.addItem(.{ .inode_nr = file_inode, .item_type = INODE_ITEM, .offset = 0 }, &file_inode_buf);
+        try items.append(alloc, .{
+            .key = .{ .inode_nr = file_inode, .item_type = INODE_ITEM, .offset = 0 },
+            .data = try alloc.dupe(u8, &file_inode_buf),
+        });
 
-        // Create dir entry in root dir (inode 1)
-        const name_hash = fnvHash(name);
-        var dir_buf: [266]u8 = undefined; // max: 8 + 1 + 1 + 255
+        // Create dir entry in parent directory
+        const name_hash = fnvHash(basename);
+        var dir_buf: [266]u8 = undefined;
         writeU64LE(dir_buf[0..8], file_inode);
         dir_buf[8] = DT_REG;
-        dir_buf[9] = @intCast(name.len);
-        @memcpy(dir_buf[10..][0..name.len], name);
-        const dir_entry_size: usize = 10 + name.len;
-        try leaf.addItem(.{ .inode_nr = 1, .item_type = DIR_ENTRY, .offset = name_hash }, dir_buf[0..dir_entry_size]);
+        dir_buf[9] = @intCast(basename.len);
+        @memcpy(dir_buf[10..][0..basename.len], basename);
+        const dir_entry_size: usize = 10 + basename.len;
+        try items.append(alloc, .{
+            .key = .{ .inode_nr = parent_inode, .item_type = DIR_ENTRY, .offset = name_hash },
+            .data = try alloc.dupe(u8, dir_buf[0..dir_entry_size]),
+        });
 
         // Store file data
         const max_inline = BLOCK_SIZE - NODE_HEADER_SIZE - LEAF_ITEM_HEADER_SIZE * 10 - 100;
         if (entry.data.len <= max_inline and entry.data.len <= 3800) {
-            // Inline data: store directly in the leaf
-            try leaf.addItem(.{ .inode_nr = file_inode, .item_type = EXTENT_DATA, .offset = 0 }, entry.data);
+            try items.append(alloc, .{
+                .key = .{ .inode_nr = file_inode, .item_type = EXTENT_DATA, .offset = 0 },
+                .data = entry.data,
+            });
         } else {
             // Allocate data blocks
             const num_data_blocks = (entry.data.len + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -349,8 +401,153 @@ pub fn main() !void {
             // Create extent data reference
             var extent_buf: [EXTENT_DATA_SIZE]u8 = undefined;
             writeExtentData(&extent_buf, first_data_block, @intCast(num_data_blocks));
-            try leaf.addItem(.{ .inode_nr = file_inode, .item_type = EXTENT_DATA, .offset = 0 }, &extent_buf);
+            try items.append(alloc, .{
+                .key = .{ .inode_nr = file_inode, .item_type = EXTENT_DATA, .offset = 0 },
+                .data = try alloc.dupe(u8, &extent_buf),
+            });
         }
+    }
+
+    // Collect files from --populate directories
+    var files_added: u64 = 0;
+    for (populate_dirs.items) |pop_dir_path| {
+        var dir = std.fs.cwd().openDir(pop_dir_path, .{ .iterate = true }) catch |err| {
+            std.debug.print("Error: cannot open --populate directory '{s}': {s}\n", .{ pop_dir_path, @errorName(err) });
+            std.process.exit(1);
+        };
+        defer dir.close();
+
+        var walker = try dir.walk(alloc);
+        defer walker.deinit();
+
+        while (try walker.next()) |entry| {
+            switch (entry.kind) {
+                .directory => {
+                    // Ensure directory exists in fs
+                    _ = try ensureDirectory(&dir_ctx, entry.path);
+                },
+                .file => {
+                    // Read file contents
+                    const data = dir.readFileAlloc(alloc, entry.path, 4 * 1024 * 1024) catch |err| {
+                        std.debug.print("Warning: cannot read '{s}': {s}\n", .{ entry.path, @errorName(err) });
+                        continue;
+                    };
+
+                    // Split into directory and basename
+                    const fdir_path = if (std.mem.lastIndexOfScalar(u8, entry.path, '/')) |slash|
+                        entry.path[0..slash]
+                    else
+                        "";
+                    const basename = if (std.mem.lastIndexOfScalar(u8, entry.path, '/')) |slash|
+                        entry.path[slash + 1 ..]
+                    else
+                        entry.path;
+
+                    if (basename.len == 0 or basename.len > 255) continue;
+
+                    // Ensure parent directory exists
+                    const parent_inode = try ensureDirectory(&dir_ctx, fdir_path);
+
+                    const file_inode = next_inode;
+                    next_inode += 1;
+
+                    // Create inode for the file
+                    var file_inode_buf: [INODE_ITEM_SIZE]u8 = [_]u8{0} ** INODE_ITEM_SIZE;
+                    writeInodeItem(&file_inode_buf, S_IFREG | 0o644, 0, 0, 1, data.len);
+                    try items.append(alloc, .{
+                        .key = .{ .inode_nr = file_inode, .item_type = INODE_ITEM, .offset = 0 },
+                        .data = try alloc.dupe(u8, &file_inode_buf),
+                    });
+
+                    // Create dir entry in parent directory
+                    const name_hash = fnvHash(basename);
+                    var dir_buf: [266]u8 = undefined;
+                    writeU64LE(dir_buf[0..8], file_inode);
+                    dir_buf[8] = DT_REG;
+                    dir_buf[9] = @intCast(basename.len);
+                    @memcpy(dir_buf[10..][0..basename.len], basename);
+                    const dir_entry_size: usize = 10 + basename.len;
+                    try items.append(alloc, .{
+                        .key = .{ .inode_nr = parent_inode, .item_type = DIR_ENTRY, .offset = name_hash },
+                        .data = try alloc.dupe(u8, dir_buf[0..dir_entry_size]),
+                    });
+
+                    // Store file data
+                    const max_inline = BLOCK_SIZE - NODE_HEADER_SIZE - LEAF_ITEM_HEADER_SIZE * 10 - 100;
+                    if (data.len <= max_inline and data.len <= 3800) {
+                        try items.append(alloc, .{
+                            .key = .{ .inode_nr = file_inode, .item_type = EXTENT_DATA, .offset = 0 },
+                            .data = data,
+                        });
+                    } else {
+                        // Allocate data blocks
+                        const num_data_blocks = (data.len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                        const first_data_block = next_free;
+                        var db: u64 = 0;
+                        while (db < num_data_blocks) : (db += 1) {
+                            setBit(bitmap, next_free);
+                            next_free += 1;
+                            allocated += 1;
+                        }
+
+                        // Write data blocks to disk
+                        var offset: usize = 0;
+                        db = 0;
+                        while (db < num_data_blocks) : (db += 1) {
+                            var data_block: [BLOCK_SIZE]u8 = [_]u8{0} ** BLOCK_SIZE;
+                            const remaining = data.len - offset;
+                            const to_copy = @min(remaining, BLOCK_SIZE);
+                            @memcpy(data_block[0..to_copy], data[offset..][0..to_copy]);
+                            try file.seekTo(partition_offset + (first_data_block + db) * BLOCK_SIZE);
+                            try file.writeAll(&data_block);
+                            offset += to_copy;
+                        }
+
+                        // Create extent data reference
+                        var extent_buf: [EXTENT_DATA_SIZE]u8 = undefined;
+                        writeExtentData(&extent_buf, first_data_block, @intCast(num_data_blocks));
+                        try items.append(alloc, .{
+                            .key = .{ .inode_nr = file_inode, .item_type = EXTENT_DATA, .offset = 0 },
+                            .data = try alloc.dupe(u8, &extent_buf),
+                        });
+                    }
+                    files_added += 1;
+                },
+                else => {},
+            }
+        }
+    }
+
+    // Sort all items by key
+    std.mem.sort(SortableItem, items.items, {}, SortableItem.orderLessThan);
+
+    // Debug: dump sorted items
+    std.debug.print("  --- sorted leaf items ---\n", .{});
+    for (items.items, 0..) |item, idx| {
+        const type_name: []const u8 = switch (item.key.item_type) {
+            INODE_ITEM => "INODE",
+            DIR_ENTRY => "DIREN",
+            EXTENT_DATA => "EXTEN",
+            else => "?????",
+        };
+        if (item.key.item_type == DIR_ENTRY and item.data.len >= 10) {
+            const name_len: usize = item.data[9];
+            const name = if (name_len <= item.data.len - 10) item.data[10..][0..name_len] else "???";
+            std.debug.print("  [{d:>2}] inode={d} type={s} off=0x{x:0>16} -> \"{s}\" (target inode {d})\n", .{
+                idx, item.key.inode_nr, type_name, item.key.offset, name,
+                @as(u64, item.data[0]) | (@as(u64, item.data[1]) << 8) | (@as(u64, item.data[2]) << 16) | (@as(u64, item.data[3]) << 24) | (@as(u64, item.data[4]) << 32) | (@as(u64, item.data[5]) << 40) | (@as(u64, item.data[6]) << 48) | (@as(u64, item.data[7]) << 56),
+            });
+        } else {
+            std.debug.print("  [{d:>2}] inode={d} type={s} off=0x{x:0>16} datalen={d}\n", .{
+                idx, item.key.inode_nr, type_name, item.key.offset, item.data.len,
+            });
+        }
+    }
+
+    // Build leaf node from sorted items
+    var leaf = LeafBuilder.init(1); // generation 1
+    for (items.items) |item| {
+        try leaf.addItem(item.key, item.data);
     }
 
     // Finalize and write root leaf
@@ -397,7 +594,71 @@ pub fn main() !void {
     std.debug.print("  data starts at block: {d}\n", .{data_start});
     std.debug.print("  root tree node: block {d}\n", .{root_block});
     std.debug.print("  free blocks: {d}\n", .{free_blocks});
-    std.debug.print("  files added: {d}\n", .{add_entries.items.len});
+    std.debug.print("  leaf items: {d}\n", .{items.items.len});
+    std.debug.print("  files: {d}, dirs: {d}\n", .{
+        add_entries.items.len + files_added,
+        dir_inodes.count() - 1, // -1 for root
+    });
+}
+
+/// Ensure a directory path exists in the filesystem, creating intermediate
+/// directories as needed. Returns the inode number.
+const DirContext = struct {
+    dir_inodes: *std.StringHashMap(u64),
+    items: *std.ArrayList(SortableItem),
+    next_inode: *u64,
+    allocator: std.mem.Allocator,
+};
+
+fn ensureDirectory(ctx: *DirContext, path: []const u8) !u64 {
+    // Empty path = root directory
+    if (path.len == 0) return 1;
+
+    // Already created?
+    if (ctx.dir_inodes.get(path)) |inode| return inode;
+
+    // Ensure parent exists first
+    const parent_path = if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash|
+        path[0..slash]
+    else
+        "";
+    const dirname = if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash|
+        path[slash + 1 ..]
+    else
+        path;
+
+    const parent_inode = try ensureDirectory(ctx, parent_path);
+
+    // Allocate new inode for this directory
+    const dir_inode = ctx.next_inode.*;
+    ctx.next_inode.* += 1;
+
+    // Create inode item
+    var inode_buf: [INODE_ITEM_SIZE]u8 = [_]u8{0} ** INODE_ITEM_SIZE;
+    writeInodeItem(&inode_buf, S_IFDIR | 0o755, 0, 0, 2, 0);
+    try ctx.items.append(ctx.allocator, .{
+        .key = .{ .inode_nr = dir_inode, .item_type = INODE_ITEM, .offset = 0 },
+        .data = try ctx.allocator.dupe(u8, &inode_buf),
+    });
+
+    // Create dir entry in parent
+    const name_hash = fnvHash(dirname);
+    var dir_buf: [266]u8 = undefined;
+    writeU64LE(dir_buf[0..8], dir_inode);
+    dir_buf[8] = DT_DIR;
+    dir_buf[9] = @intCast(dirname.len);
+    @memcpy(dir_buf[10..][0..dirname.len], dirname);
+    const dir_entry_size: usize = 10 + dirname.len;
+    try ctx.items.append(ctx.allocator, .{
+        .key = .{ .inode_nr = parent_inode, .item_type = DIR_ENTRY, .offset = name_hash },
+        .data = try ctx.allocator.dupe(u8, dir_buf[0..dir_entry_size]),
+    });
+
+    // Save the path → inode mapping
+    const saved_path = try ctx.allocator.dupe(u8, path);
+    try ctx.dir_inodes.put(saved_path, dir_inode);
+
+    return dir_inode;
 }
 
 fn setBit(bitmap: []u8, block: u64) void {

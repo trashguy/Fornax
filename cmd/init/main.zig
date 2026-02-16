@@ -1,6 +1,6 @@
-/// Fornax init — PID 1 (well, PID 2 now — ramfs is PID 1).
+/// Fornax init — PID 1.
 ///
-/// Loads fsh from /boot/fsh and respawns it in a loop.
+/// Loads fsh from /bin/fsh and respawns it in a loop.
 const fx = @import("fornax");
 
 /// 4 MB buffer for loading ELF binaries (matches spawn syscall limit).
@@ -9,11 +9,11 @@ var elf_buf: [4 * 1024 * 1024]u8 linksection(".bss") = undefined;
 
 const out = fx.io.Writer.stdout;
 
-/// Load an ELF from /boot/<name> into elf_buf. Returns the slice, or null on failure.
-fn loadBoot(name: []const u8) ?[]const u8 {
-    out.print("init: opening /boot/{s}\n", .{name});
+/// Load an ELF from /bin/<name> into elf_buf. Returns the slice, or null on failure.
+fn loadBin(name: []const u8) ?[]const u8 {
+    out.print("init: opening /bin/{s}\n", .{name});
 
-    var p = fx.path.PathBuf.from("/boot/");
+    var p = fx.path.PathBuf.from("/bin/");
     _ = p.appendRaw(name);
 
     const fd = fx.open(p.slice());
@@ -39,8 +39,8 @@ export fn _start() noreturn {
     out.puts("init: started\n");
 
     while (true) {
-        const elf_data = loadBoot("fsh") orelse {
-            out.puts("init: failed to load /boot/fsh\n");
+        const elf_data = loadBin("fsh") orelse {
+            out.puts("init: failed to load /bin/fsh\n");
             fx.exit(1);
         };
 

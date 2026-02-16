@@ -26,6 +26,7 @@ pub const SYS = enum(u64) {
     spawn = 19,
     pread = 20,
     pwrite = 21,
+    klog = 22,
 };
 
 const ipc = @import("ipc.zig");
@@ -134,6 +135,10 @@ pub fn pread(fd: i32, buf: []u8, offset: u64) isize {
 pub fn pwrite(fd: i32, buf: []const u8, offset: u64) isize {
     const result = syscall4(.pwrite, @bitCast(@as(i64, fd)), @intFromPtr(buf.ptr), buf.len, offset);
     return @bitCast(@as(usize, result));
+}
+
+pub fn klog(buf: []u8, offset: u64) usize {
+    return syscall3(.klog, @intFromPtr(buf.ptr), buf.len, offset);
 }
 
 /// Build a serialized argv block: [argc: u32][total_len: u32][str0\0str1\0...]

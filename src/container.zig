@@ -11,8 +11,7 @@
 ///   2. bind("/container/rootfs", "/", REPLACE)  — new root
 ///   3. mount(console_channel, "/dev/console")  — give it a console
 ///   4. exec("/init")  — run container's init
-const console = @import("console.zig");
-const serial = @import("serial.zig");
+const klog = @import("klog.zig");
 const process = @import("process.zig");
 const namespace = @import("namespace.zig");
 const ipc = @import("ipc.zig");
@@ -76,9 +75,9 @@ pub fn init() void {
         c.rootfs_path_len = 0;
     }
     initialized = true;
-    console.puts("Containers: initialized (max ");
-    console.putDec(MAX_CONTAINERS);
-    console.puts(")\n");
+    klog.info("Containers: initialized (max ");
+    klog.infoDec(MAX_CONTAINERS);
+    klog.info(")\n");
 }
 
 /// Create a new container configuration.
@@ -121,15 +120,15 @@ pub fn start(ct: *Container, init_elf: []const u8, console_channel_id: ?ipc.Chan
     // Mount /dev/console if a channel was provided
     if (console_channel_id) |chan_id| {
         proc.ns.mount("/dev/console", chan_id, .{}) catch {
-            serial.puts("[container] Failed to mount /dev/console\n");
+            klog.err("[container] Failed to mount /dev/console\n");
         };
     }
 
     // Load ELF into process address space
     const load_result = elf.load(proc.pml4.?, init_elf) catch {
-        serial.puts("[container] ELF load failed for '");
-        serial.puts(ct.name[0..ct.name_len]);
-        serial.puts("'\n");
+        klog.err("[container] ELF load failed for '");
+        klog.err(ct.name[0..ct.name_len]);
+        klog.err("'\n");
         proc.state = .dead;
         return null;
     };
@@ -140,7 +139,7 @@ pub fn start(ct: *Container, init_elf: []const u8, console_channel_id: ?ipc.Chan
     // Allocate user stack
     for (0..USER_STACK_PAGES) |i| {
         const page = process.allocPageForProcess(proc) orelse {
-            serial.puts("[container] Stack alloc failed (quota?)\n");
+            klog.err("[container] Stack alloc failed (quota?)\n");
             proc.state = .dead;
             return null;
         };
@@ -149,7 +148,7 @@ pub fn start(ct: *Container, init_elf: []const u8, console_channel_id: ?ipc.Chan
 
         const virt = mem.USER_STACK_TOP - (USER_STACK_PAGES - i) * mem.PAGE_SIZE;
         paging.mapPage(proc.pml4.?, virt, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
-            serial.puts("[container] Stack map failed\n");
+            klog.err("[container] Stack map failed\n");
             proc.state = .dead;
             return null;
         };
@@ -159,13 +158,13 @@ pub fn start(ct: *Container, init_elf: []const u8, console_channel_id: ?ipc.Chan
     ct.init_pid = proc.pid;
     ct.state = .running;
 
-    console.puts("Container '");
-    console.puts(ct.name[0..ct.name_len]);
-    console.puts("' started (pid=");
-    console.putDec(proc.pid);
-    console.puts(", quota=");
-    console.putDec(ct.quotas.max_memory_pages);
-    console.puts(" pages)\n");
+    klog.info("Container '");
+    klog.info(ct.name[0..ct.name_len]);
+    klog.info("' started (pid=");
+    klog.infoDec(proc.pid);
+    klog.info(", quota=");
+    klog.infoDec(ct.quotas.max_memory_pages);
+    klog.info(" pages)\n");
 
     return proc.pid;
 }

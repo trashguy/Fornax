@@ -9,7 +9,7 @@
 ///   RDI, RSI, RDX, R10, R8, R9 = args
 ///   RAX = return value (or -errno on error)
 const cpu = @import("cpu.zig");
-const console = @import("../../console.zig");
+const klog = @import("../../klog.zig");
 
 /// Kernel stack top — set before entering userspace.
 /// Used by the syscall entry asm to switch stacks.
@@ -55,7 +55,7 @@ pub fn init() void {
     // Clear IF (bit 9), DF (bit 10), TF (bit 8)
     cpu.wrmsr(cpu.MSR_SFMASK, (1 << 9) | (1 << 10) | (1 << 8));
 
-    console.puts("SYSCALL: MSRs configured\n");
+    klog.info("SYSCALL: MSRs configured\n");
 }
 
 /// Set the kernel stack for syscall entry.

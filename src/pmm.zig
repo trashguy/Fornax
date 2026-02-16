@@ -1,7 +1,7 @@
 const std = @import("std");
 const uefi = std.os.uefi;
-const console = @import("console.zig");
 const boot = @import("boot.zig");
+const klog = @import("klog.zig");
 
 const page_size = 4096;
 
@@ -88,11 +88,11 @@ pub fn init(memory_map: boot.MemoryMap) PmmError!void {
     initialized = true;
 
     // Print summary
-    console.puts("PMM: ");
-    console.putDec(free_pages);
-    console.puts(" free pages (");
-    console.putDec(free_pages * page_size / (1024 * 1024));
-    console.puts(" MB)\n");
+    klog.info("PMM: ");
+    klog.infoDec(free_pages);
+    klog.info(" free pages (");
+    klog.infoDec(free_pages * page_size / (1024 * 1024));
+    klog.info(" MB)\n");
 }
 
 pub fn allocPage() ?usize {

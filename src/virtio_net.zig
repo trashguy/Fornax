@@ -7,9 +7,8 @@
 /// virtio-net legacy device config (at io_base + 0x14):
 ///   0x14  mac[0..5]     — MAC address (6 bytes)
 ///   0x1A  status         — link status (u16)
-const console = @import("console.zig");
-const serial = @import("serial.zig");
 const pmm = @import("pmm.zig");
+const klog = @import("klog.zig");
 const virtio = @import("virtio.zig");
 
 const pci = switch (@import("builtin").cpu.arch) {
@@ -69,19 +68,19 @@ pub fn init() bool {
 
     // Find virtio-net PCI device
     const pci_dev = pci.findVirtioNet() orelse {
-        serial.puts("virtio-net: no device found\n");
+        klog.debug("virtio-net: no device found\n");
         return false;
     };
 
-    serial.puts("virtio-net: found at PCI slot ");
-    serial.putDec(pci_dev.slot);
-    serial.puts(", io_base=");
-    serial.putHex(pci_dev.ioBase() orelse 0);
-    serial.puts("\n");
+    klog.debug("virtio-net: found at PCI slot ");
+    klog.debugDec(pci_dev.slot);
+    klog.debug(", io_base=");
+    klog.debugHex(pci_dev.ioBase() orelse 0);
+    klog.debug("\n");
 
     // Initialize virtio device
     var dev = virtio.initDevice(pci_dev) orelse {
-        serial.puts("virtio-net: device init failed\n");
+        klog.err("virtio-net: device init failed\n");
         return false;
     };
 
@@ -91,9 +90,9 @@ pub fn init() bool {
         net_dev.mac[i] = cpu.inb(io_base + 0x14 + @as(u16, @intCast(i)));
     }
 
-    console.puts("virtio-net: MAC ");
+    klog.info("virtio-net: MAC ");
     printMac(net_dev.mac);
-    console.puts("\n");
+    klog.info("\n");
 
     // Negotiate features — we want MAC and basic packet support
     // Don't request MRG_RXBUF to keep things simple
@@ -102,14 +101,14 @@ pub fn init() bool {
     // Set up receive queue
     net_dev.rx_queue = virtio.setupQueue(&dev, RX_QUEUE);
     if (net_dev.rx_queue == null) {
-        serial.puts("virtio-net: failed to setup RX queue\n");
+        klog.err("virtio-net: failed to setup RX queue\n");
         return false;
     }
 
     // Set up transmit queue
     net_dev.tx_queue = virtio.setupQueue(&dev, TX_QUEUE);
     if (net_dev.tx_queue == null) {
-        serial.puts("virtio-net: failed to setup TX queue\n");
+        klog.err("virtio-net: failed to setup TX queue\n");
         return false;
     }
 
@@ -119,7 +118,7 @@ pub fn init() bool {
     net_dev.dev = dev;
     net_dev.initialized = true;
 
-    console.puts("virtio-net: initialized (RX/TX queues ready)\n");
+    klog.info("virtio-net: initialized (RX/TX queues ready)\n");
     return true;
 }
 
@@ -141,9 +140,9 @@ fn postRxBuffers() void {
     // Notify device that buffers are available
     virtio.notify(rx);
 
-    serial.puts("virtio-net: posted ");
-    serial.putDec(RX_BUFFERS);
-    serial.puts(" RX buffers\n");
+    klog.debug("virtio-net: posted ");
+    klog.debugDec(RX_BUFFERS);
+    klog.debug(" RX buffers\n");
 }
 
 /// Send a raw Ethernet frame.
@@ -208,9 +207,16 @@ pub fn isInitialized() bool {
 
 fn printMac(mac: [6]u8) void {
     const hex = "0123456789ABCDEF";
+    var buf: [17]u8 = undefined; // "XX:XX:XX:XX:XX:XX"
+    var pos: usize = 0;
     for (mac, 0..) |byte, i| {
-        if (i > 0) console.putChar(':');
-        console.putChar(hex[byte >> 4]);
-        console.putChar(hex[byte & 0x0F]);
+        if (i > 0) {
+            buf[pos] = ':';
+            pos += 1;
+        }
+        buf[pos] = hex[byte >> 4];
+        buf[pos + 1] = hex[byte & 0x0F];
+        pos += 2;
     }
+    klog.info(buf[0..pos]);
 }

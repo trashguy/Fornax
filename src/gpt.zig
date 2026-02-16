@@ -3,8 +3,7 @@
 /// Reads GPT header + partition entries from the virtio-blk device.
 /// Used by main.zig to set partition offsets for fxfs and to provide
 /// partition info for partfs.
-const serial = @import("serial.zig");
-const console = @import("console.zig");
+const klog = @import("klog.zig");
 const virtio_blk = @import("virtio_blk.zig");
 
 pub const MAX_PARTITIONS = 8;
@@ -41,21 +40,21 @@ pub fn init() bool {
     // Read block 0: contains protective MBR (LBA 0) + GPT header (LBA 1)
     var block0: [BLOCK_SIZE]u8 = undefined;
     if (!virtio_blk.readBlock(0, &block0)) {
-        serial.puts("gpt: failed to read block 0\n");
+        klog.debug("gpt: failed to read block 0\n");
         return false;
     }
 
     // Validate MBR signature at bytes 510-511
     if (block0[510] != 0x55 or block0[511] != 0xAA) {
-        serial.puts("gpt: no MBR signature\n");
+        klog.debug("gpt: no MBR signature\n");
         return false;
     }
 
     // Check protective MBR partition type at byte 450 (first partition entry type)
     if (block0[450] != 0xEE) {
-        serial.puts("gpt: not a protective MBR (type=0x");
-        serial.putHex(block0[450]);
-        serial.puts(")\n");
+        klog.debug("gpt: not a protective MBR (type=0x");
+        klog.debugHex(block0[450]);
+        klog.debug(")\n");
         return false;
     }
 
@@ -64,7 +63,7 @@ pub fn init() bool {
 
     // Validate GPT signature
     if (!eql(hdr[0..8], GPT_SIGNATURE)) {
-        serial.puts("gpt: bad GPT signature\n");
+        klog.debug("gpt: bad GPT signature\n");
         return false;
     }
 
@@ -73,16 +72,16 @@ pub fn init() bool {
     const num_partition_entries = readU32LE(hdr[80..84]);
     const entry_size = readU32LE(hdr[84..88]);
 
-    serial.puts("gpt: ");
-    serial.putDec(num_partition_entries);
-    serial.puts(" partition entries at LBA ");
-    serial.putDec(partition_entry_lba);
-    serial.puts(", entry size ");
-    serial.putDec(entry_size);
-    serial.puts("\n");
+    klog.debug("gpt: ");
+    klog.debugDec(num_partition_entries);
+    klog.debug(" partition entries at LBA ");
+    klog.debugDec(partition_entry_lba);
+    klog.debug(", entry size ");
+    klog.debugDec(entry_size);
+    klog.debug("\n");
 
     if (entry_size < GPT_ENTRY_SIZE or entry_size > 512) {
-        serial.puts("gpt: unsupported entry size\n");
+        klog.debug("gpt: unsupported entry size\n");
         return false;
     }
 
@@ -100,7 +99,7 @@ pub fn init() bool {
     while (block_nr <= last_entry_block and block_nr < 8) : (block_nr += 1) {
         var block_buf: [BLOCK_SIZE]u8 = undefined;
         if (!virtio_blk.readBlock(block_nr, &block_buf)) {
-            serial.puts("gpt: failed to read entry block\n");
+            klog.debug("gpt: failed to read entry block\n");
             break;
         }
 
@@ -150,15 +149,15 @@ pub fn init() bool {
             partitions[partition_count] = part;
             partition_count += 1;
 
-            serial.puts("gpt: partition ");
-            serial.putDec(partition_count);
-            serial.puts(": LBA ");
-            serial.putDec(part.first_lba);
-            serial.puts("-");
-            serial.putDec(part.last_lba);
-            serial.puts(" \"");
-            for (part.name[0..part.name_len]) |ch| serial.putChar(ch);
-            serial.puts("\"\n");
+            klog.debug("gpt: partition ");
+            klog.debugDec(partition_count);
+            klog.debug(": LBA ");
+            klog.debugDec(part.first_lba);
+            klog.debug("-");
+            klog.debugDec(part.last_lba);
+            klog.debug(" \"");
+            klog.debug(part.name[0..part.name_len]);
+            klog.debug("\"\n");
         }
     }
 

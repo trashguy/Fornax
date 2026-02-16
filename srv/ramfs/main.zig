@@ -464,11 +464,7 @@ fn handleRemove(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
 }
 
 export fn _start() noreturn {
-    _ = fx.write(1, "ramfs: starting\n");
-
     initNodes();
-
-    _ = fx.write(1, "ramfs: ready\n");
 
     // Server loop: receive messages on fd 3, dispatch, reply
 

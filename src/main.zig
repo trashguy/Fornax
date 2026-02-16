@@ -18,6 +18,7 @@ const elf = @import("elf.zig");
 const mem = @import("mem.zig");
 const namespace = @import("namespace.zig");
 const panic_handler = @import("panic.zig");
+const klog = @import("klog.zig");
 
 const paging = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/paging.zig"),
@@ -66,11 +67,12 @@ pub fn main() noreturn {
 
     // Now we have a framebuffer — switch to graphical console
     console.init(boot_info.framebuffer);
-    console.puts("Fornax booting...\n");
+    klog.console_level = .info;
+    klog.info("Fornax booting...\n");
 
     // Phase 3: Physical memory manager
     pmm.init(boot_info.memory_map) catch {
-        console.puts("PMM init failed!\n");
+        klog.err("PMM init failed!\n");
         halt();
     };
 
@@ -79,7 +81,7 @@ pub fn main() noreturn {
 
     // Phase 4/5: Architecture-specific init (GDT/IDT/paging)
     arch.init();
-    console.puts("Architecture init complete.\n");
+    klog.info("Architecture init complete.\n");
 
     // Phase 23: PIC initialization (remap IRQs before any device init)
     const pic_mod = @import("pic.zig");
@@ -111,24 +113,24 @@ pub fn main() noreturn {
         const pci_mod = @import("arch/x86_64/pci.zig");
         pci_mod.enumerate();
         if (virtio_net.init()) {
-            console.puts("Network ready.\n");
+            klog.info("Network ready.\n");
         }
 
         // Phase 300: Virtio-blk
         if (virtio_blk.init()) {
-            console.puts("Block device ready.\n");
+            klog.info("Block device ready.\n");
 
             // Phase 305: GPT partition table
             const gpt = @import("gpt.zig");
             if (gpt.init()) {
-                console.puts("GPT partition table loaded.\n");
+                klog.info("GPT partition table loaded.\n");
             }
         }
 
         // Phase 23: Virtio-input (keyboard)
         const virtio_input = @import("virtio_input.zig");
         if (!virtio_input.init()) {
-            console.puts("No keyboard device found.\n");
+            klog.info("No keyboard device found.\n");
         }
     }
 
@@ -142,91 +144,17 @@ pub fn main() noreturn {
     // Phase 20: Initrd
     _ = initrd.init(boot_info.initrd_base, boot_info.initrd_size);
 
-    // Phase 21: Mount initrd files at /boot/ and spawn init
+    // Phase 21: Mount initrd files at /boot/ and spawn servers
     initrd.mountFiles();
-    spawnRamfs();
     spawnPartfs();
     spawnFxfs();
     spawnInit();
 
-    console.puts("Kernel initialized.\n");
+    klog.info("Kernel initialized.\n");
+    klog.console_level = .warn;
 
     // Start the scheduler — runs init (PID 1) if spawned, else halts.
     process.scheduleNext();
-}
-
-/// Spawn ramfs server from the initrd. Creates a channel mounted at "/" in the
-/// root namespace. Ramfs serves the root filesystem via IPC.
-fn spawnRamfs() void {
-    const ramfs_elf = initrd.findFile("ramfs") orelse {
-        console.puts("No ramfs in initrd — running without root filesystem.\n");
-        return;
-    };
-
-    const proc = process.create() orelse {
-        console.puts("Failed to create ramfs process!\n");
-        return;
-    };
-
-    // Load ELF into ramfs's address space
-    const load_result = elf.load(proc.pml4.?, ramfs_elf) catch {
-        console.puts("Failed to load ramfs ELF!\n");
-        proc.state = .dead;
-        return;
-    };
-
-    proc.user_rip = load_result.entry_point;
-    proc.brk = load_result.brk;
-
-    // Allocate user stack
-    for (0..process.USER_STACK_PAGES) |i| {
-        const page = pmm.allocPage() orelse {
-            console.puts("Failed to allocate ramfs stack!\n");
-            proc.state = .dead;
-            return;
-        };
-        const ptr: [*]u8 = paging.physPtr(page);
-        @memset(ptr[0..mem.PAGE_SIZE], 0);
-        const vaddr = mem.USER_STACK_TOP - (process.USER_STACK_PAGES - i) * mem.PAGE_SIZE;
-        paging.mapPage(proc.pml4.?, vaddr, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
-            console.puts("Failed to map ramfs stack!\n");
-            proc.state = .dead;
-            return;
-        };
-    }
-    proc.user_rsp = mem.USER_STACK_INIT;
-
-    // Create IPC channel for ramfs
-    const chan = ipc.channelCreate() catch {
-        console.puts("Failed to create ramfs channel!\n");
-        proc.state = .dead;
-        return;
-    };
-
-    // Server end as fd 3
-    proc.setFd(3, chan.server, true);
-
-    // Mount client end at "/" in the root namespace
-    const root_ns = namespace.getRootNamespace();
-    root_ns.mount("/", chan.client, .{ .replace = true }) catch {
-        console.puts("Failed to mount ramfs at /!\n");
-        proc.state = .dead;
-        return;
-    };
-
-    // Ramfs has no parent (kernel-spawned)
-    proc.parent_pid = null;
-    root_ns.cloneInto(&proc.ns);
-
-    serial.puts("[ramfs: pid=");
-    serial.putDec(proc.pid);
-    serial.puts(" entry=0x");
-    serial.putHex(load_result.entry_point);
-    serial.puts("]\n");
-
-    console.puts("Spawned ramfs (PID ");
-    console.putDec(proc.pid);
-    console.puts(")\n");
 }
 
 fn spawnPartfs() void {
@@ -234,17 +162,17 @@ fn spawnPartfs() void {
     if (!virtio_blk.isInitialized()) return;
 
     const partfs_elf = initrd.findFile("partfs") orelse {
-        serial.puts("No partfs in initrd — running without /dev/.\n");
+        klog.warn("No partfs in initrd — running without /dev/.\n");
         return;
     };
 
     const proc = process.create() orelse {
-        console.puts("Failed to create partfs process!\n");
+        klog.err("Failed to create partfs process!\n");
         return;
     };
 
     const load_result = elf.load(proc.pml4.?, partfs_elf) catch {
-        console.puts("Failed to load partfs ELF!\n");
+        klog.err("Failed to load partfs ELF!\n");
         proc.state = .dead;
         return;
     };
@@ -255,7 +183,7 @@ fn spawnPartfs() void {
     // Allocate user stack
     for (0..process.USER_STACK_PAGES) |i| {
         const page = pmm.allocPage() orelse {
-            console.puts("Failed to allocate partfs stack!\n");
+            klog.err("Failed to allocate partfs stack!\n");
             proc.state = .dead;
             return;
         };
@@ -263,7 +191,7 @@ fn spawnPartfs() void {
         @memset(ptr[0..mem.PAGE_SIZE], 0);
         const vaddr = mem.USER_STACK_TOP - (process.USER_STACK_PAGES - i) * mem.PAGE_SIZE;
         paging.mapPage(proc.pml4.?, vaddr, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
-            console.puts("Failed to map partfs stack!\n");
+            klog.err("Failed to map partfs stack!\n");
             proc.state = .dead;
             return;
         };
@@ -272,7 +200,7 @@ fn spawnPartfs() void {
 
     // Create IPC channel for partfs
     const chan = ipc.channelCreate() catch {
-        console.puts("Failed to create partfs channel!\n");
+        klog.err("Failed to create partfs channel!\n");
         proc.state = .dead;
         return;
     };
@@ -292,7 +220,7 @@ fn spawnPartfs() void {
     // Mount client end at "/dev/" in root namespace
     const root_ns = namespace.getRootNamespace();
     root_ns.mount("/dev/", chan.client, .{ .replace = true }) catch {
-        console.puts("Failed to mount partfs at /dev/!\n");
+        klog.err("Failed to mount partfs at /dev/!\n");
         proc.state = .dead;
         return;
     };
@@ -300,15 +228,15 @@ fn spawnPartfs() void {
     proc.parent_pid = null;
     root_ns.cloneInto(&proc.ns);
 
-    serial.puts("[partfs: pid=");
-    serial.putDec(proc.pid);
-    serial.puts(" entry=0x");
-    serial.putHex(load_result.entry_point);
-    serial.puts("]\n");
+    klog.debug("[partfs: pid=");
+    klog.debugDec(proc.pid);
+    klog.debug(" entry=");
+    klog.debugHex(load_result.entry_point);
+    klog.debug("]\n");
 
-    console.puts("Spawned partfs (PID ");
-    console.putDec(proc.pid);
-    console.puts(")\n");
+    klog.info("Spawned partfs (PID ");
+    klog.infoDec(proc.pid);
+    klog.info(")\n");
 }
 
 fn spawnFxfs() void {
@@ -316,17 +244,17 @@ fn spawnFxfs() void {
     if (!virtio_blk.isInitialized()) return;
 
     const fxfs_elf = initrd.findFile("fxfs") orelse {
-        serial.puts("No fxfs in initrd — running without persistent filesystem.\n");
+        klog.warn("No fxfs in initrd — running without persistent filesystem.\n");
         return;
     };
 
     const proc = process.create() orelse {
-        console.puts("Failed to create fxfs process!\n");
+        klog.err("Failed to create fxfs process!\n");
         return;
     };
 
     const load_result = elf.load(proc.pml4.?, fxfs_elf) catch {
-        console.puts("Failed to load fxfs ELF!\n");
+        klog.err("Failed to load fxfs ELF!\n");
         proc.state = .dead;
         return;
     };
@@ -337,7 +265,7 @@ fn spawnFxfs() void {
     // Allocate user stack
     for (0..process.USER_STACK_PAGES) |i| {
         const page = pmm.allocPage() orelse {
-            console.puts("Failed to allocate fxfs stack!\n");
+            klog.err("Failed to allocate fxfs stack!\n");
             proc.state = .dead;
             return;
         };
@@ -345,7 +273,7 @@ fn spawnFxfs() void {
         @memset(ptr[0..mem.PAGE_SIZE], 0);
         const vaddr = mem.USER_STACK_TOP - (process.USER_STACK_PAGES - i) * mem.PAGE_SIZE;
         paging.mapPage(proc.pml4.?, vaddr, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
-            console.puts("Failed to map fxfs stack!\n");
+            klog.err("Failed to map fxfs stack!\n");
             proc.state = .dead;
             return;
         };
@@ -354,7 +282,7 @@ fn spawnFxfs() void {
 
     // Create IPC channel for fxfs
     const chan = ipc.channelCreate() catch {
-        console.puts("Failed to create fxfs channel!\n");
+        klog.err("Failed to create fxfs channel!\n");
         proc.state = .dead;
         return;
     };
@@ -375,9 +303,9 @@ fn spawnFxfs() void {
             .blk_offset = part.first_lba * 512,
             .blk_size = (part.last_lba - part.first_lba + 1) * 512,
         };
-        serial.puts("[fxfs: using partition 1 at LBA ");
-        serial.putDec(part.first_lba);
-        serial.puts("]\n");
+        klog.debug("[fxfs: using partition 1 at LBA ");
+        klog.debugDec(part.first_lba);
+        klog.debug("]\n");
     } else {
         // Fallback: whole disk (backward compatible with unpartitioned disks)
         proc.fds[4] = .{
@@ -389,10 +317,10 @@ fn spawnFxfs() void {
         };
     }
 
-    // Mount client end at "/disk/" in root namespace
+    // Mount client end at "/" in root namespace (root filesystem)
     const root_ns = namespace.getRootNamespace();
-    root_ns.mount("/disk/", chan.client, .{ .replace = true }) catch {
-        console.puts("Failed to mount fxfs at /disk/!\n");
+    root_ns.mount("/", chan.client, .{ .replace = true }) catch {
+        klog.err("Failed to mount fxfs at /!\n");
         proc.state = .dead;
         return;
     };
@@ -400,33 +328,33 @@ fn spawnFxfs() void {
     proc.parent_pid = null;
     root_ns.cloneInto(&proc.ns);
 
-    serial.puts("[fxfs: pid=");
-    serial.putDec(proc.pid);
-    serial.puts(" entry=0x");
-    serial.putHex(load_result.entry_point);
-    serial.puts("]\n");
+    klog.debug("[fxfs: pid=");
+    klog.debugDec(proc.pid);
+    klog.debug(" entry=");
+    klog.debugHex(load_result.entry_point);
+    klog.debug("]\n");
 
-    console.puts("Spawned fxfs (PID ");
-    console.putDec(proc.pid);
-    console.puts(")\n");
+    klog.info("Spawned fxfs (PID ");
+    klog.infoDec(proc.pid);
+    klog.info(")\n");
 }
 
 /// Spawn init (PID 1) from the initrd. Init inherits the root namespace
 /// with /boot/ mounts, so it can open("/boot/<program>") + read + spawn.
 fn spawnInit() void {
     const init_elf = initrd.findFile("init") orelse {
-        console.puts("No init in initrd — running without userspace.\n");
+        klog.warn("No init in initrd — running without userspace.\n");
         return;
     };
 
     const proc = process.create() orelse {
-        console.puts("Failed to create init process!\n");
+        klog.err("Failed to create init process!\n");
         return;
     };
 
     // Load ELF into init's address space
     const load_result = elf.load(proc.pml4.?, init_elf) catch {
-        console.puts("Failed to load init ELF!\n");
+        klog.err("Failed to load init ELF!\n");
         proc.state = .dead;
         return;
     };
@@ -437,7 +365,7 @@ fn spawnInit() void {
     // Allocate user stack
     for (0..process.USER_STACK_PAGES) |i| {
         const page = pmm.allocPage() orelse {
-            console.puts("Failed to allocate init stack!\n");
+            klog.err("Failed to allocate init stack!\n");
             proc.state = .dead;
             return;
         };
@@ -445,7 +373,7 @@ fn spawnInit() void {
         @memset(ptr[0..mem.PAGE_SIZE], 0);
         const vaddr = mem.USER_STACK_TOP - (process.USER_STACK_PAGES - i) * mem.PAGE_SIZE;
         paging.mapPage(proc.pml4.?, vaddr, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
-            console.puts("Failed to map init stack!\n");
+            klog.err("Failed to map init stack!\n");
             proc.state = .dead;
             return;
         };
@@ -458,15 +386,15 @@ fn spawnInit() void {
     // Init inherits root namespace (already has /boot/ mounts)
     namespace.getRootNamespace().cloneInto(&proc.ns);
 
-    serial.puts("[init: pid=");
-    serial.putDec(proc.pid);
-    serial.puts(" entry=0x");
-    serial.putHex(load_result.entry_point);
-    serial.puts("]\n");
+    klog.debug("[init: pid=");
+    klog.debugDec(proc.pid);
+    klog.debug(" entry=");
+    klog.debugHex(load_result.entry_point);
+    klog.debug("]\n");
 
-    console.puts("Spawned init (PID ");
-    console.putDec(proc.pid);
-    console.puts(")\n");
+    klog.info("Spawned init (PID ");
+    klog.infoDec(proc.pid);
+    klog.info(")\n");
 }
 
 fn halt() noreturn {

@@ -2,8 +2,7 @@
 ///
 /// Ties together ethernet, ARP, IPv4, ICMP, and UDP with the virtio-net driver.
 /// Provides a poll loop and high-level send/receive operations.
-const console = @import("console.zig");
-const serial = @import("serial.zig");
+const klog = @import("klog.zig");
 const virtio_net = @import("virtio_net.zig");
 
 pub const ethernet = @import("net/ethernet.zig");
@@ -23,17 +22,17 @@ var initialized: bool = false;
 
 pub fn init() void {
     if (!virtio_net.isInitialized()) {
-        serial.puts("net: no NIC, skipping init\n");
+        klog.debug("net: no NIC, skipping init\n");
         return;
     }
 
     our_mac = virtio_net.getMac();
 
-    console.puts("net: IP ");
-    printIpConsole(our_ip);
-    console.puts(" gateway ");
-    printIpConsole(gateway_ip);
-    console.puts("\n");
+    klog.info("net: IP ");
+    printIpInfo(our_ip);
+    klog.info(" gateway ");
+    printIpInfo(gateway_ip);
+    klog.info("\n");
 
     tcp.init();
     dns.init();
@@ -126,9 +125,9 @@ fn handleIpv4(payload: []const u8) void {
         ipv4.PROTO_TCP => tcp.handlePacket(ip_pkt.payload, ip_pkt.header),
         ipv4.PROTO_UDP => udp.handlePacket(ip_pkt.payload, ip_pkt.header),
         else => {
-            serial.puts("ipv4: unknown protocol ");
-            serial.putDec(ip_pkt.header.protocol);
-            serial.puts("\n");
+            klog.debug("ipv4: unknown protocol ");
+            klog.debugDec(ip_pkt.header.protocol);
+            klog.debug("\n");
         },
     }
 }
@@ -153,9 +152,9 @@ pub fn sendIpPacket(dst_ip: [4]u8, ip_packet: []const u8) void {
         var arp_buf: [ethernet.HEADER_SIZE + 64]u8 = undefined;
         const arp_len = arp.buildRequest(&arp_buf, our_mac, our_ip, next_hop) orelse return;
         _ = virtio_net.send(arp_buf[0..arp_len]);
-        serial.puts("net: ARP miss for ");
-        printIpSerial(next_hop);
-        serial.puts(", packet dropped\n");
+        klog.debug("net: ARP miss for ");
+        printIpDebug(next_hop);
+        klog.debug(", packet dropped\n");
         return;
     };
 
@@ -179,22 +178,27 @@ fn sameSubnet(a: [4]u8, b: [4]u8, mask: [4]u8) bool {
         (a[3] & mask[3]) == (b[3] & mask[3]);
 }
 
-fn printIpConsole(ip: [4]u8) void {
-    console.putDec(ip[0]);
-    console.putChar('.');
-    console.putDec(ip[1]);
-    console.putChar('.');
-    console.putDec(ip[2]);
-    console.putChar('.');
-    console.putDec(ip[3]);
+fn printIpInfo(ip: [4]u8) void {
+    klog.infoDec(ip[0]);
+    klog.info(".");
+    klog.infoDec(ip[1]);
+    klog.info(".");
+    klog.infoDec(ip[2]);
+    klog.info(".");
+    klog.infoDec(ip[3]);
 }
 
+pub fn printIpDebug(ip: [4]u8) void {
+    klog.debugDec(ip[0]);
+    klog.debug(".");
+    klog.debugDec(ip[1]);
+    klog.debug(".");
+    klog.debugDec(ip[2]);
+    klog.debug(".");
+    klog.debugDec(ip[3]);
+}
+
+/// Kept for backward compatibility — calls printIpDebug.
 pub fn printIpSerial(ip: [4]u8) void {
-    serial.putDec(ip[0]);
-    serial.putChar('.');
-    serial.putDec(ip[1]);
-    serial.putChar('.');
-    serial.putDec(ip[2]);
-    serial.putChar('.');
-    serial.putDec(ip[3]);
+    printIpDebug(ip);
 }
