@@ -99,5 +99,4 @@ exec qemu-system-x86_64 \
     -device virtio-keyboard-pci \
     -drive file="$DISK_IMG",format=raw,if=none,id=blk0 \
     -device virtio-blk-pci,drive=blk0 \
-    -no-reboot \
-    -no-shutdown
+    "$@"

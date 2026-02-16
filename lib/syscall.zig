@@ -30,6 +30,7 @@ pub const SYS = enum(u64) {
     klog = 22,
     sysinfo = 23,
     sleep = 24,
+    shutdown = 25,
 };
 
 const ipc = @import("ipc.zig");
@@ -163,6 +164,16 @@ pub fn sysinfo() ?SysInfo {
 
 pub fn sleep(ms: u64) void {
     _ = syscall1(.sleep, ms);
+}
+
+pub fn shutdown() noreturn {
+    _ = syscall1(.shutdown, 0);
+    unreachable;
+}
+
+pub fn reboot() noreturn {
+    _ = syscall1(.shutdown, 1);
+    unreachable;
 }
 
 /// Build a serialized argv block: [argc: u32][total_len: u32][str0\0str1\0...]

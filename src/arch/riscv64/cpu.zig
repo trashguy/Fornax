@@ -163,3 +163,29 @@ pub inline fn rdtime() u64 {
         : [ret] "=r" (-> u64),
     );
 }
+
+/// SBI SRST shutdown (reset_type=0, reason=0).
+pub fn acpiShutdown() noreturn {
+    asm volatile ("ecall"
+        :
+        : [a7] "{a7}" (@as(u64, 0x53525354)), // SBI extension: SRST
+          [a6] "{a6}" (@as(u64, 0)), // function: system_reset
+          [a0] "{a0}" (@as(u64, 0)), // reset_type: shutdown
+          [a1] "{a1}" (@as(u64, 0)), // reason: no reason
+        : .{ .memory = true }
+    );
+    halt();
+}
+
+/// SBI SRST reboot (reset_type=1, reason=0).
+pub fn resetSystem() noreturn {
+    asm volatile ("ecall"
+        :
+        : [a7] "{a7}" (@as(u64, 0x53525354)), // SBI extension: SRST
+          [a6] "{a6}" (@as(u64, 0)), // function: system_reset
+          [a0] "{a0}" (@as(u64, 1)), // reset_type: warm reboot
+          [a1] "{a1}" (@as(u64, 0)), // reason: no reason
+        : .{ .memory = true }
+    );
+    halt();
+}

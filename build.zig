@@ -310,6 +310,32 @@ pub fn build(b: *std.Build) void {
     });
     free_bin.image_base = user_image_base;
 
+    const shutdown_bin = b.addExecutable(.{
+        .name = "shutdown",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/shutdown/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    shutdown_bin.image_base = user_image_base;
+
+    const reboot_bin = b.addExecutable(.{
+        .name = "reboot",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/reboot/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    reboot_bin.image_base = user_image_base;
+
     const fxfs_bin = b.addExecutable(.{
         .name = "fxfs",
         .root_module = b.createModule(.{
@@ -379,7 +405,7 @@ pub fn build(b: *std.Build) void {
         fsh_bin,  echo_bin,    cat_bin,  ls_bin,
         rm_bin,   mkdir_bin,   wc_bin,   lsblk_bin,
         df_bin,   dmesg_bin,   head_bin, tail_bin, tree_bin, free_bin, ping_bin, hello_bin,
-        tcptest_bin, dnstest_bin,
+        tcptest_bin, dnstest_bin, shutdown_bin, reboot_bin,
     };
     for (disk_programs) |prog| {
         const install = b.addInstallArtifact(prog, .{
@@ -470,6 +496,8 @@ pub fn build(b: *std.Build) void {
         .{ "ping", "cmd/ping/main.zig" },
         .{ "tcptest", "cmd/tcptest/main.zig" },
         .{ "dnstest", "cmd/dnstest/main.zig" },
+        .{ "shutdown", "cmd/shutdown/main.zig" },
+        .{ "reboot", "cmd/reboot/main.zig" },
         .{ "fxfs", "srv/fxfs/main.zig" },
         .{ "partfs", "srv/partfs/main.zig" },
     };

@@ -71,5 +71,4 @@ exec qemu-system-riscv64 \
     -device virtio-blk-pci,drive=blk0 \
     -netdev user,id=n0 \
     -device virtio-net-pci,netdev=n0 \
-    -no-reboot \
-    -no-shutdown
+    "$@"

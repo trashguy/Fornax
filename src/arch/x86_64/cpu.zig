@@ -98,6 +98,18 @@ pub inline fn spinHint() void {
     asm volatile ("pause");
 }
 
+/// ACPI shutdown: write S5 sleep type to QEMU PM1a control port.
+pub fn acpiShutdown() noreturn {
+    outw(0x604, 0x2000);
+    halt();
+}
+
+/// System reset via keyboard controller CPU reset command.
+pub fn resetSystem() noreturn {
+    outb(0x64, 0xFE);
+    halt();
+}
+
 // MSR numbers
 pub const MSR_EFER = 0xC0000080;
 pub const MSR_STAR = 0xC0000081;

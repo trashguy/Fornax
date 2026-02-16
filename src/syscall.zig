@@ -43,6 +43,7 @@ pub const SYS = enum(u64) {
     klog = 22,
     sysinfo = 23,
     sleep = 24,
+    shutdown = 25,
 };
 
 /// Error return values.
@@ -131,6 +132,7 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         .klog => sysKlog(arg0, arg1, arg2),
         .sysinfo => sysSysinfo(arg0),
         .sleep => sysSleep(arg0),
+        .shutdown => sysShutdown(arg0),
         .mount, .bind, .unmount, .rfork => {
             klog.warn("syscall: unimplemented nr=");
             klog.warnDec(nr);
@@ -807,6 +809,21 @@ fn sysSleep(ms: u64) u64 {
     proc.pending_op = .sleep;
     proc.state = .blocked;
     process.scheduleNext();
+}
+
+fn sysShutdown(flags: u64) noreturn {
+    const cpu = switch (@import("builtin").cpu.arch) {
+        .x86_64 => @import("arch/x86_64/cpu.zig"),
+        .riscv64 => @import("arch/riscv64/cpu.zig"),
+        else => @compileError("unsupported arch for shutdown"),
+    };
+    if (flags == 1) {
+        klog.warn("syscall: reboot requested\n");
+        cpu.resetSystem();
+    } else {
+        klog.warn("syscall: shutdown requested\n");
+        cpu.acpiShutdown();
+    }
 }
 
 /// close(fd) → 0 or error

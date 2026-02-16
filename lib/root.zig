@@ -39,6 +39,8 @@ pub const klog = syscall.klog;
 pub const SysInfo = syscall.SysInfo;
 pub const sysinfo = syscall.sysinfo;
 pub const sleep = syscall.sleep;
+pub const shutdown = syscall.shutdown;
+pub const reboot = syscall.reboot;
 
 // Re-export IPC types at top level.
 pub const IpcMessage = ipc.IpcMessage;
