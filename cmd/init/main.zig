@@ -41,6 +41,10 @@ export fn _start() noreturn {
     // Ensure standard directories exist
     _ = fx.mkdir("/var");
     _ = fx.mkdir("/var/log");
+    _ = fx.mkdir("/dev");
+    _ = fx.mkdir("/proc");
+    _ = fx.mkdir("/net");
+    _ = fx.mkdir("/tmp");
 
     while (true) {
         const elf_data = loadBin("fsh") orelse {
