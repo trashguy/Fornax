@@ -45,7 +45,38 @@ pub fn handleCtl(cmd: []const u8) void {
         echo_on = true;
     } else if (eql(cmd, "echo off")) {
         echo_on = false;
+    } else if (eql(cmd, "size")) {
+        // Return "cols rows\n" via ring buffer
+        var buf: [24]u8 = undefined;
+        var len: usize = 0;
+        len += formatDecInto(buf[len..], console.getCols());
+        buf[len] = ' ';
+        len += 1;
+        len += formatDecInto(buf[len..], console.getRows());
+        buf[len] = '\n';
+        len += 1;
+        for (buf[0..len]) |c| pushToRing(c);
+        wakeWaiter();
     }
+}
+
+fn formatDecInto(buf: []u8, val: u32) usize {
+    if (val == 0) {
+        if (buf.len > 0) buf[0] = '0';
+        return 1;
+    }
+    var tmp: [12]u8 = undefined;
+    var n = val;
+    var i: usize = 0;
+    while (n > 0) : (i += 1) {
+        tmp[i] = @intCast(n % 10 + '0');
+        n /= 10;
+    }
+    var j: usize = 0;
+    while (j < i and j < buf.len) : (j += 1) {
+        buf[j] = tmp[i - 1 - j];
+    }
+    return i;
 }
 
 /// Handle an evdev key event from the virtio-input driver.

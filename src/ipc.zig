@@ -25,6 +25,8 @@ pub const Tag = enum(u32) {
     t_ctl = 6,
     t_create = 7,
     t_remove = 8,
+    t_rename = 9,
+    t_truncate = 10,
     r_ok = 128,
     r_error = 129,
 };

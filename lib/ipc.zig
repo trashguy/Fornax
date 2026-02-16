@@ -36,6 +36,8 @@ pub const T_STAT: u32 = 5;
 pub const T_CTL: u32 = 6;
 pub const T_CREATE: u32 = 7;
 pub const T_REMOVE: u32 = 8;
+pub const T_RENAME: u32 = 9;
+pub const T_TRUNCATE: u32 = 10;
 pub const R_OK: u32 = 128;
 pub const R_ERROR: u32 = 129;
 
@@ -50,7 +52,9 @@ pub const DirEntry = extern struct {
 pub const Stat = extern struct {
     size: u32,
     file_type: u32, // 0=file, 1=directory
-    _reserved: [56]u8,
+    mtime: u64, // uptime seconds at last modification
+    ctime: u64, // uptime seconds at creation
+    _reserved: [40]u8,
 };
 
 /// FD mapping for spawn: maps a parent fd to a child fd slot.

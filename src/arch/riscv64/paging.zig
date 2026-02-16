@@ -321,6 +321,10 @@ pub fn translateVaddr(root: *PageTable, virt: u64) ?u64 {
 /// Free all user-half pages and page tables in an address space.
 pub fn freeAddressSpace(root: *PageTable) void {
     // Walk user-half only (entries 0-255). Kernel half (256-511) is shared.
+    // On RISC-V, non-leaf PTEs cannot have the USER flag (it's reserved),
+    // so we cannot use USER to distinguish kernel vs user page tables.
+    // All intermediate page tables in user-half are private copies
+    // (deep-copied from kernel or allocated by mapPage), so free them all.
     for (0..256) |l3_idx| {
         if (root.entries[l3_idx] & Flags.VALID == 0) continue;
         if (isLeaf(root.entries[l3_idx])) continue;
@@ -347,16 +351,12 @@ pub fn freeAddressSpace(root: *PageTable) void {
                     }
                 }
 
-                // Free the L0 page table if it has USER flag in L1 entry
-                if (l1.entries[l1_idx] & Flags.USER != 0) {
-                    pmm.freePage(l0_phys);
-                }
+                // Free the L0 page table (always private on riscv64)
+                pmm.freePage(l0_phys);
             }
 
-            // Free the L1 page table if it has USER flag in L2 entry
-            if (l2.entries[l2_idx] & Flags.USER != 0) {
-                pmm.freePage(l1_phys);
-            }
+            // Free the L1 page table (always private on riscv64)
+            pmm.freePage(l1_phys);
         }
 
         // Free the L2 page table

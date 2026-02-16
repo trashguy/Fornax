@@ -1,6 +1,6 @@
 # Phase 201: Implement Declared-but-Unimplemented Syscalls
 
-## Status: Planned
+## Status: Done
 
 ## Goal
 

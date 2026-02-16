@@ -1,6 +1,6 @@
 # Phase 205: Shell Enhancements
 
-## Status: Planned
+## Status: Done
 
 ## Goal
 

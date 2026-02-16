@@ -1,6 +1,6 @@
 # Phase 200: Kernel-Internal `/proc` File Tree
 
-## Status: Planned
+## Status: Done
 
 ## Goal
 

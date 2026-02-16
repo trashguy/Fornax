@@ -90,9 +90,17 @@ pub const ResourceQuotas = struct {
     cpu_priority: u8 = 128, // 0=lowest, 255=highest
 };
 
-pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, remove, console_read, net_read, net_connect, net_listen, dns_query, icmp_read, pipe_read, pipe_write, sleep };
+pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, remove, rename, truncate, console_read, net_read, net_connect, net_listen, dns_query, icmp_read, pipe_read, pipe_write, sleep };
 
-pub const FdType = enum(u8) { ipc, net, pipe, blk };
+pub const FdType = enum(u8) { ipc, net, pipe, blk, proc, dev_null, dev_zero, dev_random };
+
+pub const ProcFdKind = enum(u8) {
+    dir,
+    pid_dir,
+    status,
+    ctl,
+    meminfo,
+};
 
 pub const NetFdKind = enum(u8) {
     tcp_clone,
@@ -130,6 +138,9 @@ pub const FdEntry = struct {
     blk_offset: u64 = 0,
     /// Block device partition size (bytes). 0 = whole device (no bounds check).
     blk_size: u64 = 0,
+    /// Proc-specific fields (only used when fd_type == .proc)
+    proc_kind: ProcFdKind = .dir,
+    proc_pid: u32 = 0,
 };
 
 pub const Process = struct {
@@ -255,6 +266,40 @@ pub const Process = struct {
         }
         return null;
     }
+
+        pub fn allocProcFd(self: *Process, kind: ProcFdKind, pid: u32) ?u32 {
+            for (3..MAX_FDS) |i| {
+                if (self.fds[i] == null) {
+                    self.fds[i] = .{
+                        .fd_type = .proc,
+                        .channel_id = 0,
+                        .is_server = false,
+                        .read_offset = 0,
+                        .server_handle = 0,
+                        .proc_kind = kind,
+                        .proc_pid = pid,
+                    };
+                    return @intCast(i);
+                }
+            }
+            return null;
+        }
+
+        pub fn allocDevFd(self: *Process, fd_type: FdType) ?u32 {
+            for (3..MAX_FDS) |i| {
+                if (self.fds[i] == null) {
+                    self.fds[i] = .{
+                        .fd_type = fd_type,
+                        .channel_id = 0,
+                        .is_server = false,
+                        .read_offset = 0,
+                        .server_handle = 0,
+                    };
+                    return @intCast(i);
+                }
+            }
+            return null;
+        }
 
     /// Set a specific fd to a channel entry.
     pub fn setFd(self: *Process, fd: u32, channel_id: ipc.ChannelId, is_server: bool) void {

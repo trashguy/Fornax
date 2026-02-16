@@ -31,6 +31,9 @@ pub const SYS = enum(u64) {
     sysinfo = 23,
     sleep = 24,
     shutdown = 25,
+    getpid = 26,
+    rename = 27,
+    truncate = 28,
 };
 
 const ipc = @import("ipc.zig");
@@ -103,6 +106,16 @@ pub fn remove(path: []const u8) i32 {
     return @bitCast(@as(u32, @truncate(result)));
 }
 
+pub fn rename(old_path: []const u8, new_path: []const u8) i32 {
+    const result = syscall4(.rename, @intFromPtr(old_path.ptr), old_path.len, @intFromPtr(new_path.ptr), new_path.len);
+    return @bitCast(@as(u32, @truncate(result)));
+}
+
+pub fn truncate(fd: i32, size: u64) i32 {
+    const result = syscall2(.truncate, @bitCast(@as(i64, fd)), size);
+    return @bitCast(@as(u32, @truncate(result)));
+}
+
 pub fn brk(new_brk: u64) u64 {
     return syscall1(.brk, new_brk);
 }
@@ -153,13 +166,14 @@ pub const SysInfo = extern struct {
     total_pages: u64,
     free_pages: u64,
     page_size: u64,
+    uptime_secs: u64,
 };
 
 pub fn sysinfo() ?SysInfo {
-    var buf: [3]u64 = undefined;
+    var buf: [4]u64 = undefined;
     const result = syscall1(.sysinfo, @intFromPtr(&buf));
     if (result != 0) return null;
-    return .{ .total_pages = buf[0], .free_pages = buf[1], .page_size = buf[2] };
+    return .{ .total_pages = buf[0], .free_pages = buf[1], .page_size = buf[2], .uptime_secs = buf[3] };
 }
 
 pub fn sleep(ms: u64) void {
@@ -174,6 +188,15 @@ pub fn shutdown() noreturn {
 pub fn reboot() noreturn {
     _ = syscall1(.shutdown, 1);
     unreachable;
+}
+
+pub fn seek(fd: i32, offset: u64, whence: u32) i64 {
+    const result = syscall3(.seek, @bitCast(@as(i64, fd)), offset, whence);
+    return @bitCast(result);
+}
+
+pub fn getpid() u32 {
+    return @truncate(syscall1(.getpid, 0));
 }
 
 /// Build a serialized argv block: [argc: u32][total_len: u32][str0\0str1\0...]

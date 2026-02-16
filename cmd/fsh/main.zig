@@ -119,6 +119,78 @@ fn envUnset(name: []const u8) void {
     }
 }
 
+// ── Aliases ───────────────────────────────────────────────────────
+
+const MAX_ALIASES = 32;
+const MAX_ALIAS_NAME = 32;
+const MAX_ALIAS_VALUE = 256;
+
+const Alias = struct {
+    name: [MAX_ALIAS_NAME]u8,
+    name_len: u8,
+    value: [MAX_ALIAS_VALUE]u8,
+    value_len: u16,
+    active: bool,
+};
+
+var aliases: [MAX_ALIASES]Alias linksection(".bss") = undefined;
+
+fn aliasInit() void {
+    for (&aliases) |*a| {
+        a.active = false;
+    }
+}
+
+fn aliasGet(name: []const u8) ?[]const u8 {
+    for (&aliases) |*a| {
+        if (a.active and a.name_len == name.len) {
+            if (fx.str.eql(a.name[0..a.name_len], name)) {
+                return a.value[0..a.value_len];
+            }
+        }
+    }
+    return null;
+}
+
+fn aliasSet(name: []const u8, value: []const u8) bool {
+    if (name.len == 0 or name.len > MAX_ALIAS_NAME) return false;
+    if (value.len > MAX_ALIAS_VALUE) return false;
+
+    // Update existing alias
+    for (&aliases) |*a| {
+        if (a.active and a.name_len == name.len and fx.str.eql(a.name[0..a.name_len], name)) {
+            const vlen = @min(value.len, MAX_ALIAS_VALUE);
+            @memcpy(a.value[0..vlen], value[0..vlen]);
+            a.value_len = @intCast(vlen);
+            return true;
+        }
+    }
+
+    // Find empty slot
+    for (&aliases) |*a| {
+        if (!a.active) {
+            const nlen = @min(name.len, MAX_ALIAS_NAME);
+            @memcpy(a.name[0..nlen], name[0..nlen]);
+            a.name_len = @intCast(nlen);
+            const vlen = @min(value.len, MAX_ALIAS_VALUE);
+            @memcpy(a.value[0..vlen], value[0..vlen]);
+            a.value_len = @intCast(vlen);
+            a.active = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn aliasUnset(name: []const u8) void {
+    for (&aliases) |*a| {
+        if (a.active and a.name_len == name.len and fx.str.eql(a.name[0..a.name_len], name)) {
+            a.active = false;
+            return;
+        }
+    }
+}
+
 // ── Variable expansion ─────────────────────────────────────────────
 
 const VarExpansion = struct {
@@ -186,8 +258,11 @@ fn shellTokenize(line: []const u8, tokens: *[64][]const u8) usize {
         while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
         if (i >= line.len) break;
 
-        // Special single-char tokens: ; | < >
-        if (line[i] == ';' or line[i] == '|' or line[i] == '<' or line[i] == '>') {
+        // Comment: # to end-of-line (outside quotes)
+        if (line[i] == '#') break;
+
+        // Special tokens: ; | || < > >> &&
+        if (line[i] == ';' or line[i] == '<') {
             const start = token_storage_pos;
             storeChar(line[i]);
             tokens[argc] = token_storage[start..token_storage_pos];
@@ -196,12 +271,52 @@ fn shellTokenize(line: []const u8, tokens: *[64][]const u8) usize {
             continue;
         }
 
+        if (line[i] == '|') {
+            const start = token_storage_pos;
+            if (i + 1 < line.len and line[i + 1] == '|') {
+                storeChar('|');
+                storeChar('|');
+                i += 2;
+            } else {
+                storeChar('|');
+                i += 1;
+            }
+            tokens[argc] = token_storage[start..token_storage_pos];
+            argc += 1;
+            continue;
+        }
+
+        if (line[i] == '&' and i + 1 < line.len and line[i + 1] == '&') {
+            const start = token_storage_pos;
+            storeChar('&');
+            storeChar('&');
+            tokens[argc] = token_storage[start..token_storage_pos];
+            argc += 1;
+            i += 2;
+            continue;
+        }
+
+        if (line[i] == '>') {
+            const start = token_storage_pos;
+            storeChar('>');
+            if (i + 1 < line.len and line[i + 1] == '>') {
+                storeChar('>');
+                i += 2;
+            } else {
+                i += 1;
+            }
+            tokens[argc] = token_storage[start..token_storage_pos];
+            argc += 1;
+            continue;
+        }
+
         // Build a regular token (may include quotes and $vars)
         const tok_start = token_storage_pos;
         var quoted = false;
 
         while (i < line.len and line[i] != ' ' and line[i] != '\t' and
-            line[i] != ';' and line[i] != '|' and line[i] != '<' and line[i] != '>')
+            line[i] != ';' and line[i] != '|' and line[i] != '<' and line[i] != '>' and
+            !(line[i] == '&' and i + 1 < line.len and line[i + 1] == '&'))
         {
             if (line[i] == '\'') {
                 // Single quote: copy literally until closing quote
@@ -468,14 +583,20 @@ fn builtinClear() void {
 
 fn builtinHelp() void {
     out.puts("fsh — Fornax shell\n");
-    out.puts("builtins: echo clear help exit cd pwd set unset source true false\n");
+    out.puts("builtins: echo clear help exit cd pwd set unset export source\n");
+    out.puts("          alias unalias true false test [ ]\n");
     out.puts("syntax:   cmd | cmd    (pipe)\n");
     out.puts("          cmd > file   (redirect stdout)\n");
     out.puts("          cmd < file   (redirect stdin)\n");
     out.puts("          cmd ; cmd    (sequence)\n");
+    out.puts("          cmd && cmd   (run if success)\n");
+    out.puts("          cmd || cmd   (run if failure)\n");
     out.puts("          'text'       (literal quoting)\n");
     out.puts("          \"$VAR\"       (variable expansion)\n");
     out.puts("          VAR=value    (set variable)\n");
+    out.puts("          # comment\n");
+    out.puts("          if cmd; then cmd; [else cmd;] fi\n");
+    out.puts("          while cmd; do cmd; done\n");
     out.puts("programs:");
 
     const fd = fx.open("/boot");
@@ -551,6 +672,95 @@ fn builtinUnset(args: []const []const u8) void {
         return;
     }
     envUnset(args[0]);
+    last_exit_status = 0;
+}
+
+fn builtinAlias(args: []const []const u8) void {
+    if (args.len == 0) {
+        // List all aliases
+        for (&aliases) |*a| {
+            if (a.active) {
+                out.print("alias {s}='{s}'\n", .{ a.name[0..a.name_len], a.value[0..a.value_len] });
+            }
+        }
+        last_exit_status = 0;
+        return;
+    }
+
+    for (args) |arg| {
+        // Parse name=value
+        if (fx.str.indexOf(arg, '=')) |eq_idx| {
+            if (eq_idx == 0) {
+                out.puts("fsh: alias: invalid name\n");
+                last_exit_status = 1;
+                return;
+            }
+            const name = arg[0..eq_idx];
+            const value = arg[eq_idx + 1 ..];
+            if (!aliasSet(name, value)) {
+                out.puts("fsh: alias: table full\n");
+                last_exit_status = 1;
+                return;
+            }
+        } else {
+            // Print single alias
+            if (aliasGet(arg)) |value| {
+                out.print("alias {s}='{s}'\n", .{ arg, value });
+            } else {
+                out.print("fsh: alias: {s}: not found\n", .{arg});
+                last_exit_status = 1;
+                return;
+            }
+        }
+    }
+    last_exit_status = 0;
+}
+
+fn builtinUnalias(args: []const []const u8) void {
+    if (args.len == 0) {
+        out.puts("fsh: unalias: usage: unalias name\n");
+        last_exit_status = 1;
+        return;
+    }
+    for (args) |arg| {
+        aliasUnset(arg);
+    }
+    last_exit_status = 0;
+}
+
+fn builtinExport(args: []const []const u8) void {
+    if (args.len == 0) {
+        // List all variables (same as set, for now)
+        for (&env_vars) |*v| {
+            if (v.active) {
+                out.print("export {s}={s}\n", .{ v.name[0..v.name_len], v.value[0..v.value_len] });
+            }
+        }
+        last_exit_status = 0;
+        return;
+    }
+
+    for (args) |arg| {
+        if (fx.str.indexOf(arg, '=')) |eq_idx| {
+            if (eq_idx == 0) {
+                out.puts("fsh: export: invalid name\n");
+                last_exit_status = 1;
+                return;
+            }
+            const name = arg[0..eq_idx];
+            const value = arg[eq_idx + 1 ..];
+            if (!envSet(name, value)) {
+                out.puts("fsh: export: table full\n");
+                last_exit_status = 1;
+                return;
+            }
+        } else {
+            // export FOO (without =value) — just check it exists
+            if (envGet(arg) == null) {
+                out.print("fsh: export: {s}: not set\n", .{arg});
+            }
+        }
+    }
     last_exit_status = 0;
 }
 
@@ -678,15 +888,48 @@ const Stage = struct {
     cmd: []const u8,
     args: [64][]const u8 = undefined,
     argc: usize = 0,
+    redir_in: ?[]const u8 = null,
+    redir_out: ?[]const u8 = null,
+    redir_err: ?[]const u8 = null,
+    redir_out_append: bool = false,
+    redir_err_append: bool = false,
 };
 
 fn parseStage(toks: []const []const u8) Stage {
     var s = Stage{ .cmd = toks[0] };
-    const n = @min(toks.len - 1, 64);
-    for (0..n) |j| {
-        s.args[j] = toks[1 + j];
+    var j: usize = 0;
+    var i: usize = 1;
+    while (i < toks.len) : (i += 1) {
+        const is_stderr = j > 0 and fx.str.eql(s.args[j - 1], "2");
+        if (fx.str.eql(toks[i], ">>") and i + 1 < toks.len) {
+            if (is_stderr) {
+                j -= 1;
+                s.redir_err = toks[i + 1];
+                s.redir_err_append = true;
+            } else {
+                s.redir_out = toks[i + 1];
+                s.redir_out_append = true;
+            }
+            i += 1;
+        } else if (fx.str.eql(toks[i], ">") and i + 1 < toks.len) {
+            if (is_stderr) {
+                j -= 1;
+                s.redir_err = toks[i + 1];
+            } else {
+                s.redir_out = toks[i + 1];
+            }
+            i += 1;
+        } else if (fx.str.eql(toks[i], "<") and i + 1 < toks.len) {
+            s.redir_in = toks[i + 1];
+            i += 1;
+        } else {
+            if (j < 64) {
+                s.args[j] = toks[i];
+                j += 1;
+            }
+        }
     }
-    s.argc = n;
+    s.argc = j;
     return s;
 }
 
@@ -704,63 +947,206 @@ fn runPipeline(stages: []Stage, n_stages: usize) void {
         return;
     }
 
-    for (0..n_pipes) |i| {
+    for (0..n_pipes) |pi| {
         const p = fx.pipe();
         if (p.err != 0) {
             out.puts("fsh: pipe failed\n");
-            for (0..i) |j| {
+            for (0..pi) |j| {
                 _ = fx.close(pipe_fds[j].read_fd);
                 _ = fx.close(pipe_fds[j].write_fd);
             }
             return;
         }
-        pipe_fds[i] = .{ .read_fd = p.read_fd, .write_fd = p.write_fd };
+        pipe_fds[pi] = .{ .read_fd = p.read_fd, .write_fd = p.write_fd };
+    }
+
+    // Open redirect fds for all stages before spawning
+    var redir: [8]RedirFds = undefined;
+    for (0..n_stages) |si| {
+        redir[si] = openRedirFds(&stages[si]);
+        if (!redir[si].ok) {
+            // Clean up already-opened redirect fds
+            for (0..si) |j| closeRedirFds(&redir[j]);
+            for (0..n_pipes) |j| {
+                _ = fx.close(pipe_fds[j].read_fd);
+                _ = fx.close(pipe_fds[j].write_fd);
+            }
+            last_exit_status = 1;
+            return;
+        }
     }
 
     var pids: [8]i32 = undefined;
-    for (0..n_stages) |i| {
-        var fd_map_buf: [2]fx.FdMapping = undefined;
+    for (0..n_stages) |si| {
+        var fd_map_buf: [5]fx.FdMapping = undefined;
         var fd_map_len: usize = 0;
 
-        if (i > 0) {
+        // Pipe stdin (overridden by redir_in if set)
+        if (si > 0 and stages[si].redir_in == null) {
             fd_map_buf[fd_map_len] = .{
                 .child_fd = 0,
-                .parent_fd = @intCast(pipe_fds[i - 1].read_fd),
+                .parent_fd = @intCast(pipe_fds[si - 1].read_fd),
             };
             fd_map_len += 1;
         }
 
-        if (i < n_stages - 1) {
+        // Pipe stdout (overridden by redir_out if set)
+        if (si < n_stages - 1 and stages[si].redir_out == null) {
             fd_map_buf[fd_map_len] = .{
                 .child_fd = 1,
-                .parent_fd = @intCast(pipe_fds[i].write_fd),
+                .parent_fd = @intCast(pipe_fds[si].write_fd),
             };
             fd_map_len += 1;
         }
 
-        pids[i] = runExternalWithFds(
-            stages[i].cmd,
-            stages[i].args[0..stages[i].argc],
+        // Add redirect fd mappings
+        for (redir[si].fd_map[0..redir[si].fd_map_len]) |m| {
+            fd_map_buf[fd_map_len] = m;
+            fd_map_len += 1;
+        }
+
+        pids[si] = runExternalWithFds(
+            stages[si].cmd,
+            stages[si].args[0..stages[si].argc],
             fd_map_buf[0..fd_map_len],
         );
     }
 
-    for (0..n_pipes) |i| {
-        _ = fx.close(pipe_fds[i].read_fd);
-        _ = fx.close(pipe_fds[i].write_fd);
+    for (0..n_pipes) |pi| {
+        _ = fx.close(pipe_fds[pi].read_fd);
+        _ = fx.close(pipe_fds[pi].write_fd);
     }
 
-    for (0..n_stages) |i| {
-        if (pids[i] >= 0) {
-            const status = fx.wait(@intCast(pids[i]));
-            if (i == n_stages - 1) {
+    for (0..n_stages) |si| {
+        if (pids[si] >= 0) {
+            const status = fx.wait(@intCast(pids[si]));
+            if (si == n_stages - 1) {
                 last_exit_status = @truncate(status);
             }
         }
     }
+
+    // Close redirect fds after all children finish
+    for (0..n_stages) |si| closeRedirFds(&redir[si]);
 }
 
 // ── Command dispatch ───────────────────────────────────────────────
+
+const RedirFds = struct {
+    fd_map: [5]fx.FdMapping = undefined,
+    fd_map_len: usize = 0,
+    in_fd: i32 = -1,
+    out_fd: i32 = -1,
+    err_fd: i32 = -1,
+    ok: bool = true,
+};
+
+fn openRedirFds(stage: *const Stage) RedirFds {
+    var r = RedirFds{};
+
+    if (stage.redir_in) |path| {
+        r.in_fd = fx.open(path);
+        if (r.in_fd < 0) {
+            out.print("fsh: {s}: not found\n", .{path});
+            r.ok = false;
+            return r;
+        }
+        r.fd_map[r.fd_map_len] = .{ .child_fd = 0, .parent_fd = @intCast(r.in_fd) };
+        r.fd_map_len += 1;
+    }
+
+    if (stage.redir_out) |path| {
+        const flags: u32 = if (stage.redir_out_append) 2 else 0;
+        r.out_fd = fx.create(path, flags);
+        if (r.out_fd < 0) {
+            out.print("fsh: {s}: create failed\n", .{path});
+            r.ok = false;
+            closeRedirFds(&r);
+            return r;
+        }
+        r.fd_map[r.fd_map_len] = .{ .child_fd = 1, .parent_fd = @intCast(r.out_fd) };
+        r.fd_map_len += 1;
+    }
+
+    if (stage.redir_err) |path| {
+        const flags: u32 = if (stage.redir_err_append) 2 else 0;
+        r.err_fd = fx.create(path, flags);
+        if (r.err_fd < 0) {
+            out.print("fsh: {s}: create failed\n", .{path});
+            r.ok = false;
+            closeRedirFds(&r);
+            return r;
+        }
+        r.fd_map[r.fd_map_len] = .{ .child_fd = 2, .parent_fd = @intCast(r.err_fd) };
+        r.fd_map_len += 1;
+    }
+
+    return r;
+}
+
+fn closeRedirFds(r: *const RedirFds) void {
+    if (r.in_fd >= 0) _ = fx.close(r.in_fd);
+    if (r.out_fd >= 0) _ = fx.close(r.out_fd);
+    if (r.err_fd >= 0) _ = fx.close(r.err_fd);
+}
+
+fn builtinTest(is_bracket: bool, args_in: []const []const u8) void {
+    var args = args_in;
+
+    // [ requires closing ]
+    if (is_bracket) {
+        if (args.len == 0 or !fx.str.eql(args[args.len - 1], "]")) {
+            out.puts("fsh: [: missing ]\n");
+            last_exit_status = 2;
+            return;
+        }
+        args = args[0 .. args.len - 1];
+    }
+
+    if (args.len == 0) {
+        last_exit_status = 1;
+        return;
+    }
+
+    // test -f path (file/dir exists)
+    if (args.len >= 2 and (fx.str.eql(args[0], "-f") or fx.str.eql(args[0], "-d"))) {
+        const fd = fx.open(args[1]);
+        if (fd >= 0) {
+            _ = fx.close(fd);
+            last_exit_status = 0;
+        } else {
+            last_exit_status = 1;
+        }
+        return;
+    }
+
+    // test str1 = str2
+    if (args.len >= 3 and fx.str.eql(args[1], "=")) {
+        last_exit_status = if (fx.str.eql(args[0], args[2])) 0 else 1;
+        return;
+    }
+
+    // test str1 != str2
+    if (args.len >= 3 and fx.str.eql(args[1], "!=")) {
+        last_exit_status = if (!fx.str.eql(args[0], args[2])) 0 else 1;
+        return;
+    }
+
+    // test -n str (non-empty)
+    if (args.len >= 2 and fx.str.eql(args[0], "-n")) {
+        last_exit_status = if (args[1].len > 0) 0 else 1;
+        return;
+    }
+
+    // test -z str (empty)
+    if (args.len >= 2 and fx.str.eql(args[0], "-z")) {
+        last_exit_status = if (args[1].len == 0) 0 else 1;
+        return;
+    }
+
+    // test string (true if non-empty)
+    last_exit_status = if (args[0].len > 0) 0 else 1;
+}
 
 fn executeLine(tokens: []const []const u8) void {
     const argc = tokens.len;
@@ -802,40 +1188,20 @@ fn executeLine(tokens: []const []const u8) void {
 
     if (n_stages == 1) {
         const stage = &stages[0];
-
-        // Filter redirects
-        var redir_in: ?[]const u8 = null;
-        var redir_out: ?[]const u8 = null;
-        var clean_argc: usize = 0;
-        var clean_args: [64][]const u8 = undefined;
-
-        var j: usize = 0;
-        while (j < stage.argc) : (j += 1) {
-            if (fx.str.eql(stage.args[j], ">") and j + 1 < stage.argc) {
-                redir_out = stage.args[j + 1];
-                j += 1;
-            } else if (fx.str.eql(stage.args[j], "<") and j + 1 < stage.argc) {
-                redir_in = stage.args[j + 1];
-                j += 1;
-            } else {
-                clean_args[clean_argc] = stage.args[j];
-                clean_argc += 1;
-            }
-        }
-
         const cmd = stage.cmd;
+        const has_redir = stage.redir_in != null or stage.redir_out != null or stage.redir_err != null;
 
         // Dispatch builtins (no redirect support for builtins)
-        if (redir_in == null and redir_out == null) {
+        if (!has_redir) {
             if (fx.str.eql(cmd, "exit")) {
-                if (clean_argc > 0) {
-                    if (fx.str.parseUint(clean_args[0])) |code| {
+                if (stage.argc > 0) {
+                    if (fx.str.parseUint(stage.args[0])) |code| {
                         fx.exit(@intCast(code));
                     }
                 }
                 fx.exit(0);
             } else if (fx.str.eql(cmd, "echo")) {
-                builtinEcho(clean_args[0..clean_argc]);
+                builtinEcho(stage.args[0..stage.argc]);
                 return;
             } else if (fx.str.eql(cmd, "clear")) {
                 builtinClear();
@@ -844,7 +1210,7 @@ fn executeLine(tokens: []const []const u8) void {
                 builtinHelp();
                 return;
             } else if (fx.str.eql(cmd, "cd")) {
-                builtinCd(clean_args[0..clean_argc]);
+                builtinCd(stage.args[0..stage.argc]);
                 return;
             } else if (fx.str.eql(cmd, "pwd")) {
                 builtinPwd();
@@ -853,10 +1219,10 @@ fn executeLine(tokens: []const []const u8) void {
                 builtinSet();
                 return;
             } else if (fx.str.eql(cmd, "unset")) {
-                builtinUnset(clean_args[0..clean_argc]);
+                builtinUnset(stage.args[0..stage.argc]);
                 return;
             } else if (fx.str.eql(cmd, "source")) {
-                builtinSource(clean_args[0..clean_argc]);
+                builtinSource(stage.args[0..stage.argc]);
                 return;
             } else if (fx.str.eql(cmd, "true")) {
                 last_exit_status = 0;
@@ -864,39 +1230,35 @@ fn executeLine(tokens: []const []const u8) void {
             } else if (fx.str.eql(cmd, "false")) {
                 last_exit_status = 1;
                 return;
+            } else if (fx.str.eql(cmd, "alias")) {
+                builtinAlias(stage.args[0..stage.argc]);
+                return;
+            } else if (fx.str.eql(cmd, "unalias")) {
+                builtinUnalias(stage.args[0..stage.argc]);
+                return;
+            } else if (fx.str.eql(cmd, "export")) {
+                builtinExport(stage.args[0..stage.argc]);
+                return;
+            } else if (fx.str.eql(cmd, "test")) {
+                builtinTest(false, stage.args[0..stage.argc]);
+                return;
+            } else if (fx.str.eql(cmd, "[")) {
+                builtinTest(true, stage.args[0..stage.argc]);
+                return;
             }
         }
+
+        // Command aliases
+        const actual_cmd = if (fx.str.eql(cmd, "vi")) "fe" else cmd;
 
         // External command with optional redirects
-        var fd_map_buf: [2]fx.FdMapping = undefined;
-        var fd_map_len: usize = 0;
-        var in_fd: i32 = -1;
-        var out_fd: i32 = -1;
-
-        if (redir_in) |path| {
-            in_fd = fx.open(path);
-            if (in_fd < 0) {
-                out.print("fsh: {s}: not found\n", .{path});
-                last_exit_status = 1;
-                return;
-            }
-            fd_map_buf[fd_map_len] = .{ .child_fd = 0, .parent_fd = @intCast(in_fd) };
-            fd_map_len += 1;
+        var r = openRedirFds(stage);
+        if (!r.ok) {
+            last_exit_status = 1;
+            return;
         }
 
-        if (redir_out) |path| {
-            out_fd = fx.create(path, 0);
-            if (out_fd < 0) {
-                out.print("fsh: {s}: create failed\n", .{path});
-                if (in_fd >= 0) _ = fx.close(in_fd);
-                last_exit_status = 1;
-                return;
-            }
-            fd_map_buf[fd_map_len] = .{ .child_fd = 1, .parent_fd = @intCast(out_fd) };
-            fd_map_len += 1;
-        }
-
-        const pid = runExternalWithFds(cmd, clean_args[0..clean_argc], fd_map_buf[0..fd_map_len]);
+        const pid = runExternalWithFds(actual_cmd, stage.args[0..stage.argc], r.fd_map[0..r.fd_map_len]);
 
         if (pid >= 0) {
             const status = fx.wait(@intCast(pid));
@@ -906,8 +1268,7 @@ fn executeLine(tokens: []const []const u8) void {
         // Close redirect fds AFTER wait — closing before wait races with
         // the child's use of the same IPC channel (T_CLOSE frees the server
         // handle, and the channel's single client endpoint gets clobbered).
-        if (in_fd >= 0) _ = fx.close(in_fd);
-        if (out_fd >= 0) _ = fx.close(out_fd);
+        closeRedirFds(&r);
     } else {
         runPipeline(&stages, n_stages);
     }
@@ -915,12 +1276,44 @@ fn executeLine(tokens: []const []const u8) void {
 
 // ── Line processing ────────────────────────────────────────────────
 
+fn expandAlias(line: []const u8, buf: *[1024]u8) ?[]const u8 {
+    // Skip leading whitespace
+    var start: usize = 0;
+    while (start < line.len and (line[start] == ' ' or line[start] == '\t')) : (start += 1) {}
+    if (start >= line.len) return null;
+
+    // Find end of first word
+    var end: usize = start;
+    while (end < line.len and line[end] != ' ' and line[end] != '\t' and
+        line[end] != ';' and line[end] != '|' and line[end] != '<' and line[end] != '>') : (end += 1)
+    {}
+
+    const word = line[start..end];
+    if (word.len == 0) return null;
+
+    const value = aliasGet(word) orelse return null;
+
+    // Build: leading_ws + value + rest_of_line
+    const rest = line[end..];
+    const total = start + value.len + rest.len;
+    if (total > buf.len) return null;
+
+    @memcpy(buf[0..start], line[0..start]);
+    @memcpy(buf[start..][0..value.len], value);
+    @memcpy(buf[start + value.len ..][0..rest.len], rest);
+    return buf[0..total];
+}
+
 fn processLine(line: []const u8) void {
     const saved_pos = token_storage_pos;
     defer token_storage_pos = saved_pos;
 
+    // Alias expansion: find first word, check alias table, substitute
+    var expanded_buf: [1024]u8 = undefined;
+    const actual_line = expandAlias(line, &expanded_buf) orelse line;
+
     var tokens: [64][]const u8 = undefined;
-    const argc = shellTokenize(line, &tokens);
+    const argc = shellTokenize(actual_line, &tokens);
     if (argc == 0) return;
 
     // Check for variable assignment (first token only)
@@ -935,19 +1328,164 @@ fn processLine(line: []const u8) void {
     executeTokens(tokens[0..argc]);
 }
 
-fn executeTokens(tokens: []const []const u8) void {
-    var start: usize = 0;
-    var i: usize = 0;
+// ── Control flow helpers ────────────────────────────────────────────
+
+fn isSeparator(tok: []const u8) bool {
+    return fx.str.eql(tok, ";") or fx.str.eql(tok, "&&") or fx.str.eql(tok, "||");
+}
+
+/// Find a control-flow keyword at nesting depth 0.
+/// if/while increase depth, fi/done decrease depth.
+fn findControlKeyword(tokens: []const []const u8, start: usize, keyword: []const u8) ?usize {
+    var depth: usize = 0;
+    var i = start;
     while (i < tokens.len) : (i += 1) {
-        if (fx.str.eql(tokens[i], ";")) {
-            if (i > start) {
-                executeLine(tokens[start..i]);
-            }
-            start = i + 1;
+        if (depth == 0 and fx.str.eql(tokens[i], keyword)) {
+            return i;
+        }
+        if (fx.str.eql(tokens[i], "if") or fx.str.eql(tokens[i], "while")) {
+            depth += 1;
+        } else if (fx.str.eql(tokens[i], "fi") or fx.str.eql(tokens[i], "done")) {
+            if (depth > 0) depth -= 1;
         }
     }
-    if (start < tokens.len) {
-        executeLine(tokens[start..tokens.len]);
+    return null;
+}
+
+fn handleIf(tokens: []const []const u8, pos: *usize) void {
+    const if_pos = pos.*;
+
+    const then_pos = findControlKeyword(tokens, if_pos + 1, "then") orelse {
+        out.puts("fsh: syntax error: missing 'then'\n");
+        last_exit_status = 2;
+        pos.* = tokens.len;
+        return;
+    };
+
+    const fi_pos = findControlKeyword(tokens, then_pos + 1, "fi") orelse {
+        out.puts("fsh: syntax error: missing 'fi'\n");
+        last_exit_status = 2;
+        pos.* = tokens.len;
+        return;
+    };
+
+    var else_pos: ?usize = findControlKeyword(tokens, then_pos + 1, "else");
+    if (else_pos) |ep| {
+        if (ep >= fi_pos) else_pos = null;
+    }
+
+    // Condition: tokens between if and then, stripping ; before then
+    var cond_end = then_pos;
+    if (cond_end > if_pos + 1 and fx.str.eql(tokens[cond_end - 1], ";")) cond_end -= 1;
+
+    if (cond_end > if_pos + 1) {
+        executeTokens(tokens[if_pos + 1 .. cond_end]);
+    }
+
+    if (last_exit_status == 0) {
+        // Execute then-body
+        const body_end = else_pos orelse fi_pos;
+        executeTokens(tokens[then_pos + 1 .. body_end]);
+    } else if (else_pos) |ep| {
+        // Execute else-body
+        executeTokens(tokens[ep + 1 .. fi_pos]);
+    }
+
+    pos.* = fi_pos + 1;
+}
+
+fn handleWhile(tokens: []const []const u8, pos: *usize) void {
+    const while_pos = pos.*;
+
+    const do_pos = findControlKeyword(tokens, while_pos + 1, "do") orelse {
+        out.puts("fsh: syntax error: missing 'do'\n");
+        last_exit_status = 2;
+        pos.* = tokens.len;
+        return;
+    };
+
+    const done_pos = findControlKeyword(tokens, do_pos + 1, "done") orelse {
+        out.puts("fsh: syntax error: missing 'done'\n");
+        last_exit_status = 2;
+        pos.* = tokens.len;
+        return;
+    };
+
+    // Condition: tokens between while and do, stripping ; before do
+    var cond_end = do_pos;
+    if (cond_end > while_pos + 1 and fx.str.eql(tokens[cond_end - 1], ";")) cond_end -= 1;
+
+    const body = tokens[do_pos + 1 .. done_pos];
+
+    var iterations: usize = 0;
+    while (iterations < 10000) : (iterations += 1) {
+        if (cond_end > while_pos + 1) {
+            executeTokens(tokens[while_pos + 1 .. cond_end]);
+        }
+        if (last_exit_status != 0) break;
+        executeTokens(body);
+    }
+
+    pos.* = done_pos + 1;
+}
+
+fn skipBlock(tokens: []const []const u8, pos: *usize, closer: []const u8) void {
+    const end = findControlKeyword(tokens, pos.* + 1, closer);
+    pos.* = if (end) |ep| ep + 1 else tokens.len;
+}
+
+fn executeTokens(tokens: []const []const u8) void {
+    var i: usize = 0;
+    var should_exec = true;
+
+    while (i < tokens.len) {
+        // Handle separators
+        if (fx.str.eql(tokens[i], ";")) {
+            should_exec = true;
+            i += 1;
+            continue;
+        }
+        if (fx.str.eql(tokens[i], "&&")) {
+            should_exec = (last_exit_status == 0);
+            i += 1;
+            continue;
+        }
+        if (fx.str.eql(tokens[i], "||")) {
+            should_exec = (last_exit_status != 0);
+            i += 1;
+            continue;
+        }
+
+        // Handle control flow blocks
+        if (fx.str.eql(tokens[i], "if")) {
+            if (should_exec) {
+                handleIf(tokens, &i);
+            } else {
+                skipBlock(tokens, &i, "fi");
+            }
+            should_exec = true;
+            continue;
+        }
+        if (fx.str.eql(tokens[i], "while")) {
+            if (should_exec) {
+                handleWhile(tokens, &i);
+            } else {
+                skipBlock(tokens, &i, "done");
+            }
+            should_exec = true;
+            continue;
+        }
+
+        // Find end of command (next separator)
+        var end = i;
+        while (end < tokens.len) : (end += 1) {
+            if (isSeparator(tokens[end])) break;
+        }
+
+        if (should_exec and end > i) {
+            executeLine(tokens[i..end]);
+        }
+        i = end;
     }
 }
 
@@ -957,6 +1495,7 @@ export fn _start() noreturn {
     builtinClear();
     out.puts("fsh: Fornax shell\n");
     envInit();
+    aliasInit();
 
     while (true) {
         const line = editLine("fornax% ") orelse break;

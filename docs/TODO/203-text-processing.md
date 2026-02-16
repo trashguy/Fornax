@@ -1,6 +1,6 @@
 # Phase 203: Text Processing Utilities
 
-## Status: Planned
+## Status: Done
 
 ## Goal
 

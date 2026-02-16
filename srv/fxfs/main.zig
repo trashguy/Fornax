@@ -221,17 +221,43 @@ var sb_generation: u64 = 0;
 var sb_bitmap_start: u64 = 0;
 var sb_data_start: u64 = 0;
 var sb_total_blocks: u64 = 0;
+var alloc_hint: u64 = 0;
+
+fn getTime() u64 {
+    const info = fx.sysinfo() orelse return 0;
+    return info.uptime_secs;
+}
 
 fn loadSuperblock() bool {
     var sb_buf: [BLOCK_SIZE]u8 = undefined;
-    if (!readBlock(0, &sb_buf)) return false;
-
-    // Check magic
-    if (!fx.str.eql(sb_buf[0..8], MAGIC)) {
-        _ = fx.write(1, "fxfs: bad magic\n");
-        return false;
+    if (readBlock(0, &sb_buf) and validateSuperblock(&sb_buf)) {
+        applySuperblock(&sb_buf);
+        return true;
     }
+    // Primary failed — try backup at block 1
+    _ = fx.write(1, "fxfs: primary superblock bad, trying backup\n");
+    if (readBlock(1, &sb_buf) and validateSuperblock(&sb_buf)) {
+        applySuperblock(&sb_buf);
+        return true;
+    }
+    _ = fx.write(1, "fxfs: both superblocks bad\n");
+    return false;
+}
 
+fn validateSuperblock(sb_buf: *[BLOCK_SIZE]u8) bool {
+    if (!fx.str.eql(sb_buf[0..8], MAGIC)) return false;
+    // Validate CRC32: checksum covers bytes 0..80 with checksum field zeroed
+    const stored_cksum = readU32LE(sb_buf[76..80]);
+    if (stored_cksum != 0) {
+        writeU32LE(sb_buf[76..80], 0);
+        const computed = crc32(sb_buf[0..80]);
+        writeU32LE(sb_buf[76..80], stored_cksum);
+        if (computed != stored_cksum) return false;
+    }
+    return true;
+}
+
+fn applySuperblock(sb_buf: *const [BLOCK_SIZE]u8) void {
     sb_total_blocks = readU64LE(sb_buf[16..24]);
     sb_tree_root = readU64LE(sb_buf[24..32]);
     sb_next_inode = readU64LE(sb_buf[32..40]);
@@ -239,8 +265,6 @@ fn loadSuperblock() bool {
     sb_generation = readU64LE(sb_buf[48..56]);
     sb_bitmap_start = readU64LE(sb_buf[56..64]);
     sb_data_start = readU64LE(sb_buf[64..72]);
-
-    return true;
 }
 
 fn writeSuperblock() bool {
@@ -391,6 +415,125 @@ fn parseInternalChild(node: *const [BLOCK_SIZE]u8, num_keys: u16, idx: u16) u64 
     return readU64LE(node[child_offset..][0..8]);
 }
 
+// ── B-tree path helpers (for multi-level tree operations) ──────────
+
+const MAX_TREE_DEPTH = 10;
+const PathEntry = struct { block: u64, child_idx: u16, num_keys: u16 };
+
+/// Walk from root to the leaf containing `key`, recording the path through
+/// internal nodes. Returns the leaf block number, or null on failure.
+fn findLeafPath(key: Key, path: []PathEntry, path_len: *usize) ?u64 {
+    var block_nr = sb_tree_root;
+    path_len.* = 0;
+
+    var depth: u8 = 0;
+    while (depth < MAX_TREE_DEPTH) : (depth += 1) {
+        const node = readBlockCached(block_nr) orelse return null;
+        const level = parseNodeLevel(node);
+        const num_items = parseNodeNumItems(node);
+
+        if (level == 0) return block_nr;
+
+        var child_idx: u16 = 0;
+        var i: u16 = 0;
+        while (i < num_items) : (i += 1) {
+            const k = parseInternalKey(node, i);
+            if (k.lessOrEqual(key)) {
+                child_idx = i + 1;
+            } else break;
+        }
+
+        if (path_len.* >= path.len) return null;
+        path[path_len.*] = .{ .block = block_nr, .child_idx = child_idx, .num_keys = num_items };
+        path_len.* += 1;
+
+        block_nr = parseInternalChild(node, num_items, child_idx);
+        if (block_nr == 0) return null;
+    }
+    return null;
+}
+
+/// After modifying a leaf, CoW each ancestor node in `path` back up to the root,
+/// updating the child pointer at each level. Returns the new root block number.
+fn cowPath(path: []const PathEntry, path_len: usize, new_leaf_block: u64) ?u64 {
+    var child_block = new_leaf_block;
+    var p = path_len;
+    while (p > 0) {
+        p -= 1;
+        const pe = path[p];
+        const old_parent = readBlockCached(pe.block) orelse return null;
+
+        var parent_buf: [BLOCK_SIZE]u8 = undefined;
+        @memcpy(&parent_buf, old_parent);
+
+        // Update child pointer
+        const children_base = NODE_HEADER_SIZE + @as(usize, pe.num_keys) * 17;
+        const child_offset = children_base + @as(usize, pe.child_idx) * 8;
+        writeU64LE(parent_buf[child_offset..][0..8], child_block);
+
+        // Update generation and clear checksum
+        writeU64LE(parent_buf[4..12], sb_generation + 1);
+        writeU32LE(parent_buf[12..16], 0);
+
+        const new_parent = allocBlock() orelse return null;
+        if (!writeTreeNode(new_parent, &parent_buf)) {
+            freeBlock(new_parent);
+            return null;
+        }
+        _ = cacheInsert(new_parent, &parent_buf);
+        freeBlock(pe.block);
+
+        child_block = new_parent;
+    }
+    return child_block;
+}
+
+/// Advance to the next sibling leaf by walking up the path and descending
+/// into the next child. Used by btreeScan for cross-leaf iteration.
+fn advanceToNextLeaf(path: []PathEntry, path_len: *usize) ?u64 {
+    while (path_len.* > 0) {
+        path_len.* -= 1;
+        const pe = path[path_len.*];
+
+        // Can we advance to next child in this node?
+        if (pe.child_idx < pe.num_keys) {
+            const next_idx = pe.child_idx + 1;
+            const node = readBlockCached(pe.block) orelse return null;
+            const child = parseInternalChild(node, pe.num_keys, next_idx);
+            if (child == 0) return null;
+
+            // Update path entry with new child index
+            path[path_len.*] = .{ .block = pe.block, .child_idx = next_idx, .num_keys = pe.num_keys };
+            path_len.* += 1;
+
+            // Descend to leftmost leaf from this child
+            return descendToLeftmostLeaf(child, path, path_len);
+        }
+        // This node's children exhausted, pop up
+    }
+    return null;
+}
+
+/// Descend from `start_block` to the leftmost leaf, recording path entries.
+fn descendToLeftmostLeaf(start_block: u64, path: []PathEntry, path_len: *usize) ?u64 {
+    var block_nr = start_block;
+    var depth: u8 = 0;
+    while (depth < MAX_TREE_DEPTH) : (depth += 1) {
+        const node = readBlockCached(block_nr) orelse return null;
+        const level = parseNodeLevel(node);
+        if (level == 0) return block_nr;
+
+        const num_items = parseNodeNumItems(node);
+        if (path_len.* >= path.len) return null;
+        path[path_len.*] = .{ .block = block_nr, .child_idx = 0, .num_keys = num_items };
+        path_len.* += 1;
+
+        block_nr = parseInternalChild(node, num_items, 0);
+        if (block_nr == 0) return null;
+    }
+    return null;
+}
+
 // ── B-tree search ──────────────────────────────────────────────────
 
 /// Search the B-tree for an exact key match. Returns the leaf item data, or null.
@@ -445,48 +588,37 @@ fn leafSearch(node: *const [BLOCK_SIZE]u8, num_items: u16, key: Key) ?[]const u8
 /// Scan all items in the tree with a given inode_nr and item_type.
 /// Calls callback for each matching item. Returns number of matches.
 fn btreeScan(inode_nr: u64, item_type: u8, context: anytype, callback: fn (ctx: @TypeOf(context), key: Key, data: []const u8) void) u32 {
-    // Start from root, find the first key >= (inode_nr, item_type, 0)
     const start_key = Key{ .inode_nr = inode_nr, .item_type = item_type, .offset = 0 };
     var count: u32 = 0;
 
-    // Walk the tree to find the leaf containing start_key
-    var block_nr = sb_tree_root;
-    var depth: u8 = 0;
+    // Find starting leaf via path (supports multi-level trees)
+    var path: [MAX_TREE_DEPTH]PathEntry = undefined;
+    var path_len: usize = 0;
+    var leaf_block_opt: ?u64 = findLeafPath(start_key, &path, &path_len);
 
-    while (depth < 10) : (depth += 1) {
-        const node = readBlockCached(block_nr) orelse return count;
-        const level = parseNodeLevel(node);
+    while (leaf_block_opt) |leaf_block| {
+        const node = readBlockCached(leaf_block) orelse return count;
         const num_items = parseNodeNumItems(node);
+        var past_range = false;
 
-        if (level == 0) {
-            // Scan this leaf for matching items
-            var i: u16 = 0;
-            while (i < num_items) : (i += 1) {
-                const k = parseLeafItemKey(node, i);
-                if (k.inode_nr == inode_nr and k.item_type == item_type) {
-                    const data = parseLeafItemData(node, i);
-                    callback(context, k, data);
-                    count += 1;
-                } else if (k.inode_nr > inode_nr or (k.inode_nr == inode_nr and k.item_type > item_type)) {
-                    return count; // Past our range
-                }
-            }
-            return count;
-        }
-
-        // Internal: descend to the right child
-        var child_idx: u16 = 0;
         var i: u16 = 0;
         while (i < num_items) : (i += 1) {
-            const k = parseInternalKey(node, i);
-            if (k.lessOrEqual(start_key)) {
-                child_idx = i + 1;
-            } else {
+            const k = parseLeafItemKey(node, i);
+            if (k.inode_nr == inode_nr and k.item_type == item_type) {
+                const data = parseLeafItemData(node, i);
+                callback(context, k, data);
+                count += 1;
+            } else if (k.inode_nr > inode_nr or (k.inode_nr == inode_nr and k.item_type > item_type)) {
+                past_range = true;
                 break;
             }
         }
-        block_nr = parseInternalChild(node, num_items, child_idx);
-        if (block_nr == 0) return count;
+
+        // If we hit a key past our range, or leaf is empty, we're done
+        if (past_range or num_items == 0) break;
+
+        // Items might continue in the next leaf — advance
+        leaf_block_opt = advanceToNextLeaf(&path, &path_len);
     }
 
     return count;
@@ -603,90 +735,156 @@ fn readFileData(inode_nr: u64, file_offset: u64, dest: []u8) u32 {
     const want: u32 = @intCast(@min(dest.len, @min(available, 4096)));
     if (want == 0) return 0;
 
-    // Search for EXTENT_DATA at offset 0 (covers inline and extent data)
-    const extent_key = Key{ .inode_nr = inode_nr, .item_type = EXTENT_DATA, .offset = 0 };
-    const data = btreeSearch(extent_key) orelse return 0;
+    // Fast path: check EXTENT_DATA at offset 0 (handles inline + single extent)
+    if (btreeSearch(.{ .inode_nr = inode_nr, .item_type = EXTENT_DATA, .offset = 0 })) |data| {
+        if (data.len == EXTENT_DATA_SIZE and readU64LE(data[0..8]) > 0) {
+            // Extent at offset 0
+            const disk_block = readU64LE(data[0..8]);
+            const num_blocks = readU32LE(data[8..12]);
+            const ext_end: u64 = @as(u64, num_blocks) * BLOCK_SIZE;
+            if (file_offset < ext_end) {
+                const block_in_extent = file_offset / BLOCK_SIZE;
+                const offset_in_block = file_offset % BLOCK_SIZE;
+                const target_block = disk_block + block_in_extent;
 
-    // Extent items are always exactly EXTENT_DATA_SIZE bytes with disk_block > 0.
-    // Everything else is inline data (raw file content stored in the B-tree leaf).
-    if (data.len == EXTENT_DATA_SIZE) {
-        const disk_block = readU64LE(data[0..8]);
-        if (disk_block > 0) {
-            // Extent: read from disk blocks
-            const block_in_extent = file_offset / BLOCK_SIZE;
-            const offset_in_block = file_offset % BLOCK_SIZE;
-            const target_block = disk_block + block_in_extent;
+                if (!readBlock(target_block, &read_data_buf)) return 0;
 
-            if (!readBlock(target_block, &read_data_buf)) return 0;
-
-            const block_avail: u32 = @intCast(BLOCK_SIZE - offset_in_block);
-            const to_copy = @min(want, block_avail);
-            @memcpy(dest[0..to_copy], read_data_buf[@intCast(offset_in_block)..][0..to_copy]);
-            return to_copy;
+                const block_avail: u32 = @intCast(BLOCK_SIZE - offset_in_block);
+                const to_copy = @min(want, block_avail);
+                @memcpy(dest[0..to_copy], read_data_buf[@intCast(offset_in_block)..][0..to_copy]);
+                return to_copy;
+            }
+            // file_offset beyond first extent — fall through to multi-extent scan
+        } else {
+            // Inline data: raw file content stored directly in B-tree leaf
+            if (file_offset < data.len) {
+                const avail: u32 = @intCast(data.len - file_offset);
+                const to_copy = @min(want, avail);
+                @memcpy(dest[0..to_copy], data[@intCast(file_offset)..][0..to_copy]);
+                return to_copy;
+            }
+            return 0;
         }
     }
 
-    // Inline data: raw file content stored directly in B-tree leaf
-    if (file_offset < data.len) {
-        const avail: u32 = @intCast(data.len - file_offset);
-        const to_copy = @min(want, avail);
-        @memcpy(dest[0..to_copy], data[@intCast(file_offset)..][0..to_copy]);
-        return to_copy;
-    }
+    // Multi-extent: scan all EXTENT_DATA items for this inode
+    const Ctx = struct {
+        file_offset: u64,
+        dest: []u8,
+        want: u32,
+        result: u32,
+    };
+    var ctx = Ctx{ .file_offset = file_offset, .dest = dest, .want = want, .result = 0 };
 
-    return 0;
+    _ = btreeScan(inode_nr, EXTENT_DATA, &ctx, struct {
+        fn cb(c: *Ctx, k: Key, data: []const u8) void {
+            if (c.result > 0) return;
+            if (data.len != EXTENT_DATA_SIZE) return;
+            const disk_block = readU64LE(data[0..8]);
+            if (disk_block == 0) return;
+            const num_blocks = readU32LE(data[8..12]);
+            const ext_start = k.offset;
+            const ext_end = ext_start + @as(u64, num_blocks) * BLOCK_SIZE;
+            if (c.file_offset >= ext_start and c.file_offset < ext_end) {
+                const offset_in_extent = c.file_offset - ext_start;
+                const block_in_extent = offset_in_extent / BLOCK_SIZE;
+                const offset_in_block = offset_in_extent % BLOCK_SIZE;
+                const target_block = disk_block + block_in_extent;
+
+                if (!readBlock(target_block, &read_data_buf)) return;
+
+                const block_avail: u32 = @intCast(BLOCK_SIZE - offset_in_block);
+                const to_copy = @min(c.want, block_avail);
+                @memcpy(c.dest[0..to_copy], read_data_buf[@intCast(offset_in_block)..][0..to_copy]);
+                c.result = to_copy;
+            }
+        }
+    }.cb);
+
+    return ctx.result;
 }
 
-// ── Bitmap operations ──────────────────────────────────────────────
+// ── Bitmap operations (multi-block) ───────────────────────────────
+//
+// One bitmap block covers BLOCK_SIZE*8 = 32768 blocks = 128 MB.
+// For larger filesystems, the bitmap spans multiple consecutive blocks
+// starting at sb_bitmap_start. We cache one bitmap block at a time.
+
+const BITS_PER_BITMAP_BLOCK: u64 = BLOCK_SIZE * 8;
 
 var bitmap_buf: [BLOCK_SIZE]u8 linksection(".bss") = undefined;
 var bitmap_loaded: bool = false;
+var bitmap_cached_idx: u64 = 0; // which bitmap block is cached (0-based)
+var bitmap_dirty: bool = false;
 
-fn loadBitmap() bool {
-    if (bitmap_loaded) return true;
-    if (!readBlock(sb_bitmap_start, &bitmap_buf)) return false;
+/// Ensure the bitmap block covering `block_nr` is loaded into bitmap_buf.
+fn ensureBitmapBlock(block_nr: u64) bool {
+    const idx = block_nr / BITS_PER_BITMAP_BLOCK;
+    if (bitmap_loaded and bitmap_cached_idx == idx) return true;
+    // Flush current block if dirty
+    if (bitmap_loaded and bitmap_dirty) {
+        if (!writeBlock(sb_bitmap_start + bitmap_cached_idx, &bitmap_buf)) return false;
+        bitmap_dirty = false;
+    }
+    // Load the needed bitmap block
+    if (!readBlock(sb_bitmap_start + idx, &bitmap_buf)) return false;
+    bitmap_cached_idx = idx;
     bitmap_loaded = true;
     return true;
 }
 
 fn isBitSet(block: u64) bool {
-    if (!loadBitmap()) return true; // assume allocated on failure
-    const byte_idx = block / 8;
-    const bit_idx: u3 = @intCast(block % 8);
-    if (byte_idx >= BLOCK_SIZE) return true;
+    if (!ensureBitmapBlock(block)) return true; // assume allocated on failure
+    const local_bit = block % BITS_PER_BITMAP_BLOCK;
+    const byte_idx = local_bit / 8;
+    const bit_idx: u3 = @intCast(local_bit % 8);
     return (bitmap_buf[byte_idx] & (@as(u8, 1) << bit_idx)) != 0;
 }
 
 fn setBit(block: u64) void {
-    if (!loadBitmap()) return;
-    const byte_idx = block / 8;
-    const bit_idx: u3 = @intCast(block % 8);
-    if (byte_idx < BLOCK_SIZE) {
-        bitmap_buf[byte_idx] |= @as(u8, 1) << bit_idx;
-    }
+    if (!ensureBitmapBlock(block)) return;
+    const local_bit = block % BITS_PER_BITMAP_BLOCK;
+    const byte_idx = local_bit / 8;
+    const bit_idx: u3 = @intCast(local_bit % 8);
+    bitmap_buf[byte_idx] |= @as(u8, 1) << bit_idx;
+    bitmap_dirty = true;
 }
 
 fn clearBit(block: u64) void {
-    if (!loadBitmap()) return;
-    const byte_idx = block / 8;
-    const bit_idx: u3 = @intCast(block % 8);
-    if (byte_idx < BLOCK_SIZE) {
-        bitmap_buf[byte_idx] &= ~(@as(u8, 1) << bit_idx);
-    }
+    if (!ensureBitmapBlock(block)) return;
+    const local_bit = block % BITS_PER_BITMAP_BLOCK;
+    const byte_idx = local_bit / 8;
+    const bit_idx: u3 = @intCast(local_bit % 8);
+    bitmap_buf[byte_idx] &= ~(@as(u8, 1) << bit_idx);
+    bitmap_dirty = true;
 }
 
 fn flushBitmap() bool {
-    if (!bitmap_loaded) return true;
-    return writeBlock(sb_bitmap_start, &bitmap_buf);
+    if (!bitmap_loaded or !bitmap_dirty) return true;
+    if (!writeBlock(sb_bitmap_start + bitmap_cached_idx, &bitmap_buf)) return false;
+    bitmap_dirty = false;
+    return true;
 }
 
 fn allocBlock() ?u64 {
-    if (!loadBitmap()) return null;
-    var block: u64 = sb_data_start;
+    // Start search from hint for O(1) sequential allocation
+    const start = if (alloc_hint >= sb_data_start and alloc_hint < sb_total_blocks) alloc_hint else sb_data_start;
+    var block: u64 = start;
     while (block < sb_total_blocks) : (block += 1) {
         if (!isBitSet(block)) {
             setBit(block);
             sb_free_blocks -%= 1;
+            alloc_hint = block + 1;
+            return block;
+        }
+    }
+    // Wrap around from data_start to hint
+    block = sb_data_start;
+    while (block < start) : (block += 1) {
+        if (!isBitSet(block)) {
+            setBit(block);
+            sb_free_blocks -%= 1;
+            alloc_hint = block + 1;
             return block;
         }
     }
@@ -707,6 +905,15 @@ fn writeNodeHeader(buf: *[BLOCK_SIZE]u8, level: u8, num_items: u16, generation: 
     buf[3] = 0; // pad
     writeU64LE(buf[4..12], generation);
     writeU32LE(buf[12..16], 0); // checksum placeholder
+}
+
+/// Write a B-tree node block with CRC32 checksum at bytes 12-15.
+fn writeTreeNode(block_nr: u64, buf: *[BLOCK_SIZE]u8) bool {
+    // Compute CRC32 with checksum field zeroed
+    writeU32LE(buf[12..16], 0);
+    const cksum = crc32(buf);
+    writeU32LE(buf[12..16], cksum);
+    return writeBlock(block_nr, buf);
 }
 
 fn writeLeafItem(buf: *[BLOCK_SIZE]u8, idx: u16, key: Key, data_offset: u16, data_size: u16) void {
@@ -749,7 +956,7 @@ fn cowNode(old_block: u64) ?u64 {
     // Update generation
     writeU64LE(new_data[4..12], sb_generation + 1);
 
-    if (!writeBlock(new_block, &new_data)) {
+    if (!writeTreeNode(new_block, &new_data)) {
         freeBlock(new_block);
         return null;
     }
@@ -762,79 +969,518 @@ fn cowNode(old_block: u64) ?u64 {
 
 /// Insert an item into the B-tree. Does CoW on modified nodes.
 /// Returns true on success.
-fn btreeInsert(key: Key, data: []const u8) bool {
-    // For now, handle single-leaf trees (no splits needed for small filesystems)
-    // TODO: implement node splitting for deeper trees
+/// Build a leaf from a range of "combined items" (old leaf items + new item in sorted order).
+/// Items from combined index range_start (inclusive) to range_end (exclusive) are written.
+/// Returns the first key written (used as separator key for splits).
+fn buildLeafRange(
+    old_leaf: *const [BLOCK_SIZE]u8,
+    old_num_items: u16,
+    new_key: Key,
+    new_data: []const u8,
+    range_start: u16,
+    range_end: u16,
+    out_buf: *[BLOCK_SIZE]u8,
+) Key {
+    @memset(out_buf, 0);
+    var data_cursor: usize = BLOCK_SIZE;
+    var write_count: u16 = 0;
+    var first_key: Key = undefined;
 
+    var old_idx: u16 = 0;
+    var combined_idx: u16 = 0;
+    var new_inserted = false;
+    const total_combined: u16 = old_num_items + 1;
+
+    while (combined_idx < range_end and combined_idx < total_combined) {
+        var use_new = false;
+        if (!new_inserted) {
+            if (old_idx >= old_num_items) {
+                use_new = true;
+            } else {
+                const k = parseLeafItemKey(old_leaf, old_idx);
+                if (new_key.lessThan(k)) {
+                    use_new = true;
+                }
+            }
+        }
+
+        if (combined_idx >= range_start) {
+            if (use_new) {
+                data_cursor -= new_data.len;
+                @memcpy(out_buf[data_cursor..][0..new_data.len], new_data);
+                writeLeafItem(out_buf, write_count, new_key, @intCast(data_cursor), @intCast(new_data.len));
+                if (write_count == 0) first_key = new_key;
+                write_count += 1;
+            } else {
+                const k = parseLeafItemKey(old_leaf, old_idx);
+                const d = parseLeafItemData(old_leaf, old_idx);
+                data_cursor -= d.len;
+                @memcpy(out_buf[data_cursor..][0..d.len], d);
+                writeLeafItem(out_buf, write_count, k, @intCast(data_cursor), @intCast(d.len));
+                if (write_count == 0) first_key = k;
+                write_count += 1;
+            }
+        }
+
+        if (use_new) {
+            new_inserted = true;
+        } else {
+            old_idx += 1;
+        }
+        combined_idx += 1;
+    }
+
+    writeNodeHeader(out_buf, 0, write_count, sb_generation + 1);
+    return first_key;
+}
+
+/// Build an internal node by inserting a separator key + right child at a split point.
+fn buildInternalWithInsert(
+    out_buf: *[BLOCK_SIZE]u8,
+    old_buf: *const [BLOCK_SIZE]u8,
+    level: u8,
+    old_num_keys: u16,
+    insert_at: u16,
+    left_child: u64,
+    sep_key: Key,
+    right_child: u64,
+) void {
+    const new_num_keys = old_num_keys + 1;
+    @memset(out_buf, 0);
+    writeNodeHeader(out_buf, level, new_num_keys, sb_generation + 1);
+
+    // Write keys
+    var ki: u16 = 0;
+    while (ki < new_num_keys) : (ki += 1) {
+        if (ki < insert_at) {
+            writeInternalKey(out_buf, ki, parseInternalKey(old_buf, ki));
+        } else if (ki == insert_at) {
+            writeInternalKey(out_buf, ki, sep_key);
+        } else {
+            writeInternalKey(out_buf, ki, parseInternalKey(old_buf, ki - 1));
+        }
+    }
+
+    // Write children
+    var ci: u16 = 0;
+    while (ci <= new_num_keys) : (ci += 1) {
+        if (ci < insert_at) {
+            writeInternalChild(out_buf, new_num_keys, ci, parseInternalChild(old_buf, old_num_keys, ci));
+        } else if (ci == insert_at) {
+            writeInternalChild(out_buf, new_num_keys, ci, left_child);
+        } else if (ci == insert_at + 1) {
+            writeInternalChild(out_buf, new_num_keys, ci, right_child);
+        } else {
+            writeInternalChild(out_buf, new_num_keys, ci, parseInternalChild(old_buf, old_num_keys, ci - 1));
+        }
+    }
+}
+
+/// Split an internal node after inserting a separator key + right child.
+/// Returns the middle key (pushed up to parent) via pushed_sep.
+fn splitInternalWithInsert(
+    left_buf: *[BLOCK_SIZE]u8,
+    right_buf: *[BLOCK_SIZE]u8,
+    pushed_sep: *Key,
+    old_buf: *const [BLOCK_SIZE]u8,
+    level: u8,
+    old_num_keys: u16,
+    insert_at: u16,
+    left_child: u64,
+    sep_key: Key,
+    right_child: u64,
+) void {
+    const total_keys: u16 = old_num_keys + 1;
+
+    // Collect all keys and children into arrays
+    var all_keys: [MAX_INTERNAL_KEYS + 1]Key = undefined;
+    var all_children: [MAX_INTERNAL_KEYS + 2]u64 = undefined;
+
+    var ki: u16 = 0;
+    while (ki < total_keys) : (ki += 1) {
+        if (ki < insert_at) {
+            all_keys[ki] = parseInternalKey(old_buf, ki);
+        } else if (ki == insert_at) {
+            all_keys[ki] = sep_key;
+        } else {
+            all_keys[ki] = parseInternalKey(old_buf, ki - 1);
+        }
+    }
+
+    var ci: u16 = 0;
+    while (ci <= total_keys) : (ci += 1) {
+        if (ci < insert_at) {
+            all_children[ci] = parseInternalChild(old_buf, old_num_keys, ci);
+        } else if (ci == insert_at) {
+            all_children[ci] = left_child;
+        } else if (ci == insert_at + 1) {
+            all_children[ci] = right_child;
+        } else {
+            all_children[ci] = parseInternalChild(old_buf, old_num_keys, ci - 1);
+        }
+    }
+
+    // Split: left gets [0..mid), pushed_sep = keys[mid], right gets [mid+1..total_keys)
+    const mid: u16 = total_keys / 2;
+    pushed_sep.* = all_keys[mid];
+
+    // Build left internal node
+    const left_keys: u16 = mid;
+    @memset(left_buf, 0);
+    writeNodeHeader(left_buf, level, left_keys, sb_generation + 1);
+    var i: u16 = 0;
+    while (i < left_keys) : (i += 1) {
+        writeInternalKey(left_buf, i, all_keys[i]);
+    }
+    i = 0;
+    while (i <= left_keys) : (i += 1) {
+        writeInternalChild(left_buf, left_keys, i, all_children[i]);
+    }
+
+    // Build right internal node
+    const right_keys: u16 = total_keys - mid - 1;
+    @memset(right_buf, 0);
+    writeNodeHeader(right_buf, level, right_keys, sb_generation + 1);
+    i = 0;
+    while (i < right_keys) : (i += 1) {
+        writeInternalKey(right_buf, i, all_keys[mid + 1 + i]);
+    }
+    i = 0;
+    while (i <= right_keys) : (i += 1) {
+        writeInternalChild(right_buf, right_keys, i, all_children[mid + 1 + i]);
+    }
+}
+
+/// CoW path with split propagation. When a leaf or internal node was split,
+/// propagates the split upward, potentially splitting parent nodes too.
+/// If the split reaches the root, creates a new root node.
+fn cowPathWithSplit(path: []const PathEntry, path_len: usize, new_left: u64, sep_key: Key, new_right: u64) ?u64 {
+    var carry_left = new_left;
+    var carry_sep = sep_key;
+    var carry_right = new_right;
+    var has_split = true;
+
+    var p = path_len;
+    while (p > 0) {
+        p -= 1;
+        const pe = path[p];
+
+        var parent_buf: [BLOCK_SIZE]u8 = undefined;
+        {
+            const cached = readBlockCached(pe.block) orelse return null;
+            @memcpy(&parent_buf, cached);
+        }
+        const parent_level = parseNodeLevel(&parent_buf);
+
+        if (has_split) {
+            const old_num_keys = pe.num_keys;
+            const new_num_keys = old_num_keys + 1;
+            const space_needed = NODE_HEADER_SIZE + @as(usize, new_num_keys) * 17 + @as(usize, new_num_keys + 1) * 8;
+
+            if (space_needed <= BLOCK_SIZE) {
+                // Fits — build new parent with inserted key + child
+                var new_parent: [BLOCK_SIZE]u8 = undefined;
+                buildInternalWithInsert(&new_parent, &parent_buf, parent_level, old_num_keys, pe.child_idx, carry_left, carry_sep, carry_right);
+
+                const new_block = allocBlock() orelse return null;
+                if (!writeTreeNode(new_block, &new_parent)) {
+                    freeBlock(new_block);
+                    return null;
+                }
+                _ = cacheInsert(new_block, &new_parent);
+                freeBlock(pe.block);
+
+                carry_left = new_block;
+                has_split = false;
+            } else {
+                // Parent needs to split too
+                var left_internal: [BLOCK_SIZE]u8 = undefined;
+                var right_internal: [BLOCK_SIZE]u8 = undefined;
+                var pushed_sep: Key = undefined;
+
+                splitInternalWithInsert(&left_internal, &right_internal, &pushed_sep, &parent_buf, parent_level, pe.num_keys, pe.child_idx, carry_left, carry_sep, carry_right);
+
+                const left_block = allocBlock() orelse return null;
+                if (!writeTreeNode(left_block, &left_internal)) {
+                    freeBlock(left_block);
+                    return null;
+                }
+                _ = cacheInsert(left_block, &left_internal);
+
+                const right_block = allocBlock() orelse return null;
+                if (!writeTreeNode(right_block, &right_internal)) {
+                    freeBlock(right_block);
+                    freeBlock(left_block);
+                    return null;
+                }
+                _ = cacheInsert(right_block, &right_internal);
+
+                freeBlock(pe.block);
+
+                carry_left = left_block;
+                carry_sep = pushed_sep;
+                carry_right = right_block;
+            }
+        } else {
+            // Normal CoW — just update child pointer
+            const children_base = NODE_HEADER_SIZE + @as(usize, pe.num_keys) * 17;
+            const child_offset = children_base + @as(usize, pe.child_idx) * 8;
+            writeU64LE(parent_buf[child_offset..][0..8], carry_left);
+
+            writeU64LE(parent_buf[4..12], sb_generation + 1);
+            writeU32LE(parent_buf[12..16], 0);
+
+            const new_block = allocBlock() orelse return null;
+            if (!writeTreeNode(new_block, &parent_buf)) {
+                freeBlock(new_block);
+                return null;
+            }
+            _ = cacheInsert(new_block, &parent_buf);
+            freeBlock(pe.block);
+
+            carry_left = new_block;
+        }
+    }
+
+    if (has_split) {
+        // Root was split — create new root
+        const child_node = readBlockCached(carry_left) orelse return null;
+        const child_level = parseNodeLevel(child_node);
+        const new_root_level: u8 = child_level + 1;
+
+        var root_buf: [BLOCK_SIZE]u8 = [_]u8{0} ** BLOCK_SIZE;
+        writeNodeHeader(&root_buf, new_root_level, 1, sb_generation + 1);
+        writeInternalKey(&root_buf, 0, carry_sep);
+        writeInternalChild(&root_buf, 1, 0, carry_left);
+        writeInternalChild(&root_buf, 1, 1, carry_right);
+
+        const new_root = allocBlock() orelse return null;
+        if (!writeTreeNode(new_root, &root_buf)) {
+            freeBlock(new_root);
+            return null;
+        }
+        _ = cacheInsert(new_root, &root_buf);
+        return new_root;
+    }
+
+    return carry_left;
+}
+
+fn btreeInsert(key: Key, data: []const u8) bool {
     const root = readBlockCached(sb_tree_root) orelse return false;
     const level = parseNodeLevel(root);
 
-    if (level != 0) {
-        // Multi-level tree: need recursive insert (not yet implemented)
-        _ = fx.write(1, "fxfs: multi-level insert not yet supported\n");
-        return false;
+    if (level == 0) {
+        // Single leaf tree — use existing logic
+        return leafInsert(sb_tree_root, key, data);
     }
 
-    // Single leaf tree: CoW the leaf, insert the item
-    return leafInsert(sb_tree_root, key, data);
-}
+    // Multi-level tree: find leaf via path, insert with possible split
+    var path: [MAX_TREE_DEPTH]PathEntry = undefined;
+    var path_len: usize = 0;
+    const leaf_block = findLeafPath(key, &path, &path_len) orelse return false;
 
-fn leafInsert(leaf_block: u64, key: Key, data: []const u8) bool {
-    const old_leaf = readBlockCached(leaf_block) orelse return false;
-    const num_items = parseNodeNumItems(old_leaf);
+    // Copy old leaf locally to survive cache invalidation during splits
+    var old_leaf: [BLOCK_SIZE]u8 = undefined;
+    {
+        const cached = readBlockCached(leaf_block) orelse return false;
+        @memcpy(&old_leaf, cached);
+    }
+    const num_items = parseNodeNumItems(&old_leaf);
 
-    // Build new leaf with the item inserted in sorted order
-    var new_buf: [BLOCK_SIZE]u8 = [_]u8{0} ** BLOCK_SIZE;
-    var data_cursor: usize = BLOCK_SIZE;
-    var new_count: u16 = 0;
-    var inserted = false;
+    // Check if items fit in a single leaf
+    var total_data: usize = data.len;
+    {
+        var i: u16 = 0;
+        while (i < num_items) : (i += 1) {
+            total_data += parseLeafItemDataSize(&old_leaf, i);
+        }
+    }
+    const total_items: u16 = num_items + 1;
+    const header_end = NODE_HEADER_SIZE + @as(usize, total_items) * LEAF_ITEM_HEADER_SIZE;
 
-    var i: u16 = 0;
-    while (i < num_items) : (i += 1) {
-        const k = parseLeafItemKey(old_leaf, i);
+    if (header_end + total_data <= BLOCK_SIZE) {
+        // Fits in single leaf — build directly
+        var new_buf: [BLOCK_SIZE]u8 = [_]u8{0} ** BLOCK_SIZE;
+        var data_cursor: usize = BLOCK_SIZE;
+        var new_count: u16 = 0;
+        var inserted = false;
 
-        // Insert new item before first key that's greater
-        if (!inserted and key.lessThan(k)) {
+        var i: u16 = 0;
+        while (i < num_items) : (i += 1) {
+            const k = parseLeafItemKey(&old_leaf, i);
+            if (!inserted and key.lessThan(k)) {
+                data_cursor -= data.len;
+                @memcpy(new_buf[data_cursor..][0..data.len], data);
+                writeLeafItem(&new_buf, new_count, key, @intCast(data_cursor), @intCast(data.len));
+                new_count += 1;
+                inserted = true;
+            }
+            const old_data = parseLeafItemData(&old_leaf, i);
+            data_cursor -= old_data.len;
+            @memcpy(new_buf[data_cursor..][0..old_data.len], old_data);
+            writeLeafItem(&new_buf, new_count, k, @intCast(data_cursor), @intCast(old_data.len));
+            new_count += 1;
+        }
+        if (!inserted) {
             data_cursor -= data.len;
             @memcpy(new_buf[data_cursor..][0..data.len], data);
             writeLeafItem(&new_buf, new_count, key, @intCast(data_cursor), @intCast(data.len));
             new_count += 1;
-            inserted = true;
         }
 
-        // Copy existing item
-        const old_data = parseLeafItemData(old_leaf, i);
-        data_cursor -= old_data.len;
-        @memcpy(new_buf[data_cursor..][0..old_data.len], old_data);
-        writeLeafItem(&new_buf, new_count, k, @intCast(data_cursor), @intCast(old_data.len));
-        new_count += 1;
+        writeNodeHeader(&new_buf, 0, new_count, sb_generation + 1);
+
+        const new_block = allocBlock() orelse return false;
+        if (!writeTreeNode(new_block, &new_buf)) {
+            freeBlock(new_block);
+            return false;
+        }
+        _ = cacheInsert(new_block, &new_buf);
+        freeBlock(leaf_block);
+
+        // CoW the path back to root
+        const new_root = cowPath(&path, path_len, new_block) orelse return false;
+        sb_tree_root = new_root;
+        return true;
     }
 
-    // Insert at end if not yet inserted
-    if (!inserted) {
-        data_cursor -= data.len;
-        @memcpy(new_buf[data_cursor..][0..data.len], data);
-        writeLeafItem(&new_buf, new_count, key, @intCast(data_cursor), @intCast(data.len));
-        new_count += 1;
-    }
+    // Leaf overflow — split into two halves
+    const split_at = total_items / 2;
 
-    // Write header
-    writeNodeHeader(&new_buf, 0, new_count, sb_generation + 1);
+    var left_buf: [BLOCK_SIZE]u8 = undefined;
+    _ = buildLeafRange(&old_leaf, num_items, key, data, 0, split_at, &left_buf);
 
-    // Allocate new block
-    const new_block = allocBlock() orelse return false;
-    if (!writeBlock(new_block, &new_buf)) {
-        freeBlock(new_block);
+    var right_buf: [BLOCK_SIZE]u8 = undefined;
+    const separator = buildLeafRange(&old_leaf, num_items, key, data, split_at, total_items, &right_buf);
+
+    const left_block = allocBlock() orelse return false;
+    if (!writeTreeNode(left_block, &left_buf)) {
+        freeBlock(left_block);
         return false;
     }
-    _ = cacheInsert(new_block, &new_buf);
+    _ = cacheInsert(left_block, &left_buf);
 
-    // Free old root, update tree root
-    if (leaf_block != sb_tree_root or leaf_block == sb_tree_root) {
-        freeBlock(leaf_block);
+    const right_block = allocBlock() orelse return false;
+    if (!writeTreeNode(right_block, &right_buf)) {
+        freeBlock(right_block);
+        freeBlock(left_block);
+        return false;
     }
-    sb_tree_root = new_block;
+    _ = cacheInsert(right_block, &right_buf);
 
+    freeBlock(leaf_block);
+
+    // Propagate split up via cowPathWithSplit
+    const new_root = cowPathWithSplit(&path, path_len, left_block, separator, right_block) orelse return false;
+    sb_tree_root = new_root;
+    return true;
+}
+
+fn leafInsert(leaf_block: u64, key: Key, data: []const u8) bool {
+    // Copy old leaf locally to survive cache invalidation during splits
+    var old_leaf: [BLOCK_SIZE]u8 = undefined;
+    {
+        const cached = readBlockCached(leaf_block) orelse return false;
+        @memcpy(&old_leaf, cached);
+    }
+    const num_items = parseNodeNumItems(&old_leaf);
+
+    // Check if items fit in a single leaf
+    var total_data: usize = data.len;
+    {
+        var i: u16 = 0;
+        while (i < num_items) : (i += 1) {
+            total_data += parseLeafItemDataSize(&old_leaf, i);
+        }
+    }
+    const total_items: u16 = num_items + 1;
+    const header_end = NODE_HEADER_SIZE + @as(usize, total_items) * LEAF_ITEM_HEADER_SIZE;
+
+    if (header_end + total_data <= BLOCK_SIZE) {
+        // Fits in single leaf — build directly
+        var new_buf: [BLOCK_SIZE]u8 = [_]u8{0} ** BLOCK_SIZE;
+        var data_cursor: usize = BLOCK_SIZE;
+        var new_count: u16 = 0;
+        var inserted = false;
+
+        var i: u16 = 0;
+        while (i < num_items) : (i += 1) {
+            const k = parseLeafItemKey(&old_leaf, i);
+            if (!inserted and key.lessThan(k)) {
+                data_cursor -= data.len;
+                @memcpy(new_buf[data_cursor..][0..data.len], data);
+                writeLeafItem(&new_buf, new_count, key, @intCast(data_cursor), @intCast(data.len));
+                new_count += 1;
+                inserted = true;
+            }
+            const old_data = parseLeafItemData(&old_leaf, i);
+            data_cursor -= old_data.len;
+            @memcpy(new_buf[data_cursor..][0..old_data.len], old_data);
+            writeLeafItem(&new_buf, new_count, k, @intCast(data_cursor), @intCast(old_data.len));
+            new_count += 1;
+        }
+        if (!inserted) {
+            data_cursor -= data.len;
+            @memcpy(new_buf[data_cursor..][0..data.len], data);
+            writeLeafItem(&new_buf, new_count, key, @intCast(data_cursor), @intCast(data.len));
+            new_count += 1;
+        }
+
+        writeNodeHeader(&new_buf, 0, new_count, sb_generation + 1);
+
+        const new_block = allocBlock() orelse return false;
+        if (!writeTreeNode(new_block, &new_buf)) {
+            freeBlock(new_block);
+            return false;
+        }
+        _ = cacheInsert(new_block, &new_buf);
+        freeBlock(leaf_block);
+        sb_tree_root = new_block;
+        return true;
+    }
+
+    // Leaf overflow — split into two halves, create new internal root
+    const split_at = total_items / 2;
+
+    var left_buf: [BLOCK_SIZE]u8 = undefined;
+    _ = buildLeafRange(&old_leaf, num_items, key, data, 0, split_at, &left_buf);
+
+    var right_buf: [BLOCK_SIZE]u8 = undefined;
+    const separator = buildLeafRange(&old_leaf, num_items, key, data, split_at, total_items, &right_buf);
+
+    const left_block = allocBlock() orelse return false;
+    if (!writeTreeNode(left_block, &left_buf)) {
+        freeBlock(left_block);
+        return false;
+    }
+    _ = cacheInsert(left_block, &left_buf);
+
+    const right_block = allocBlock() orelse return false;
+    if (!writeTreeNode(right_block, &right_buf)) {
+        freeBlock(right_block);
+        freeBlock(left_block);
+        return false;
+    }
+    _ = cacheInsert(right_block, &right_buf);
+
+    freeBlock(leaf_block);
+
+    // Create new internal root (level 1)
+    var root_buf: [BLOCK_SIZE]u8 = [_]u8{0} ** BLOCK_SIZE;
+    writeNodeHeader(&root_buf, 1, 1, sb_generation + 1);
+    writeInternalKey(&root_buf, 0, separator);
+    writeInternalChild(&root_buf, 1, 0, left_block);
+    writeInternalChild(&root_buf, 1, 1, right_block);
+
+    const new_root = allocBlock() orelse return false;
+    if (!writeTreeNode(new_root, &root_buf)) {
+        freeBlock(new_root);
+        return false;
+    }
+    _ = cacheInsert(new_root, &root_buf);
+
+    sb_tree_root = new_root;
     return true;
 }
 
@@ -843,12 +1489,54 @@ fn btreeDelete(key: Key) bool {
     const root = readBlockCached(sb_tree_root) orelse return false;
     const level = parseNodeLevel(root);
 
-    if (level != 0) {
-        _ = fx.write(1, "fxfs: multi-level delete not yet supported\n");
-        return false;
+    if (level == 0) {
+        return leafDelete(sb_tree_root, key);
     }
 
-    return leafDelete(sb_tree_root, key);
+    // Multi-level tree: find leaf via path, delete, CoW path
+    var path: [MAX_TREE_DEPTH]PathEntry = undefined;
+    var path_len: usize = 0;
+    const leaf_block = findLeafPath(key, &path, &path_len) orelse return false;
+
+    // Delete from leaf (CoW)
+    const old_leaf = readBlockCached(leaf_block) orelse return false;
+    const num_items = parseNodeNumItems(old_leaf);
+
+    var new_buf: [BLOCK_SIZE]u8 = [_]u8{0} ** BLOCK_SIZE;
+    var data_cursor: usize = BLOCK_SIZE;
+    var new_count: u16 = 0;
+    var deleted = false;
+
+    var i: u16 = 0;
+    while (i < num_items) : (i += 1) {
+        const k = parseLeafItemKey(old_leaf, i);
+        if (k.eql(key)) {
+            deleted = true;
+            continue;
+        }
+        const old_data = parseLeafItemData(old_leaf, i);
+        data_cursor -= old_data.len;
+        @memcpy(new_buf[data_cursor..][0..old_data.len], old_data);
+        writeLeafItem(&new_buf, new_count, k, @intCast(data_cursor), @intCast(old_data.len));
+        new_count += 1;
+    }
+
+    if (!deleted) return false;
+
+    writeNodeHeader(&new_buf, 0, new_count, sb_generation + 1);
+
+    const new_block = allocBlock() orelse return false;
+    if (!writeTreeNode(new_block, &new_buf)) {
+        freeBlock(new_block);
+        return false;
+    }
+    _ = cacheInsert(new_block, &new_buf);
+    freeBlock(leaf_block);
+
+    // CoW the path back to root
+    const new_root = cowPath(&path, path_len, new_block) orelse return false;
+    sb_tree_root = new_root;
+    return true;
 }
 
 fn leafDelete(leaf_block: u64, key: Key) bool {
@@ -881,7 +1569,7 @@ fn leafDelete(leaf_block: u64, key: Key) bool {
     writeNodeHeader(&new_buf, 0, new_count, sb_generation + 1);
 
     const new_block = allocBlock() orelse return false;
-    if (!writeBlock(new_block, &new_buf)) {
+    if (!writeTreeNode(new_block, &new_buf)) {
         freeBlock(new_block);
         return false;
     }
@@ -939,6 +1627,42 @@ fn ctlAppendDec(buf: []u8, pos: usize, val: u64) usize {
         buf[pos + i] = tmp[len - 1 - i];
     }
     return pos + len;
+}
+
+/// Free all extent data blocks and delete all EXTENT_DATA B-tree items for an inode.
+fn freeAllExtents(inode_nr: u64) void {
+    // First pass: free data blocks and collect keys to delete
+    const Ctx = struct {
+        keys: [32]Key,
+        count: usize,
+    };
+    var ctx = Ctx{ .keys = undefined, .count = 0 };
+
+    _ = btreeScan(inode_nr, EXTENT_DATA, &ctx, struct {
+        fn cb(c: *Ctx, k: Key, data: []const u8) void {
+            // Free data blocks if this is an extent reference (not inline)
+            if (data.len == EXTENT_DATA_SIZE) {
+                const disk_block = readU64LE(data[0..8]);
+                const num_blocks = readU32LE(data[8..12]);
+                if (disk_block != 0) {
+                    var b: u64 = 0;
+                    while (b < num_blocks) : (b += 1) {
+                        freeBlock(disk_block + b);
+                    }
+                }
+            }
+            if (c.count < 32) {
+                c.keys[c.count] = k;
+                c.count += 1;
+            }
+        }
+    }.cb);
+
+    // Second pass: delete B-tree items
+    var i: usize = 0;
+    while (i < ctx.count) : (i += 1) {
+        _ = btreeDelete(ctx.keys[i]);
+    }
 }
 
 fn handleOpen(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
@@ -1141,6 +1865,8 @@ fn handleStat(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
     @memset(resp.data[0..64], 0);
     writeU32LE(resp.data[0..4], @intCast(@min(inode.size, 0xFFFFFFFF)));
     writeU32LE(resp.data[4..8], if (isDirectory(inode)) 1 else 0);
+    writeU64LE(resp.data[8..16], inode.mtime);
+    writeU64LE(resp.data[16..24], inode.ctime);
     resp.data_len = 64;
 }
 
@@ -1209,9 +1935,10 @@ fn handleCreate(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
     writeU16LE(inode_data[4..6], 0); // gid
     writeU16LE(inode_data[6..8], 1); // nlinks
     writeU64LE(inode_data[8..16], 0); // size
-    writeU64LE(inode_data[16..24], 0); // atime
-    writeU64LE(inode_data[24..32], 0); // mtime
-    writeU64LE(inode_data[32..40], 0); // ctime
+    const now = getTime();
+    writeU64LE(inode_data[16..24], now); // atime
+    writeU64LE(inode_data[24..32], now); // mtime
+    writeU64LE(inode_data[32..40], now); // ctime
 
     if (!btreeInsert(.{ .inode_nr = new_inode, .item_type = INODE_ITEM, .offset = 0 }, &inode_data)) {
         resp.* = fx.IpcMessage.init(fx.R_ERROR);
@@ -1296,8 +2023,8 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
         // Place new data at write_offset
         @memcpy(combined[write_offset..][0..write_data.len], write_data);
 
-        // Delete old extent data if exists
-        _ = btreeDelete(.{ .inode_nr = h.inode_nr, .item_type = EXTENT_DATA, .offset = 0 });
+        // Delete all old extent data (handles both inline and multi-extent)
+        freeAllExtents(h.inode_nr);
 
         // Insert combined inline data
         if (!btreeInsert(.{ .inode_nr = h.inode_nr, .item_type = EXTENT_DATA, .offset = 0 }, combined[0..new_end])) {
@@ -1305,81 +2032,95 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
             return;
         }
     } else {
-        // Allocate data block(s)
+        // Large file — allocate blocks in runs (supports non-contiguous allocation)
         const num_blocks = (new_end + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        const first_block = allocBlock() orelse {
-            resp.* = fx.IpcMessage.init(fx.R_ERROR);
-            return;
-        };
 
-        // Allocate remaining blocks (must be contiguous for simple extent)
-        var blocks_ok = true;
-        var b: u64 = 1;
-        while (b < num_blocks) : (b += 1) {
-            const next = allocBlock() orelse {
-                blocks_ok = false;
-                break;
-            };
-            if (next != first_block + b) {
-                // Not contiguous — give up for now
-                freeBlock(next);
-                blocks_ok = false;
-                break;
-            }
-        }
+        const MAX_RUNS = 32;
+        const RunInfo = struct { start: u64, count: u32 };
+        var runs: [MAX_RUNS]RunInfo = undefined;
+        var num_runs: usize = 0;
+        var total_allocated: usize = 0;
 
-        if (!blocks_ok) {
-            freeBlock(first_block);
-            resp.* = fx.IpcMessage.init(fx.R_ERROR);
-            return;
-        }
+        // Free old extents first to reclaim space
+        freeAllExtents(h.inode_nr);
 
-        // Read existing data if we're writing at an offset
-        // then overlay new data at write_offset
-        var block_buf: [BLOCK_SIZE]u8 = [_]u8{0} ** BLOCK_SIZE;
-
-        // Write data blocks
-        var offset: usize = 0;
-        b = 0;
-        while (b < num_blocks) : (b += 1) {
-            @memset(&block_buf, 0);
-            // Copy existing data for this block range if needed
-            // (for simplicity, just write new data at write_offset)
-            const block_start = b * BLOCK_SIZE;
-            if (block_start < new_end) {
-                // Determine what part of the combined data falls in this block
-                const data_start = if (block_start >= write_offset) block_start - write_offset else 0;
-                const buf_start = if (write_offset > block_start) write_offset - block_start else 0;
-                if (data_start < write_data.len) {
-                    const remaining = write_data.len - data_start;
-                    const space = BLOCK_SIZE - buf_start;
-                    const to_copy = @min(remaining, space);
-                    @memcpy(block_buf[buf_start..][0..to_copy], write_data[data_start..][0..to_copy]);
+        while (total_allocated < num_blocks) {
+            const block = allocBlock() orelse {
+                // Free what we've already allocated
+                for (runs[0..num_runs]) |run| {
+                    var f: u32 = 0;
+                    while (f < run.count) : (f += 1) {
+                        freeBlock(run.start + f);
+                    }
                 }
+                resp.* = fx.IpcMessage.init(fx.R_ERROR);
+                return;
+            };
+
+            if (num_runs == 0 or block != runs[num_runs - 1].start + runs[num_runs - 1].count) {
+                // Start new run
+                if (num_runs >= MAX_RUNS) {
+                    freeBlock(block);
+                    for (runs[0..num_runs]) |run| {
+                        var f: u32 = 0;
+                        while (f < run.count) : (f += 1) {
+                            freeBlock(run.start + f);
+                        }
+                    }
+                    resp.* = fx.IpcMessage.init(fx.R_ERROR);
+                    return;
+                }
+                runs[num_runs] = .{ .start = block, .count = 1 };
+                num_runs += 1;
+            } else {
+                runs[num_runs - 1].count += 1;
             }
-            if (!writeBlock(first_block + b, &block_buf)) {
+            total_allocated += 1;
+        }
+
+        // Write data to blocks
+        var block_buf: [BLOCK_SIZE]u8 = [_]u8{0} ** BLOCK_SIZE;
+        var block_idx: usize = 0;
+        for (runs[0..num_runs]) |run| {
+            var r: u32 = 0;
+            while (r < run.count) : (r += 1) {
+                @memset(&block_buf, 0);
+                const block_start = block_idx * BLOCK_SIZE;
+                if (block_start < new_end) {
+                    const data_start = if (block_start >= write_offset) block_start - write_offset else 0;
+                    const buf_start = if (write_offset > block_start) write_offset - block_start else 0;
+                    if (data_start < write_data.len) {
+                        const remaining = write_data.len - data_start;
+                        const space = BLOCK_SIZE - buf_start;
+                        const to_copy = @min(remaining, space);
+                        @memcpy(block_buf[buf_start..][0..to_copy], write_data[data_start..][0..to_copy]);
+                    }
+                }
+                if (!writeBlock(run.start + r, &block_buf)) {
+                    resp.* = fx.IpcMessage.init(fx.R_ERROR);
+                    return;
+                }
+                block_idx += 1;
+            }
+        }
+
+        // Insert extent references — one per contiguous run
+        var file_offset: u64 = 0;
+        for (runs[0..num_runs]) |run| {
+            var extent_data: [EXTENT_DATA_SIZE]u8 = undefined;
+            writeU64LE(extent_data[0..8], run.start);
+            writeU32LE(extent_data[8..12], run.count);
+            writeU32LE(extent_data[12..16], 0); // reserved
+
+            if (!btreeInsert(.{ .inode_nr = h.inode_nr, .item_type = EXTENT_DATA, .offset = file_offset }, &extent_data)) {
                 resp.* = fx.IpcMessage.init(fx.R_ERROR);
                 return;
             }
-            offset += BLOCK_SIZE;
-        }
-
-        // Delete old extent data
-        _ = btreeDelete(.{ .inode_nr = h.inode_nr, .item_type = EXTENT_DATA, .offset = 0 });
-
-        // Insert extent reference
-        var extent_data: [EXTENT_DATA_SIZE]u8 = undefined;
-        writeU64LE(extent_data[0..8], first_block);
-        writeU32LE(extent_data[8..12], @intCast(num_blocks));
-        writeU32LE(extent_data[12..16], 0); // reserved
-
-        if (!btreeInsert(.{ .inode_nr = h.inode_nr, .item_type = EXTENT_DATA, .offset = 0 }, &extent_data)) {
-            resp.* = fx.IpcMessage.init(fx.R_ERROR);
-            return;
+            file_offset += @as(u64, run.count) * BLOCK_SIZE;
         }
     }
 
-    // Update inode size
+    // Update inode size + mtime
     var inode_data: [INODE_ITEM_SIZE]u8 = undefined;
     writeU16LE(inode_data[0..2], inode.mode);
     writeU16LE(inode_data[2..4], inode.uid);
@@ -1387,7 +2128,7 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
     writeU16LE(inode_data[6..8], inode.nlinks);
     writeU64LE(inode_data[8..16], new_size);
     writeU64LE(inode_data[16..24], inode.atime);
-    writeU64LE(inode_data[24..32], inode.mtime);
+    writeU64LE(inode_data[24..32], getTime()); // mtime
     writeU64LE(inode_data[32..40], inode.ctime);
 
     if (!btreeUpdate(.{ .inode_nr = h.inode_nr, .item_type = INODE_ITEM, .offset = 0 }, &inode_data)) {
@@ -1424,6 +2165,22 @@ fn handleRemove(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
         return;
     }
 
+    // Check if directory is non-empty
+    const inode = readInode(inode_nr) orelse {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    };
+    if (isDirectory(inode)) {
+        // Scan for any DIR_ENTRY items — refuse removal if any exist
+        const count = btreeScan(inode_nr, DIR_ENTRY, {}, struct {
+            fn cb(_: void, _: Key, _: []const u8) void {}
+        }.cb);
+        if (count > 0) {
+            resp.* = fx.IpcMessage.init(fx.R_ERROR);
+            return;
+        }
+    }
+
     // Find parent and name
     var parent_inode: u64 = 1;
     var file_name: []const u8 = path;
@@ -1446,20 +2203,8 @@ fn handleRemove(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
     const name_hash = fnvHash(file_name);
     _ = btreeDelete(.{ .inode_nr = parent_inode, .item_type = DIR_ENTRY, .offset = name_hash });
 
-    // Delete EXTENT_DATA (free data blocks if extent)
-    if (btreeSearch(.{ .inode_nr = inode_nr, .item_type = EXTENT_DATA, .offset = 0 })) |data| {
-        if (data.len >= EXTENT_DATA_SIZE) {
-            const disk_block = readU64LE(data[0..8]);
-            const num_blocks = readU32LE(data[8..12]);
-            if (disk_block != 0) {
-                var b: u64 = 0;
-                while (b < num_blocks) : (b += 1) {
-                    freeBlock(disk_block + b);
-                }
-            }
-        }
-        _ = btreeDelete(.{ .inode_nr = inode_nr, .item_type = EXTENT_DATA, .offset = 0 });
-    }
+    // Free all extent data blocks and delete all EXTENT_DATA items
+    freeAllExtents(inode_nr);
 
     // Delete INODE_ITEM
     _ = btreeDelete(.{ .inode_nr = inode_nr, .item_type = INODE_ITEM, .offset = 0 });
@@ -1484,6 +2229,197 @@ fn handleRemove(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
 
 /// Format the disk with an empty fxfs filesystem.
 /// Probes disk size by reading blocks until failure.
+fn handleRename(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
+    // Data format: old_path \0 new_path
+    const data = req.data[0..req.data_len];
+
+    // Find the \0 separator
+    var sep: ?usize = null;
+    for (data, 0..) |c, i_| {
+        if (c == 0) {
+            sep = i_;
+            break;
+        }
+    }
+    const separator = sep orelse {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    };
+
+    const old_path = data[0..separator];
+    const new_path = data[separator + 1 ..];
+
+    if (old_path.len == 0 or new_path.len == 0) {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    }
+
+    // Resolve old path to get the inode
+    const inode_nr = resolvePath(old_path) orelse {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    };
+
+    // Don't rename root
+    if (inode_nr == 1) {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    }
+
+    // Get old parent + name
+    var old_parent: u64 = 1;
+    var old_name: []const u8 = old_path;
+    {
+        var last_slash: ?usize = null;
+        for (old_path, 0..) |c, i_| {
+            if (c == '/') last_slash = i_;
+        }
+        if (last_slash) |slash| {
+            old_parent = resolvePath(old_path[0..slash]) orelse {
+                resp.* = fx.IpcMessage.init(fx.R_ERROR);
+                return;
+            };
+            old_name = old_path[slash + 1 ..];
+        }
+    }
+
+    // Get new parent + name
+    var new_parent: u64 = 1;
+    var new_name: []const u8 = new_path;
+    {
+        var last_slash: ?usize = null;
+        for (new_path, 0..) |c, i_| {
+            if (c == '/') last_slash = i_;
+        }
+        if (last_slash) |slash| {
+            new_parent = resolvePath(new_path[0..slash]) orelse {
+                resp.* = fx.IpcMessage.init(fx.R_ERROR);
+                return;
+            };
+            new_name = new_path[slash + 1 ..];
+        }
+    }
+
+    if (new_name.len == 0 or new_name.len > MAX_NAME) {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    }
+
+    // If target exists, remove it first (POSIX rename semantics)
+    if (resolvePath(new_path)) |existing| {
+        if (existing != inode_nr) {
+            // Remove the existing target's DIR_ENTRY
+            const existing_hash = fnvHash(new_name);
+            _ = btreeDelete(.{ .inode_nr = new_parent, .item_type = DIR_ENTRY, .offset = existing_hash });
+            // Free its data and inode
+            freeAllExtents(existing);
+            _ = btreeDelete(.{ .inode_nr = existing, .item_type = INODE_ITEM, .offset = 0 });
+        }
+    }
+
+    // Delete old DIR_ENTRY
+    const old_hash = fnvHash(old_name);
+    _ = btreeDelete(.{ .inode_nr = old_parent, .item_type = DIR_ENTRY, .offset = old_hash });
+
+    // Read inode to get file type for DIR_ENTRY
+    const inode = readInode(inode_nr) orelse {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    };
+
+    // Insert new DIR_ENTRY
+    const new_hash = fnvHash(new_name);
+    var dir_data: [266]u8 = undefined;
+    writeU64LE(dir_data[0..8], inode_nr);
+    dir_data[8] = if (isDirectory(inode)) DT_DIR else DT_REG;
+    dir_data[9] = @intCast(new_name.len);
+    @memcpy(dir_data[10..][0..new_name.len], new_name);
+    const dir_len: usize = 10 + new_name.len;
+
+    if (!btreeInsert(.{ .inode_nr = new_parent, .item_type = DIR_ENTRY, .offset = new_hash }, dir_data[0..dir_len])) {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    }
+
+    if (!commitTransaction()) {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    }
+
+    resp.* = fx.IpcMessage.init(fx.R_OK);
+    resp.data_len = 0;
+}
+
+fn handleTruncate(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
+    if (req.data_len < 12) {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    }
+
+    const handle_id = readU32LE(req.data[0..4]);
+    const new_size = readU64LE(req.data[4..12]);
+
+    const h = getHandle(handle_id) orelse {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    };
+
+    const inode = readInode(h.inode_nr) orelse {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    };
+
+    if (isDirectory(inode)) {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    }
+
+    if (new_size < inode.size) {
+        // Shrinking: free excess extent data
+        freeAllExtents(h.inode_nr);
+
+        if (new_size > 0 and new_size <= 3800) {
+            // Re-read data and store inline at new size
+            // (data was already freed, so this results in a zero-filled inline item)
+            var zero_buf: [3800]u8 = [_]u8{0} ** 3800;
+            if (!btreeInsert(.{ .inode_nr = h.inode_nr, .item_type = EXTENT_DATA, .offset = 0 }, zero_buf[0..@intCast(new_size)])) {
+                resp.* = fx.IpcMessage.init(fx.R_ERROR);
+                return;
+            }
+        }
+        // If new_size == 0, no EXTENT_DATA needed (empty file)
+    }
+
+    // Update inode size + mtime
+    var inode_data: [INODE_ITEM_SIZE]u8 = undefined;
+    writeU16LE(inode_data[0..2], inode.mode);
+    writeU16LE(inode_data[2..4], inode.uid);
+    writeU16LE(inode_data[4..6], inode.gid);
+    writeU16LE(inode_data[6..8], inode.nlinks);
+    writeU64LE(inode_data[8..16], new_size);
+    writeU64LE(inode_data[16..24], inode.atime);
+    writeU64LE(inode_data[24..32], getTime()); // mtime
+    writeU64LE(inode_data[32..40], inode.ctime);
+
+    if (!btreeUpdate(.{ .inode_nr = h.inode_nr, .item_type = INODE_ITEM, .offset = 0 }, &inode_data)) {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    }
+
+    // Reset write offset if needed
+    if (h.write_offset > new_size) {
+        h.write_offset = new_size;
+    }
+
+    if (!commitTransaction()) {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    }
+
+    resp.* = fx.IpcMessage.init(fx.R_OK);
+    resp.data_len = 0;
+}
+
 fn formatDisk() bool {
     // Probe disk size: try reading blocks to find total capacity
     // A 64MB disk = 16384 blocks. Try common sizes.
@@ -1548,7 +2484,7 @@ fn formatDisk() bool {
     writeU16LE(leaf_buf[data_offset + 6..][0..2], 2); // nlinks
     // size, atime, mtime, ctime all zero (already zeroed)
 
-    if (!writeBlock(root_block, &leaf_buf)) return false;
+    if (!writeTreeNode(root_block, &leaf_buf)) return false;
 
     // Write superblock
     var sb_buf_fmt: [BLOCK_SIZE]u8 = [_]u8{0} ** BLOCK_SIZE;
@@ -1607,6 +2543,8 @@ export fn _start() noreturn {
             fx.T_CLOSE => handleClose(&msg, &reply),
             fx.T_STAT => handleStat(&msg, &reply),
             fx.T_REMOVE => handleRemove(&msg, &reply),
+            fx.T_RENAME => handleRename(&msg, &reply),
+            fx.T_TRUNCATE => handleTruncate(&msg, &reply),
             else => {
                 reply = fx.IpcMessage.init(fx.R_ERROR);
             },

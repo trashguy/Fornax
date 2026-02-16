@@ -544,16 +544,87 @@ pub fn main() !void {
         }
     }
 
-    // Build leaf node from sorted items
-    var leaf = LeafBuilder.init(1); // generation 1
-    for (items.items) |item| {
-        try leaf.addItem(item.key, item.data);
-    }
+    // Build B-tree from sorted items — split across multiple leaves if needed
+    const LeafEntry = struct { first_key: Key, data: [BLOCK_SIZE]u8 };
+    var leaves: std.ArrayList(LeafEntry) = .empty;
 
-    // Finalize and write root leaf
-    const root_data = leaf.finalize();
-    try file.seekTo(partition_offset + root_block * BLOCK_SIZE);
-    try file.writeAll(&root_data);
+    var current_leaf = LeafBuilder.init(1);
+    var leaf_first_key: Key = items.items[0].key;
+
+    for (items.items) |item| {
+        current_leaf.addItem(item.key, item.data) catch {
+            // Leaf full — finalize and start a new one
+            try leaves.append(alloc, .{
+                .first_key = leaf_first_key,
+                .data = current_leaf.finalize(),
+            });
+            current_leaf = LeafBuilder.init(1);
+            leaf_first_key = item.key;
+            try current_leaf.addItem(item.key, item.data);
+        };
+    }
+    // Finalize last leaf
+    try leaves.append(alloc, .{
+        .first_key = leaf_first_key,
+        .data = current_leaf.finalize(),
+    });
+
+    if (leaves.items.len == 1) {
+        // Single leaf — write directly as root
+        try file.seekTo(partition_offset + root_block * BLOCK_SIZE);
+        try file.writeAll(&leaves.items[0].data);
+    } else {
+        // Multiple leaves — allocate blocks, write each, build internal root
+        const leaf_blocks = try alloc.alloc(u64, leaves.items.len);
+        for (leaf_blocks) |*lb| {
+            lb.* = next_free;
+            setBit(bitmap, next_free);
+            next_free += 1;
+            allocated += 1;
+        }
+
+        // Write leaf nodes
+        for (leaves.items, leaf_blocks) |leaf_entry, block| {
+            try file.seekTo(partition_offset + block * BLOCK_SIZE);
+            try file.writeAll(&leaf_entry.data);
+        }
+
+        // Build internal root node (level 1)
+        const num_keys: u16 = @intCast(leaves.items.len - 1);
+        var root_buf: [BLOCK_SIZE]u8 = [_]u8{0} ** BLOCK_SIZE;
+        root_buf[0] = 1; // level = 1 (internal)
+        writeU16LE(root_buf[1..3], num_keys);
+        root_buf[3] = 0; // pad
+        writeU64LE(root_buf[4..12], 1); // generation
+
+        // Keys: first key of each non-first leaf
+        for (1..leaves.items.len) |idx| {
+            const ki: u16 = @intCast(idx - 1);
+            const base = NODE_HEADER_SIZE + @as(usize, ki) * 17;
+            const key = leaves.items[idx].first_key;
+            writeU64LE(root_buf[base..][0..8], key.inode_nr);
+            root_buf[base + 8] = key.item_type;
+            writeU64LE(root_buf[base + 9..][0..8], key.offset);
+        }
+
+        // Children: block number of each leaf
+        const children_base = NODE_HEADER_SIZE + @as(usize, num_keys) * 17;
+        for (leaf_blocks, 0..) |block, idx| {
+            const child_offset = children_base + idx * 8;
+            writeU64LE(root_buf[child_offset..][0..8], block);
+        }
+
+        // Checksum
+        writeU32LE(root_buf[12..16], 0);
+        const cksum = crc32(&root_buf);
+        writeU32LE(root_buf[12..16], cksum);
+
+        // Write internal root node
+        try file.seekTo(partition_offset + root_block * BLOCK_SIZE);
+        try file.writeAll(&root_buf);
+
+        std.debug.print("  B-tree: {d} leaves, internal root at block {d}\n", .{ leaves.items.len, root_block });
+    }
 
     // Write bitmap
     try file.seekTo(partition_offset + bitmap_start * BLOCK_SIZE);
@@ -594,7 +665,7 @@ pub fn main() !void {
     std.debug.print("  data starts at block: {d}\n", .{data_start});
     std.debug.print("  root tree node: block {d}\n", .{root_block});
     std.debug.print("  free blocks: {d}\n", .{free_blocks});
-    std.debug.print("  leaf items: {d}\n", .{items.items.len});
+    std.debug.print("  leaf items: {d} ({d} leaves)\n", .{ items.items.len, leaves.items.len });
     std.debug.print("  files: {d}, dirs: {d}\n", .{
         add_entries.items.len + files_added,
         dir_inodes.count() - 1, // -1 for root

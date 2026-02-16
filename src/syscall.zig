@@ -16,6 +16,7 @@ const paging = switch (@import("builtin").cpu.arch) {
 const pmm = @import("pmm.zig");
 const mem = @import("mem.zig");
 const klog = @import("klog.zig");
+const timer = @import("timer.zig");
 
 pub const SYS = enum(u64) {
     open = 0,
@@ -44,6 +45,9 @@ pub const SYS = enum(u64) {
     sysinfo = 23,
     sleep = 24,
     shutdown = 25,
+    getpid = 26,
+    rename = 27,
+    truncate = 28,
 };
 
 /// Error return values.
@@ -63,6 +67,17 @@ fn writeU32LE(buf: *[4]u8, val: u32) void {
     buf[1] = @truncate(val >> 8);
     buf[2] = @truncate(val >> 16);
     buf[3] = @truncate(val >> 24);
+}
+
+fn writeU64LE(buf: *[8]u8, val: u64) void {
+    buf[0] = @truncate(val);
+    buf[1] = @truncate(val >> 8);
+    buf[2] = @truncate(val >> 16);
+    buf[3] = @truncate(val >> 24);
+    buf[4] = @truncate(val >> 32);
+    buf[5] = @truncate(val >> 40);
+    buf[6] = @truncate(val >> 48);
+    buf[7] = @truncate(val >> 56);
 }
 
 fn readU32LE(buf: *const [4]u8) u32 {
@@ -116,12 +131,7 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         .create => sysCreate(arg0, arg1, arg2),
         .stat => sysStat(arg0, arg1),
         .remove => sysRemove(arg0, arg1),
-        .seek => {
-            klog.warn("syscall: unimplemented nr=");
-            klog.warnDec(nr);
-            klog.warn("\n");
-            return ENOSYS;
-        },
+        .seek => sysSeek(arg0, arg1, arg2),
         .exec => sysExec(arg0, arg1),
         .wait => sysWait(arg0),
         .spawn => sysSpawn(arg0, arg1, arg2, arg3, arg4),
@@ -133,6 +143,9 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         .sysinfo => sysSysinfo(arg0),
         .sleep => sysSleep(arg0),
         .shutdown => sysShutdown(arg0),
+        .getpid => sysGetpid(),
+        .rename => sysRename(arg0, arg1, arg2, arg3),
+        .truncate => sysTruncate(arg0, arg1),
         .mount, .bind, .unmount, .rfork => {
             klog.warn("syscall: unimplemented nr=");
             klog.warnDec(nr);
@@ -232,6 +245,16 @@ fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
         }
 
         return 0;
+    }
+
+    // Proc fd: write "kill" to /proc/N/ctl
+    if (entry.fd_type == .proc) {
+        return procWrite(entry, buf_ptr, count);
+    }
+
+    // Virtual device fds: discard writes, return count
+    if (entry.fd_type == .dev_null or entry.fd_type == .dev_zero or entry.fd_type == .dev_random) {
+        return @min(count, 4096);
     }
 
     const chan = ipc.getChannel(entry.channel_id) orelse return EBADF;
@@ -441,6 +464,268 @@ fn sysWait(pid_arg: u64) u64 {
     process.scheduleNext();
 }
 
+// ---------- helpers ----------
+
+fn strEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (x != y) return false;
+    }
+    return true;
+}
+
+// ---------- /proc helpers ----------
+
+fn fmtDecimal(val: u64, buf: *[20]u8) []const u8 {
+    if (val == 0) {
+        buf[0] = '0';
+        return buf[0..1];
+    }
+    var n = val;
+    var i: usize = 0;
+    while (n > 0) : (i += 1) {
+        buf[i] = @intCast(n % 10 + '0');
+        n /= 10;
+    }
+    var lo: usize = 0;
+    var hi = i - 1;
+    while (lo < hi) {
+        const tmp = buf[lo];
+        buf[lo] = buf[hi];
+        buf[hi] = tmp;
+        lo += 1;
+        hi -= 1;
+    }
+    return buf[0..i];
+}
+
+/// Append a "key value\n" line to buf, return new position.
+fn appendKV(buf: []u8, pos: usize, key: []const u8, val: u64) usize {
+    var p = pos;
+    if (p + key.len >= buf.len) return p;
+    @memcpy(buf[p..][0..key.len], key);
+    p += key.len;
+    if (p >= buf.len) return p;
+    buf[p] = ' ';
+    p += 1;
+    var dec_buf: [20]u8 = undefined;
+    const dec = fmtDecimal(val, &dec_buf);
+    if (p + dec.len >= buf.len) return p;
+    @memcpy(buf[p..][0..dec.len], dec);
+    p += dec.len;
+    if (p >= buf.len) return p;
+    buf[p] = '\n';
+    p += 1;
+    return p;
+}
+
+const ProcDirEntry = extern struct {
+    name: [64]u8,
+    file_type: u32,
+    size: u32,
+};
+
+var proc_dir_buf: [65 * @sizeOf(ProcDirEntry)]u8 linksection(".bss") = undefined;
+
+fn procRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
+    const dest: [*]u8 = @ptrFromInt(buf_ptr);
+    const max_bytes: usize = @intCast(@min(count, 4096));
+
+    switch (entry_ptr.proc_kind) {
+        .dir => {
+            // List active PIDs + meminfo as ProcDirEntry structs
+            const procs = process.getProcessTable();
+            var pos: usize = 0;
+
+            for (procs) |*p| {
+                if (p.state == .free or p.state == .dead) continue;
+                if (pos + @sizeOf(ProcDirEntry) > proc_dir_buf.len) break;
+
+                var de: ProcDirEntry = .{ .name = [_]u8{0} ** 64, .file_type = 1, .size = 0 };
+                var dec_buf: [20]u8 = undefined;
+                const pid_str = fmtDecimal(p.pid, &dec_buf);
+                @memcpy(de.name[0..pid_str.len], pid_str);
+
+                const de_bytes: *const [@sizeOf(ProcDirEntry)]u8 = @ptrCast(&de);
+                @memcpy(proc_dir_buf[pos..][0..@sizeOf(ProcDirEntry)], de_bytes);
+                pos += @sizeOf(ProcDirEntry);
+            }
+
+            // Add "meminfo" entry
+            if (pos + @sizeOf(ProcDirEntry) <= proc_dir_buf.len) {
+                var de_mi: ProcDirEntry = .{ .name = [_]u8{0} ** 64, .file_type = 0, .size = 0 };
+                @memcpy(de_mi.name[0..7], "meminfo");
+                const mi_bytes: *const [@sizeOf(ProcDirEntry)]u8 = @ptrCast(&de_mi);
+                @memcpy(proc_dir_buf[pos..][0..@sizeOf(ProcDirEntry)], mi_bytes);
+                pos += @sizeOf(ProcDirEntry);
+            }
+
+            // Apply read offset
+            const offset: usize = entry_ptr.read_offset;
+            if (offset >= pos) return 0;
+            const available = pos - offset;
+            const to_copy = @min(available, max_bytes);
+            @memcpy(dest[0..to_copy], proc_dir_buf[offset..][0..to_copy]);
+            entry_ptr.read_offset += @intCast(to_copy);
+            return to_copy;
+        },
+        .pid_dir => {
+            // List "status" and "ctl" as ProcDirEntry structs
+            var tmp_buf: [2 * @sizeOf(ProcDirEntry)]u8 = undefined;
+            var pos: usize = 0;
+
+            // "status" entry
+            var de_status: ProcDirEntry = .{ .name = [_]u8{0} ** 64, .file_type = 0, .size = 0 };
+            @memcpy(de_status.name[0..6], "status");
+            const s_bytes: *const [@sizeOf(ProcDirEntry)]u8 = @ptrCast(&de_status);
+            @memcpy(tmp_buf[pos..][0..@sizeOf(ProcDirEntry)], s_bytes);
+            pos += @sizeOf(ProcDirEntry);
+
+            // "ctl" entry
+            var de_ctl: ProcDirEntry = .{ .name = [_]u8{0} ** 64, .file_type = 0, .size = 0 };
+            @memcpy(de_ctl.name[0..3], "ctl");
+            const c_bytes: *const [@sizeOf(ProcDirEntry)]u8 = @ptrCast(&de_ctl);
+            @memcpy(tmp_buf[pos..][0..@sizeOf(ProcDirEntry)], c_bytes);
+            pos += @sizeOf(ProcDirEntry);
+
+            const offset: usize = entry_ptr.read_offset;
+            if (offset >= pos) return 0;
+            const available = pos - offset;
+            const to_copy = @min(available, max_bytes);
+            @memcpy(dest[0..to_copy], tmp_buf[offset..][0..to_copy]);
+            entry_ptr.read_offset += @intCast(to_copy);
+            return to_copy;
+        },
+        .status => {
+            const target = process.getByPid(entry_ptr.proc_pid) orelse return 0;
+            var text_buf: [256]u8 = undefined;
+            var pos: usize = 0;
+
+            pos = appendKV(&text_buf, pos, "pid", target.pid);
+            pos = appendKV(&text_buf, pos, "ppid", target.parent_pid orelse 0);
+
+            // State as text
+            const state_str = switch (target.state) {
+                .free => "free",
+                .running => "running",
+                .ready => "ready",
+                .blocked => "blocked",
+                .zombie => "zombie",
+                .dead => "dead",
+            };
+            if (pos + 6 + state_str.len + 1 <= text_buf.len) {
+                @memcpy(text_buf[pos..][0..6], "state ");
+                pos += 6;
+                @memcpy(text_buf[pos..][0..state_str.len], state_str);
+                pos += state_str.len;
+                text_buf[pos] = '\n';
+                pos += 1;
+            }
+
+            pos = appendKV(&text_buf, pos, "pages", target.pages_used);
+
+            const offset: usize = entry_ptr.read_offset;
+            if (offset >= pos) return 0;
+            const available = pos - offset;
+            const to_copy = @min(available, max_bytes);
+            @memcpy(dest[0..to_copy], text_buf[offset..][0..to_copy]);
+            entry_ptr.read_offset += @intCast(to_copy);
+            return to_copy;
+        },
+        .ctl => {
+            return 0; // ctl is write-only
+        },
+        .meminfo => {
+            var text_buf: [128]u8 = undefined;
+            var pos: usize = 0;
+
+            pos = appendKV(&text_buf, pos, "total_pages", pmm.getTotalPages());
+            pos = appendKV(&text_buf, pos, "free_pages", pmm.getFreePages());
+            pos = appendKV(&text_buf, pos, "page_size", 4096);
+
+            const offset: usize = entry_ptr.read_offset;
+            if (offset >= pos) return 0;
+            const available = pos - offset;
+            const to_copy = @min(available, max_bytes);
+            @memcpy(dest[0..to_copy], text_buf[offset..][0..to_copy]);
+            entry_ptr.read_offset += @intCast(to_copy);
+            return to_copy;
+        },
+    }
+}
+
+// ---------- /dev/random PRNG ----------
+
+var dev_random_state: u64 = 0x853c49e6748fea9b; // xorshift64 seed
+
+fn devRandomFill(buf: []u8) void {
+    var state = dev_random_state;
+    // Seed from timer ticks on first call for some entropy
+    if (state == 0x853c49e6748fea9b) {
+        state ^= timer.getTicks();
+        if (state == 0) state = 0x853c49e6748fea9b;
+    }
+    var i: usize = 0;
+    while (i < buf.len) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        const bytes = @as([8]u8, @bitCast(state));
+        const remaining = buf.len - i;
+        const n = @min(remaining, 8);
+        @memcpy(buf[i..][0..n], bytes[0..n]);
+        i += n;
+    }
+    dev_random_state = state;
+}
+
+fn procWrite(entry: process.FdEntry, buf_ptr: u64, count: u64) u64 {
+    if (entry.proc_kind != .ctl) return EBADF;
+
+    const buf: [*]const u8 = @ptrFromInt(buf_ptr);
+    const len: usize = @intCast(@min(count, 64));
+
+    // Strip trailing whitespace/newline
+    var cmd_len = len;
+    while (cmd_len > 0 and (buf[cmd_len - 1] == '\n' or buf[cmd_len - 1] == ' ')) {
+        cmd_len -= 1;
+    }
+
+    // "kill" — terminate the target process
+    if (cmd_len == 4 and buf[0] == 'k' and buf[1] == 'i' and buf[2] == 'l' and buf[3] == 'l') {
+        const target = process.getByPid(entry.proc_pid) orelse return ENOENT;
+        if (target.state == .free or target.state == .dead) return ENOENT;
+
+        target.exit_status = 137; // killed
+
+        // Kill children first
+        process.killChildren(target.pid);
+
+        // Wake parent if waiting
+        if (target.parent_pid) |ppid| {
+            if (process.getByPid(ppid)) |parent| {
+                if (parent.state == .blocked) {
+                    if (parent.waiting_for_pid) |wait_pid| {
+                        if (wait_pid == target.pid or wait_pid == 0) {
+                            parent.syscall_ret = target.exit_status;
+                            parent.state = .ready;
+                            parent.waiting_for_pid = null;
+                            target.state = .free;
+                            target.parent_pid = null;
+                            return len;
+                        }
+                    }
+                }
+            }
+        }
+
+        target.state = .zombie;
+        return len;
+    }
+
+    return EINVAL;
+}
+
 /// open(path_ptr, path_len) → fd
 /// Resolves path in the process's namespace. For kernel-backed channels (initrd),
 /// allocates fd directly. For server channels, sends T_OPEN and blocks for reply.
@@ -462,6 +747,21 @@ fn sysOpen(path_ptr: u64, path_len: u64) u64 {
         const virtio_blk = @import("virtio_blk.zig");
         if (!virtio_blk.isInitialized()) return ENOENT;
         return proc.allocBlkFd() orelse return EMFILE;
+    }
+
+    // Intercept /dev/null, /dev/zero, /dev/random
+    if (path_len >= 9 and path_slice[0] == '/' and path_slice[1] == 'd' and
+        path_slice[2] == 'e' and path_slice[3] == 'v' and path_slice[4] == '/')
+    {
+        if (strEql(path_slice, "/dev/null")) {
+            return proc.allocDevFd(.dev_null) orelse return EMFILE;
+        }
+        if (strEql(path_slice, "/dev/zero")) {
+            return proc.allocDevFd(.dev_zero) orelse return EMFILE;
+        }
+        if (strEql(path_slice, "/dev/random")) {
+            return proc.allocDevFd(.dev_random) orelse return EMFILE;
+        }
     }
 
     // Intercept /net/* paths for kernel TCP/DNS
@@ -486,6 +786,63 @@ fn sysOpen(path_ptr: u64, path_len: u64) u64 {
         }
 
         return fd;
+    }
+
+    // Intercept /proc/* paths for kernel process info
+    if (path_len >= 5 and path_slice[0] == '/' and path_slice[1] == 'p' and
+        path_slice[2] == 'r' and path_slice[3] == 'o' and path_slice[4] == 'c')
+    {
+        // "/proc" — directory listing of PIDs
+        if (path_len == 5) {
+            return proc.allocProcFd(.dir, 0) orelse return EMFILE;
+        }
+
+        // Must have "/" after "/proc"
+        if (path_slice[5] != '/') return ENOENT;
+
+        const suffix = path_slice[6..];
+
+        // "/proc/meminfo"
+        if (suffix.len == 7 and suffix[0] == 'm' and suffix[1] == 'e' and
+            suffix[2] == 'm' and suffix[3] == 'i' and suffix[4] == 'n' and
+            suffix[5] == 'f' and suffix[6] == 'o')
+        {
+            return proc.allocProcFd(.meminfo, 0) orelse return EMFILE;
+        }
+
+        // Parse PID: digits until '/' or end
+        var pid: u32 = 0;
+        var i: usize = 0;
+        while (i < suffix.len and suffix[i] >= '0' and suffix[i] <= '9') : (i += 1) {
+            pid = pid * 10 + (suffix[i] - '0');
+        }
+        if (i == 0) return ENOENT;
+
+        // Verify PID exists
+        if (process.getByPid(pid) == null) return ENOENT;
+
+        // "/proc/N" — per-pid directory
+        if (i == suffix.len) {
+            return proc.allocProcFd(.pid_dir, pid) orelse return EMFILE;
+        }
+
+        // Must have "/" after PID
+        if (suffix[i] != '/') return ENOENT;
+        const file = suffix[i + 1 ..];
+
+        // "/proc/N/status"
+        if (file.len == 6 and file[0] == 's' and file[1] == 't' and
+            file[2] == 'a' and file[3] == 't' and file[4] == 'u' and file[5] == 's')
+        {
+            return proc.allocProcFd(.status, pid) orelse return EMFILE;
+        }
+
+        // "/proc/N/ctl"
+        if (file.len == 3 and file[0] == 'c' and file[1] == 't' and file[2] == 'l') {
+            return proc.allocProcFd(.ctl, pid) orelse return EMFILE;
+        }
+
+        return ENOENT;
     }
 
     const resolved = proc.ns.resolve(path_slice) orelse return ENOENT;
@@ -644,6 +1001,26 @@ fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
         process.scheduleNext();
     }
 
+    // Proc fd: kernel-generated process info
+    if (entry_ptr.fd_type == .proc) {
+        return procRead(entry_ptr, buf_ptr, count);
+    }
+
+    // Virtual device fds
+    if (entry_ptr.fd_type == .dev_null) return 0; // EOF
+    if (entry_ptr.fd_type == .dev_zero) {
+        const dest: [*]u8 = @ptrFromInt(buf_ptr);
+        const n = @min(count, 4096);
+        @memset(dest[0..n], 0);
+        return n;
+    }
+    if (entry_ptr.fd_type == .dev_random) {
+        const dest: [*]u8 = @ptrFromInt(buf_ptr);
+        const n = @min(count, 4096);
+        devRandomFill(dest[0..n]);
+        return n;
+    }
+
     const chan = ipc.getChannel(entry_ptr.channel_id) orelse return EBADF;
 
     // Kernel-backed channel (initrd file server): serve directly, no IPC
@@ -792,15 +1169,15 @@ fn sysSysinfo(info_ptr: u64) u64 {
     if (info_ptr >= 0x0000_8000_0000_0000) return EFAULT;
     if (info_ptr % 8 != 0) return EFAULT;
 
-    const ptr: *[3]u64 = @ptrFromInt(info_ptr);
+    const ptr: *[4]u64 = @ptrFromInt(info_ptr);
     ptr[0] = pmm.getTotalPages();
     ptr[1] = pmm.getFreePages();
     ptr[2] = 4096;
+    ptr[3] = timer.getTicks() / timer.TICKS_PER_SEC;
     return 0;
 }
 
 fn sysSleep(ms: u64) u64 {
-    const timer = @import("timer.zig");
     const proc = process.getCurrent() orelse return EFAULT;
 
     // At least 1 tick, even for small ms values
@@ -826,6 +1203,23 @@ fn sysShutdown(flags: u64) noreturn {
     }
 }
 
+fn sysSeek(fd: u64, offset: u64, whence: u64) u64 {
+    const proc = process.getCurrent() orelse return ENOSYS;
+    const entry_ptr = proc.getFdEntryPtr(@intCast(fd)) orelse return EBADF;
+
+    switch (whence) {
+        0 => entry_ptr.read_offset = @intCast(offset), // SEEK_SET
+        1 => entry_ptr.read_offset +|= @intCast(offset), // SEEK_CUR
+        else => return ENOSYS,
+    }
+    return entry_ptr.read_offset;
+}
+
+fn sysGetpid() u64 {
+    const proc = process.getCurrent() orelse return ENOSYS;
+    return proc.pid;
+}
+
 /// close(fd) → 0 or error
 fn sysClose(fd: u64) u64 {
     const proc = process.getCurrent() orelse return EBADF;
@@ -849,6 +1243,18 @@ fn sysClose(fd: u64) u64 {
     if (entry.fd_type == .net) {
         const net = @import("net.zig");
         net.netfs.netClose(entry.net_kind, entry.net_conn);
+        proc.closeFd(@intCast(fd));
+        return 0;
+    }
+
+    // Proc fd: no cleanup needed, just close
+    if (entry.fd_type == .proc) {
+        proc.closeFd(@intCast(fd));
+        return 0;
+    }
+
+    // Virtual device fds: no cleanup, just close
+    if (entry.fd_type == .dev_null or entry.fd_type == .dev_zero or entry.fd_type == .dev_random) {
         proc.closeFd(@intCast(fd));
         return 0;
     }
@@ -927,6 +1333,24 @@ fn sysStat(fd: u64, stat_buf_ptr: u64) u64 {
         return 0;
     }
 
+    // Proc fds: synthetic stat
+    if (entry.fd_type == .proc) {
+        const stat_ptr: *align(1) [64]u8 = @ptrFromInt(stat_buf_ptr);
+        @memset(stat_ptr, 0);
+        // file_type at offset 4: 1=directory for dir/pid_dir, 0=file otherwise
+        if (entry.proc_kind == .dir or entry.proc_kind == .pid_dir) {
+            writeU32LE(@ptrCast(stat_ptr[4..8]), 1);
+        }
+        return 0;
+    }
+
+    // Virtual device fds: synthetic stat (size=0, type=file)
+    if (entry.fd_type == .dev_null or entry.fd_type == .dev_zero or entry.fd_type == .dev_random) {
+        const stat_ptr: *align(1) [64]u8 = @ptrFromInt(stat_buf_ptr);
+        @memset(stat_ptr, 0);
+        return 0;
+    }
+
     const chan = ipc.getChannel(entry.channel_id) orelse return EBADF;
 
     // Kernel-backed channel (initrd): stat from kernel data length
@@ -986,6 +1410,76 @@ fn sysRemove(path_ptr: u64, path_len: u64) u64 {
 
     proc.pending_op = .remove;
     proc.pending_fd = 0;
+    proc.syscall_ret = 0;
+
+    sendToServer(chan, proc);
+    proc.state = .blocked;
+    process.scheduleNext();
+}
+
+/// rename(old_path_ptr, old_path_len, new_path_ptr, new_path_len) → 0 or negative error.
+/// Resolves both paths, verifies same server, sends T_RENAME.
+fn sysRename(old_ptr: u64, old_len: u64, new_ptr: u64, new_len: u64) u64 {
+    const proc = process.getCurrent() orelse return ENOSYS;
+    if (old_ptr >= 0x0000_8000_0000_0000 or new_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+    if (old_len == 0 or old_len > 256 or new_len == 0 or new_len > 256) return ENOENT;
+
+    const old_path: [*]const u8 = @ptrFromInt(old_ptr);
+    const new_path: [*]const u8 = @ptrFromInt(new_ptr);
+
+    const old_resolved = proc.ns.resolve(old_path[0..@intCast(old_len)]) orelse return ENOENT;
+    const new_resolved = proc.ns.resolve(new_path[0..@intCast(new_len)]) orelse return ENOENT;
+
+    // Both paths must be on the same server
+    if (old_resolved.channel_id != new_resolved.channel_id) return ENOSYS;
+
+    const chan = ipc.getChannel(old_resolved.channel_id) orelse return ENOENT;
+    if (chan.kernel_data != null) return ENOSYS;
+
+    // Build T_RENAME: old_suffix \0 new_suffix
+    proc.ipc_msg = ipc.Message.init(.t_rename);
+    const old_suffix = old_resolved.suffix;
+    const new_suffix = new_resolved.suffix;
+    const old_slen: u32 = @intCast(old_suffix.len);
+    const new_slen: u32 = @intCast(new_suffix.len);
+    const total: u32 = old_slen + 1 + new_slen;
+    if (total > ipc.MAX_MSG_DATA) return ENOENT;
+
+    if (old_slen > 0) {
+        @memcpy(proc.ipc_msg.data_buf[0..old_slen], old_suffix);
+    }
+    proc.ipc_msg.data_buf[old_slen] = 0; // separator
+    if (new_slen > 0) {
+        @memcpy(proc.ipc_msg.data_buf[old_slen + 1 ..][0..new_slen], new_suffix);
+    }
+    proc.ipc_msg.data_len = total;
+
+    proc.pending_op = .rename;
+    proc.pending_fd = 0;
+    proc.syscall_ret = 0;
+
+    sendToServer(chan, proc);
+    proc.state = .blocked;
+    process.scheduleNext();
+}
+
+/// truncate(fd, new_size) → 0 or negative error.
+/// Sends T_TRUNCATE to the server with handle + new size.
+fn sysTruncate(fd: u64, new_size: u64) u64 {
+    const proc = process.getCurrent() orelse return ENOSYS;
+    const entry = proc.getFdEntry(@intCast(fd)) orelse return EBADF;
+
+    const chan = ipc.getChannel(entry.channel_id) orelse return EBADF;
+    if (entry.server_handle == 0) return ENOSYS;
+
+    // Build T_TRUNCATE: [handle: u32][new_size: u64]
+    proc.ipc_msg = ipc.Message.init(.t_truncate);
+    writeU32LE(proc.ipc_msg.data_buf[0..4], entry.server_handle);
+    writeU64LE(proc.ipc_msg.data_buf[4..12], new_size);
+    proc.ipc_msg.data_len = 12;
+
+    proc.pending_op = .truncate;
+    proc.pending_fd = @intCast(fd);
     proc.syscall_ret = 0;
 
     sendToServer(chan, proc);
@@ -1111,8 +1605,11 @@ fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
                 client_proc.ipc_recv_buf_ptr = 0;
             }
         },
-        .remove => {
+        .remove, .rename => {
             client_proc.syscall_ret = if (is_ok) 0 else ENOENT;
+        },
+        .truncate => {
+            client_proc.syscall_ret = if (is_ok) 0 else EIO;
         },
         .console_read, .net_read, .net_connect, .net_listen, .dns_query, .icmp_read, .pipe_read, .pipe_write, .sleep => {
             // These don't go through IPC — should not happen here

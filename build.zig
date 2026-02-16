@@ -336,6 +336,188 @@ pub fn build(b: *std.Build) void {
     });
     reboot_bin.image_base = user_image_base;
 
+    const ps_bin = b.addExecutable(.{
+        .name = "ps",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/ps/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    ps_bin.image_base = user_image_base;
+
+    const kill_bin = b.addExecutable(.{
+        .name = "kill",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/kill/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    kill_bin.image_base = user_image_base;
+
+    const du_bin = b.addExecutable(.{
+        .name = "du",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/du/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    du_bin.image_base = user_image_base;
+
+    const top_bin = b.addExecutable(.{
+        .name = "top",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/top/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    top_bin.image_base = user_image_base;
+
+    const cp_bin = b.addExecutable(.{
+        .name = "cp",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/cp/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    cp_bin.image_base = user_image_base;
+
+    const mv_bin = b.addExecutable(.{
+        .name = "mv",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/mv/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    mv_bin.image_base = user_image_base;
+
+const touch_bin = b.addExecutable(.{
+        .name = "touch",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/touch/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    touch_bin.image_base = user_image_base;
+
+    const truncate_bin = b.addExecutable(.{
+        .name = "truncate",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/truncate/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    truncate_bin.image_base = user_image_base;
+
+    const dd_bin = b.addExecutable(.{
+        .name = "dd",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/dd/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    dd_bin.image_base = user_image_base;
+
+    const grep_bin = b.addExecutable(.{
+        .name = "grep",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/grep/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    grep_bin.image_base = user_image_base;
+
+    const sed_bin = b.addExecutable(.{
+        .name = "sed",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/sed/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    sed_bin.image_base = user_image_base;
+
+    const awk_bin = b.addExecutable(.{
+        .name = "awk",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/awk/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    awk_bin.image_base = user_image_base;
+
+    const less_bin = b.addExecutable(.{
+        .name = "less",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/less/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    less_bin.image_base = user_image_base;
+
+    const fe_bin = b.addExecutable(.{
+        .name = "fe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/fe/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    fe_bin.image_base = user_image_base;
+
     const fxfs_bin = b.addExecutable(.{
         .name = "fxfs",
         .root_module = b.createModule(.{
@@ -406,6 +588,10 @@ pub fn build(b: *std.Build) void {
         rm_bin,   mkdir_bin,   wc_bin,   lsblk_bin,
         df_bin,   dmesg_bin,   head_bin, tail_bin, tree_bin, free_bin, ping_bin, hello_bin,
         tcptest_bin, dnstest_bin, shutdown_bin, reboot_bin,
+        ps_bin, kill_bin, du_bin, top_bin,
+        cp_bin, mv_bin, touch_bin, truncate_bin, dd_bin,
+        grep_bin, sed_bin, awk_bin, less_bin,
+        fe_bin,
     };
     for (disk_programs) |prog| {
         const install = b.addInstallArtifact(prog, .{
@@ -498,13 +684,27 @@ pub fn build(b: *std.Build) void {
         .{ "dnstest", "cmd/dnstest/main.zig" },
         .{ "shutdown", "cmd/shutdown/main.zig" },
         .{ "reboot", "cmd/reboot/main.zig" },
+        .{ "ps", "cmd/ps/main.zig" },
+        .{ "kill", "cmd/kill/main.zig" },
+        .{ "du", "cmd/du/main.zig" },
+        .{ "top", "cmd/top/main.zig" },
+        .{ "cp", "cmd/cp/main.zig" },
+        .{ "mv", "cmd/mv/main.zig" },
+        .{ "touch", "cmd/touch/main.zig" },
+        .{ "truncate", "cmd/truncate/main.zig" },
+        .{ "dd", "cmd/dd/main.zig" },
+        .{ "grep", "cmd/grep/main.zig" },
+        .{ "sed", "cmd/sed/main.zig" },
+        .{ "awk", "cmd/awk/main.zig" },
+        .{ "less", "cmd/less/main.zig" },
+        .{ "fe", "cmd/fe/main.zig" },
         .{ "fxfs", "srv/fxfs/main.zig" },
         .{ "partfs", "srv/partfs/main.zig" },
     };
 
     // Build riscv64 initrd programs (init, partfs, fxfs)
     var rv_initrd_bins: [3]*std.Build.Step.Compile = undefined;
-    var rv_disk_bin_buf: [32]*std.Build.Step.Compile = undefined;
+    var rv_disk_bin_buf: [48]*std.Build.Step.Compile = undefined;
     var rv_disk_bin_count: usize = 0;
 
     inline for (rv_user_programs) |prog_info| {

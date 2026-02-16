@@ -24,6 +24,9 @@
 | 100 | TCP (full connection lifecycle, `/net/tcp` file interface) |
 | 101 | DNS resolver (`/net/dns` file server) |
 | — | Pipes, core utilities (echo, cat, ls, rm, mkdir, wc), shell enhancements |
+| 200 | Kernel `/proc` file tree (process info, meminfo, kill via ctl) |
+| 201 | `seek` + `getpid` syscalls |
+| 204 | Process & system management (ps, kill, du, top) |
 
 ## Milestones Reached
 

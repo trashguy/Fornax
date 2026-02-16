@@ -304,6 +304,23 @@ fn handleRead(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
                 entries_written += 1;
             }
 
+            // Virtual device entries: null, zero, random
+            const vdevs = [_][]const u8{ "null", "zero", "random" };
+            for (vdevs, 0..) |vname, vi| {
+                const entry_idx: u32 = 1 + part_count + @as(u32, @intCast(vi));
+                if (entry_idx < skip) continue;
+                if (entries_written >= max_entries) break;
+                if (written + entry_size > 4096) break;
+
+                const dest: *fx.DirEntry = @ptrCast(@alignCast(resp.data[written..][0..entry_size]));
+                @memset(&dest.name, 0);
+                @memcpy(dest.name[0..vname.len], vname);
+                dest.file_type = 0;
+                dest.size = 0;
+                written += entry_size;
+                entries_written += 1;
+            }
+
             resp.data_len = written;
         },
         .disk => {

@@ -41,6 +41,10 @@ pub const sysinfo = syscall.sysinfo;
 pub const sleep = syscall.sleep;
 pub const shutdown = syscall.shutdown;
 pub const reboot = syscall.reboot;
+pub const seek = syscall.seek;
+pub const getpid = syscall.getpid;
+pub const rename = syscall.rename;
+pub const truncate = syscall.truncate;
 
 // Re-export IPC types at top level.
 pub const IpcMessage = ipc.IpcMessage;
@@ -57,6 +61,8 @@ pub const T_CREATE = ipc.T_CREATE;
 pub const T_REMOVE = ipc.T_REMOVE;
 pub const R_OK = ipc.R_OK;
 pub const R_ERROR = ipc.R_ERROR;
+pub const T_RENAME = ipc.T_RENAME;
+pub const T_TRUNCATE = ipc.T_TRUNCATE;
 
 // Re-export argv helpers at top level.
 pub const ARGV_BASE = syscall.ARGV_BASE;
