@@ -4,7 +4,11 @@
 /// and device_cfg MMIO structures. Used for virtio-input which is modern-only.
 
 const klog = @import("klog.zig");
-const pci = @import("arch/x86_64/pci.zig");
+const pci = switch (@import("builtin").cpu.arch) {
+    .x86_64 => @import("arch/x86_64/pci.zig"),
+    .riscv64 => @import("arch/riscv64/pci.zig"),
+    else => @compileError("unsupported architecture"),
+};
 const pmm = @import("pmm.zig");
 const virtio = @import("virtio.zig");
 

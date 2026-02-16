@@ -11,6 +11,7 @@ const virtio = @import("virtio.zig");
 
 const pci = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/pci.zig"),
+    .riscv64 => @import("arch/riscv64/pci.zig"),
     else => struct {
         pub const PciDevice = struct {};
     },
@@ -18,6 +19,7 @@ const pci = switch (@import("builtin").cpu.arch) {
 
 const cpu = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/cpu.zig"),
+    .riscv64 => @import("arch/riscv64/cpu.zig"),
     else => struct {
         pub fn inb(_: u16) u8 {
             return 0;
@@ -57,7 +59,7 @@ var blk_dev: BlkDevice = .{
 
 /// Initialize the virtio-blk device.
 pub fn init() bool {
-    if (@import("builtin").cpu.arch != .x86_64) return false;
+    if (@import("builtin").cpu.arch != .x86_64 and @import("builtin").cpu.arch != .riscv64) return false;
 
     const pci_dev = pci.findVirtioBlk() orelse {
         klog.debug("virtio-blk: no device found\n");
@@ -85,10 +87,25 @@ pub fn init() bool {
         return false;
     }
 
-    // Read capacity from device config at io_base + 0x14 (u64 LE, sector count)
-    const io_base = pci_dev.ioBase().?;
-    const cap_lo: u64 = cpu.inl(io_base + 0x14);
-    const cap_hi: u64 = cpu.inl(io_base + 0x18);
+    // Read capacity from device config at BAR + 0x14 (u64 LE, sector count)
+    const cap_lo: u64 = blk: {
+        if (comptime @import("builtin").cpu.arch == .riscv64) {
+            const mmio_base = virtio.getMmioBase();
+            break :blk cpu.mmioRead32(mmio_base + 0x14);
+        } else {
+            const io_base = pci_dev.ioBase().?;
+            break :blk cpu.inl(io_base + 0x14);
+        }
+    };
+    const cap_hi: u64 = blk: {
+        if (comptime @import("builtin").cpu.arch == .riscv64) {
+            const mmio_base = virtio.getMmioBase();
+            break :blk cpu.mmioRead32(mmio_base + 0x18);
+        } else {
+            const io_base = pci_dev.ioBase().?;
+            break :blk cpu.inl(io_base + 0x18);
+        }
+    };
     blk_dev.capacity = cap_lo | (cap_hi << 32);
 
     blk_dev.dev = dev;
@@ -165,7 +182,7 @@ pub fn readBlock(block: u64, buf: *[4096]u8) bool {
             pmm.freePage(req_phys);
             return false;
         }
-        asm volatile ("pause");
+        cpu.spinHint();
     }
 
     // Reclaim descriptors — synchronous polling means no other requests
@@ -247,7 +264,7 @@ pub fn writeBlock(block: u64, buf: *const [4096]u8) bool {
             pmm.freePage(req_phys);
             return false;
         }
-        asm volatile ("pause");
+        cpu.spinHint();
     }
 
     const status = req_ptr[16];

@@ -1,5 +1,5 @@
 const std = @import("std");
-const uefi = std.os.uefi;
+const builtin = @import("builtin");
 const boot = @import("boot.zig");
 const klog = @import("klog.zig");
 
@@ -9,6 +9,7 @@ var bitmap: [*]u8 = undefined;
 var bitmap_size: usize = 0; // in bytes
 var total_pages: usize = 0;
 var free_pages: usize = 0;
+var search_hint: usize = 0;
 var usable_pages: usize = 0;
 var initialized: bool = false;
 
@@ -97,12 +98,61 @@ pub fn init(memory_map: boot.MemoryMap) PmmError!void {
     klog.info(" MB)\n");
 }
 
+/// Initialize PMM from a flat physical memory range (for freestanding targets).
+/// `ram_base` / `ram_size`: total RAM region.
+/// `reserved_end`: everything below this address is reserved (firmware + kernel + initrd).
+/// The bitmap is placed at `reserved_end`, free memory starts after it.
+pub fn initDirect(ram_base: u64, ram_size: u64, reserved_end: u64) void {
+    const ram_end = ram_base + ram_size;
+
+    total_pages = @intCast(ram_end / page_size);
+    bitmap_size = (total_pages + 7) / 8;
+
+    // Place bitmap right after reserved area
+    const bitmap_phys = (reserved_end + page_size - 1) & ~@as(u64, page_size - 1);
+    bitmap = @ptrFromInt(bitmap_phys);
+
+    // Mark everything as used
+    @memset(bitmap[0..bitmap_size], 0xFF);
+
+    // Mark free region (after bitmap) as free
+    const bitmap_pages = (bitmap_size + page_size - 1) / page_size;
+    const free_start = bitmap_phys + bitmap_pages * page_size;
+    const free_start_page: usize = @intCast(free_start / page_size);
+    const end_page: usize = @intCast(ram_end / page_size);
+
+    for (free_start_page..end_page) |page| {
+        markFree(page);
+    }
+
+    // Count free pages
+    free_pages = 0;
+    for (0..total_pages) |page| {
+        if (isFree(page)) {
+            free_pages += 1;
+        }
+    }
+
+    usable_pages = free_pages;
+    initialized = true;
+
+    klog.info("PMM: ");
+    klog.infoDec(free_pages);
+    klog.info(" free pages (");
+    klog.infoDec(free_pages * page_size / (1024 * 1024));
+    klog.info(" MB)\n");
+}
+
 pub fn allocPage() ?usize {
     if (!initialized) return null;
-    for (0..total_pages) |page| {
+    // Start scanning from where we last found a free page (avoids O(n) rescan)
+    var checked: usize = 0;
+    while (checked < total_pages) : (checked += 1) {
+        const page = (search_hint + checked) % total_pages;
         if (isFree(page)) {
             markUsed(page);
             free_pages -= 1;
+            search_hint = page + 1;
             return page * page_size;
         }
     }

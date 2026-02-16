@@ -5,13 +5,21 @@
 /// from the event queue (queue 0).
 
 const klog = @import("klog.zig");
-const pci = @import("arch/x86_64/pci.zig");
+const pci = switch (@import("builtin").cpu.arch) {
+    .x86_64 => @import("arch/x86_64/pci.zig"),
+    .riscv64 => @import("arch/riscv64/pci.zig"),
+    else => @compileError("unsupported architecture"),
+};
 const virtio = @import("virtio.zig");
 const virtio_modern = @import("virtio_modern.zig");
 const pic = @import("pic.zig");
 const keyboard = @import("keyboard.zig");
 
-const interrupts = @import("arch/x86_64/interrupts.zig");
+const interrupts = switch (@import("builtin").cpu.arch) {
+    .x86_64 => @import("arch/x86_64/interrupts.zig"),
+    .riscv64 => @import("arch/riscv64/interrupts.zig"),
+    else => @compileError("unsupported architecture"),
+};
 
 /// Virtio-input event structure (8 bytes, matches Linux input_event for virtio).
 const VirtioInputEvent = extern struct {

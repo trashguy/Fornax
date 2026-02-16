@@ -145,6 +145,14 @@ fn pathEqual(a: []const u8, b: []const u8) bool {
 }
 
 fn isPrefix(prefix: []const u8, path: []const u8) bool {
+    // Allow path "/var/log" to match mount "/var/log/" —
+    // the path refers to the mount directory itself.
+    if (prefix.len > 0 and prefix[prefix.len - 1] == '/' and prefix.len == path.len + 1) {
+        for (prefix[0 .. prefix.len - 1], path) |a, b| {
+            if (a != b) return false;
+        }
+        return true;
+    }
     if (prefix.len > path.len) return false;
     for (prefix, path[0..prefix.len]) |a, b| {
         if (a != b) return false;

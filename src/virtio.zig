@@ -17,6 +17,7 @@ const klog = @import("klog.zig");
 
 const pci = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/pci.zig"),
+    .riscv64 => @import("arch/riscv64/pci.zig"),
     else => struct {
         pub const PciDevice = struct {};
     },
@@ -24,6 +25,7 @@ const pci = switch (@import("builtin").cpu.arch) {
 
 const cpu = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/cpu.zig"),
+    .riscv64 => @import("arch/riscv64/cpu.zig"),
     else => struct {
         pub fn outb(_: u16, _: u8) void {}
         pub fn inb(_: u16) u8 {
@@ -31,6 +33,12 @@ const cpu = switch (@import("builtin").cpu.arch) {
         }
     },
 };
+
+const builtin_arch = @import("builtin").cpu.arch;
+
+/// QEMU riscv64 virt: PCI I/O port space is mapped to MMIO at this CPU address.
+/// From device tree: ranges = <0x01000000 ... 0x03000000 ... 0x10000>
+const PCI_IO_WINDOW: u64 = 0x0300_0000;
 
 // Legacy virtio register offsets
 const REG_DEVICE_FEATURES: u16 = 0x00;
@@ -121,13 +129,21 @@ pub const VirtioDevice = struct {
 
 /// Initialize a legacy virtio device via PCI.
 pub fn initDevice(pci_dev: *pci.PciDevice) ?VirtioDevice {
-    const io_base = pci_dev.ioBase() orelse {
+    var io_base: u16 = 0;
+
+    // Legacy virtio always uses an I/O BAR. On riscv64, the PCI controller
+    // maps I/O port space to MMIO at PCI_IO_WINDOW (0x03000000).
+    io_base = pci_dev.ioBase() orelse {
         klog.debug("virtio: device has no I/O BAR\n");
         return null;
     };
 
     // Enable PCI bus mastering (required for DMA)
     pci.enableBusMastering(pci_dev);
+
+    // On riscv64, set the global MMIO address for I/O helpers.
+    // I/O BAR port address → PCI I/O window MMIO address.
+    if (comptime builtin_arch == .riscv64) setMmioBase(PCI_IO_WINDOW + @as(u64, io_base));
 
     // Reset device
     write8(io_base, REG_DEVICE_STATUS, 0);
@@ -341,31 +357,79 @@ pub fn memoryBarrier() void {
     switch (@import("builtin").cpu.arch) {
         .x86_64 => asm volatile ("mfence" ::: .{ .memory = true }),
         .aarch64 => asm volatile ("dmb sy" ::: .{ .memory = true }),
+        .riscv64 => asm volatile ("fence rw, rw" ::: .{ .memory = true }),
         else => {},
     }
 }
 
-// I/O port helpers for legacy virtio
+// I/O helpers for legacy virtio.
+// x86_64: I/O port. riscv64: MMIO (base comes from VirtioDevice.mmio_base).
 fn read8(base: u16, offset: u16) u8 {
-    return cpu.inb(base + offset);
+    return switch (builtin_arch) {
+        .riscv64 => cpu.mmioRead8(mmioDevAddr(base, offset)),
+        else => cpu.inb(base + offset),
+    };
 }
 
 fn read16(base: u16, offset: u16) u16 {
-    return cpu.inw(base + offset);
+    return switch (builtin_arch) {
+        .riscv64 => cpu.mmioRead16(mmioDevAddr(base, offset)),
+        else => cpu.inw(base + offset),
+    };
 }
 
 fn read32(base: u16, offset: u16) u32 {
-    return cpu.inl(base + offset);
+    return switch (builtin_arch) {
+        .riscv64 => cpu.mmioRead32(mmioDevAddr(base, offset)),
+        else => cpu.inl(base + offset),
+    };
 }
 
 fn write8(base: u16, offset: u16, val: u8) void {
-    cpu.outb(base + offset, val);
+    switch (builtin_arch) {
+        .riscv64 => cpu.mmioWrite8(mmioDevAddr(base, offset), val),
+        else => cpu.outb(base + offset, val),
+    }
 }
 
 fn write16(base: u16, offset: u16, val: u16) void {
-    cpu.outw(base + offset, val);
+    switch (builtin_arch) {
+        .riscv64 => cpu.mmioWrite16(mmioDevAddr(base, offset), val),
+        else => cpu.outw(base + offset, val),
+    }
 }
 
 fn write32(base: u16, offset: u16, val: u32) void {
-    cpu.outl(base + offset, val);
+    switch (builtin_arch) {
+        .riscv64 => cpu.mmioWrite32(mmioDevAddr(base, offset), val),
+        else => cpu.outl(base + offset, val),
+    }
+}
+
+/// On riscv64, the "io_base" field stores a truncated u16. Recover the full MMIO addr.
+/// For virtqueue ops that only get the u16 io_base, we need the full MMIO address.
+/// We store the low 16 bits of the MMIO BAR address in io_base and reconstruct here.
+/// NOTE: QEMU virt PCI MMIO BARs are in the 0x40000000+ range, so truncation loses data.
+/// This helper is only correct if mmio_base was stored somewhere accessible.
+/// For simplicity, we use a global that initDevice sets.
+var global_mmio_base: u64 = 0;
+
+fn mmioDevAddr(base_lo: u16, offset: u16) u64 {
+    // On riscv64, io_base is 0 (not used). Use the global MMIO base.
+    _ = base_lo;
+    const paging_mod = @import("arch/riscv64/paging.zig");
+    const mem = @import("mem.zig");
+    const addr = global_mmio_base + @as(u64, offset);
+    return if (paging_mod.isInitialized()) addr +% mem.KERNEL_VIRT_BASE else addr;
+}
+
+/// Set the global MMIO base for virtio I/O helpers (called during initDevice on riscv64).
+pub fn setMmioBase(base: u64) void {
+    global_mmio_base = base;
+}
+
+pub fn getMmioBase() u64 {
+    const paging_mod = @import("arch/riscv64/paging.zig");
+    const mem = @import("mem.zig");
+    return if (paging_mod.isInitialized()) global_mmio_base +% mem.KERNEL_VIRT_BASE else global_mmio_base;
 }

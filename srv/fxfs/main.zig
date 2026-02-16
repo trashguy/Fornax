@@ -110,9 +110,13 @@ const Handle = struct {
 var handles: [MAX_HANDLES]Handle linksection(".bss") = undefined;
 
 fn allocHandle(inode_nr: u64) ?u32 {
+    return allocHandleAt(inode_nr, 0);
+}
+
+fn allocHandleAt(inode_nr: u64, write_offset: u64) ?u32 {
     for (1..MAX_HANDLES) |i| {
         if (!handles[i].active) {
-            handles[i] = .{ .inode_nr = inode_nr, .write_offset = 0, .active = true };
+            handles[i] = .{ .inode_nr = inode_nr, .write_offset = write_offset, .active = true };
             return @intCast(i);
         }
     }
@@ -1149,10 +1153,17 @@ fn handleCreate(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
     const flags = readU32LE(req.data[0..4]);
     const path = req.data[4..req.data_len];
     const is_dir = (flags & 1) != 0;
+    const is_append = (flags & 2) != 0;
 
     // Check if already exists
     if (resolvePath(path)) |existing| {
-        const handle = allocHandle(existing) orelse {
+        var offset: u64 = 0;
+        if (is_append) {
+            if (readInode(existing)) |inode| {
+                offset = inode.size;
+            }
+        }
+        const handle = allocHandleAt(existing, offset) orelse {
             resp.* = fx.IpcMessage.init(fx.R_ERROR);
             return;
         };

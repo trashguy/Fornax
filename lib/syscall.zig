@@ -1,8 +1,9 @@
 /// Fornax userspace syscall library.
 ///
 /// Thin wrappers around the Fornax syscall ABI.
-/// Convention: RAX=nr, RDI=a0, RSI=a1, RDX=a2, R10=a3, R8=a4
-/// Returns: RAX
+/// x86_64:  SYSCALL — RAX=nr, RDI/RSI/RDX/R10/R8=args, return RAX
+/// riscv64: ECALL  — A7=nr,  A0/A1/A2/A3/A4=args,      return A0
+const arch = @import("builtin").cpu.arch;
 pub const SYS = enum(u64) {
     open = 0,
     create = 1,
@@ -28,6 +29,7 @@ pub const SYS = enum(u64) {
     pwrite = 21,
     klog = 22,
     sysinfo = 23,
+    sleep = 24,
 };
 
 const ipc = @import("ipc.zig");
@@ -77,13 +79,17 @@ pub fn close(fd: i32) i32 {
     return @bitCast(@as(u32, @truncate(result)));
 }
 
+// Create flags
+pub const O_DIR: u32 = 1; // create directory
+pub const O_APPEND: u32 = 2; // open at end of file for appending
+
 pub fn create(path: []const u8, flags: u32) i32 {
     const result = syscall3(.create, @intFromPtr(path.ptr), path.len, flags);
     return @bitCast(@as(u32, @truncate(result)));
 }
 
 pub fn mkdir(path: []const u8) i32 {
-    return create(path, 1);
+    return create(path, O_DIR);
 }
 
 pub fn stat(fd: i32, buf: *Stat) i32 {
@@ -155,6 +161,10 @@ pub fn sysinfo() ?SysInfo {
     return .{ .total_pages = buf[0], .free_pages = buf[1], .page_size = buf[2] };
 }
 
+pub fn sleep(ms: u64) void {
+    _ = syscall1(.sleep, ms);
+}
+
 /// Build a serialized argv block: [argc: u32][total_len: u32][str0\0str1\0...]
 pub fn buildArgvBlock(buf: []u8, args: []const []const u8) ?[]const u8 {
     if (args.len == 0) return null;
@@ -201,52 +211,102 @@ pub fn getArgs() []const [*:0]const u8 {
 }
 
 fn syscall1(nr: SYS, a0: u64) u64 {
-    return asm volatile ("syscall"
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (@intFromEnum(nr)),
-          [a0] "{rdi}" (a0),
-        : .{ .rcx = true, .r11 = true, .memory = true });
+    return switch (arch) {
+        .x86_64 => asm volatile ("syscall"
+            : [ret] "={rax}" (-> u64),
+            : [nr] "{rax}" (@intFromEnum(nr)),
+              [a0] "{rdi}" (a0),
+            : .{ .rcx = true, .r11 = true, .memory = true }),
+        .riscv64 => asm volatile ("ecall"
+            : [ret] "={a0}" (-> u64),
+            : [nr] "{a7}" (@intFromEnum(nr)),
+              [a0] "{a0}" (a0),
+            : .{ .memory = true }),
+        else => @compileError("unsupported arch for syscall"),
+    };
 }
 
 fn syscall2(nr: SYS, a0: u64, a1: u64) u64 {
-    return asm volatile ("syscall"
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (@intFromEnum(nr)),
-          [a0] "{rdi}" (a0),
-          [a1] "{rsi}" (a1),
-        : .{ .rcx = true, .r11 = true, .memory = true });
+    return switch (arch) {
+        .x86_64 => asm volatile ("syscall"
+            : [ret] "={rax}" (-> u64),
+            : [nr] "{rax}" (@intFromEnum(nr)),
+              [a0] "{rdi}" (a0),
+              [a1] "{rsi}" (a1),
+            : .{ .rcx = true, .r11 = true, .memory = true }),
+        .riscv64 => asm volatile ("ecall"
+            : [ret] "={a0}" (-> u64),
+            : [nr] "{a7}" (@intFromEnum(nr)),
+              [a0] "{a0}" (a0),
+              [a1] "{a1}" (a1),
+            : .{ .memory = true }),
+        else => @compileError("unsupported arch for syscall"),
+    };
 }
 
 fn syscall3(nr: SYS, a0: u64, a1: u64, a2: u64) u64 {
-    return asm volatile ("syscall"
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (@intFromEnum(nr)),
-          [a0] "{rdi}" (a0),
-          [a1] "{rsi}" (a1),
-          [a2] "{rdx}" (a2),
-        : .{ .rcx = true, .r11 = true, .memory = true });
+    return switch (arch) {
+        .x86_64 => asm volatile ("syscall"
+            : [ret] "={rax}" (-> u64),
+            : [nr] "{rax}" (@intFromEnum(nr)),
+              [a0] "{rdi}" (a0),
+              [a1] "{rsi}" (a1),
+              [a2] "{rdx}" (a2),
+            : .{ .rcx = true, .r11 = true, .memory = true }),
+        .riscv64 => asm volatile ("ecall"
+            : [ret] "={a0}" (-> u64),
+            : [nr] "{a7}" (@intFromEnum(nr)),
+              [a0] "{a0}" (a0),
+              [a1] "{a1}" (a1),
+              [a2] "{a2}" (a2),
+            : .{ .memory = true }),
+        else => @compileError("unsupported arch for syscall"),
+    };
 }
 
 fn syscall4(nr: SYS, a0: u64, a1: u64, a2: u64, a3: u64) u64 {
-    return asm volatile ("syscall"
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (@intFromEnum(nr)),
-          [a0] "{rdi}" (a0),
-          [a1] "{rsi}" (a1),
-          [a2] "{rdx}" (a2),
-          [a3] "{r10}" (a3),
-        : .{ .rcx = true, .r11 = true, .memory = true });
+    return switch (arch) {
+        .x86_64 => asm volatile ("syscall"
+            : [ret] "={rax}" (-> u64),
+            : [nr] "{rax}" (@intFromEnum(nr)),
+              [a0] "{rdi}" (a0),
+              [a1] "{rsi}" (a1),
+              [a2] "{rdx}" (a2),
+              [a3] "{r10}" (a3),
+            : .{ .rcx = true, .r11 = true, .memory = true }),
+        .riscv64 => asm volatile ("ecall"
+            : [ret] "={a0}" (-> u64),
+            : [nr] "{a7}" (@intFromEnum(nr)),
+              [a0] "{a0}" (a0),
+              [a1] "{a1}" (a1),
+              [a2] "{a2}" (a2),
+              [a3] "{a3}" (a3),
+            : .{ .memory = true }),
+        else => @compileError("unsupported arch for syscall"),
+    };
 }
 
 fn syscall5(nr: SYS, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
-    return asm volatile ("syscall"
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (@intFromEnum(nr)),
-          [a0] "{rdi}" (a0),
-          [a1] "{rsi}" (a1),
-          [a2] "{rdx}" (a2),
-          [a3] "{r10}" (a3),
-          [a4] "{r8}" (a4),
-        : .{ .rcx = true, .r11 = true, .memory = true });
+    return switch (arch) {
+        .x86_64 => asm volatile ("syscall"
+            : [ret] "={rax}" (-> u64),
+            : [nr] "{rax}" (@intFromEnum(nr)),
+              [a0] "{rdi}" (a0),
+              [a1] "{rsi}" (a1),
+              [a2] "{rdx}" (a2),
+              [a3] "{r10}" (a3),
+              [a4] "{r8}" (a4),
+            : .{ .rcx = true, .r11 = true, .memory = true }),
+        .riscv64 => asm volatile ("ecall"
+            : [ret] "={a0}" (-> u64),
+            : [nr] "{a7}" (@intFromEnum(nr)),
+              [a0] "{a0}" (a0),
+              [a1] "{a1}" (a1),
+              [a2] "{a2}" (a2),
+              [a3] "{a3}" (a3),
+              [a4] "{a4}" (a4),
+            : .{ .memory = true }),
+        else => @compileError("unsupported arch for syscall"),
+    };
 }
 

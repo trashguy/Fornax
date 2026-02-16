@@ -13,6 +13,7 @@ const virtio = @import("virtio.zig");
 
 const pci = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/pci.zig"),
+    .riscv64 => @import("arch/riscv64/pci.zig"),
     else => struct {
         pub const PciDevice = struct {};
     },
@@ -20,6 +21,7 @@ const pci = switch (@import("builtin").cpu.arch) {
 
 const cpu = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/cpu.zig"),
+    .riscv64 => @import("arch/riscv64/cpu.zig"),
     else => struct {
         pub fn inb(_: u16) u8 {
             return 0;
@@ -64,7 +66,7 @@ var net_dev: NetDevice = .{
 
 /// Initialize the virtio-net device.
 pub fn init() bool {
-    if (@import("builtin").cpu.arch != .x86_64) return false;
+    if (@import("builtin").cpu.arch != .x86_64 and @import("builtin").cpu.arch != .riscv64) return false;
 
     // Find virtio-net PCI device
     const pci_dev = pci.findVirtioNet() orelse {
@@ -85,9 +87,16 @@ pub fn init() bool {
     };
 
     // Read MAC address from device config (offset 0x14)
-    const io_base = pci_dev.ioBase().?;
-    for (0..6) |i| {
-        net_dev.mac[i] = cpu.inb(io_base + 0x14 + @as(u16, @intCast(i)));
+    if (comptime @import("builtin").cpu.arch == .riscv64) {
+        const mmio_base = virtio.getMmioBase();
+        for (0..6) |i| {
+            net_dev.mac[i] = cpu.mmioRead8(mmio_base + 0x14 + @as(u64, @intCast(i)));
+        }
+    } else {
+        const io_base = pci_dev.ioBase().?;
+        for (0..6) |i| {
+            net_dev.mac[i] = cpu.inb(io_base + 0x14 + @as(u16, @intCast(i)));
+        }
     }
 
     klog.info("virtio-net: MAC ");

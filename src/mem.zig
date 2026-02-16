@@ -15,10 +15,13 @@ pub const KERNEL_VIRT_BASE: u64 = 0xFFFF_8000_0000_0000;
 /// User stack top (grows down).
 pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFF0_0000;
 
-/// Initial user RSP: 8 bytes below USER_STACK_TOP to satisfy the
-/// x86_64 ABI requirement that RSP ≡ 8 (mod 16) at function entry
-/// (as if a `call` instruction pushed a return address).
-pub const USER_STACK_INIT: u64 = USER_STACK_TOP - 8;
+/// Initial user SP:
+/// x86_64:  RSP ≡ 8 (mod 16) at function entry (as if `call` pushed RA) → TOP - 8
+/// riscv64: SP ≡ 0 (mod 16) at function entry → TOP
+pub const USER_STACK_INIT: u64 = switch (@import("builtin").cpu.arch) {
+    .riscv64 => USER_STACK_TOP,
+    else => USER_STACK_TOP - 8,
+};
 
 /// Base address for argv layout (one page below USER_STACK_TOP).
 /// Layout at ARGV_BASE: [argc: u64][argv[0]: ptr][argv[1]: ptr]...[str0\0str1\0...]

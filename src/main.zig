@@ -1,7 +1,10 @@
 const std = @import("std");
-const uefi = std.os.uefi;
+const builtin = @import("builtin");
 
+// UEFI-only imports — lazy, only analyzed when referenced from UEFI code paths
+const uefi = std.os.uefi;
 const boot = @import("boot.zig");
+
 const console = @import("console.zig");
 const pmm = @import("pmm.zig");
 const serial = @import("serial.zig");
@@ -20,8 +23,9 @@ const namespace = @import("namespace.zig");
 const panic_handler = @import("panic.zig");
 const klog = @import("klog.zig");
 
-const paging = switch (@import("builtin").cpu.arch) {
+const paging = switch (builtin.cpu.arch) {
     .x86_64 => @import("arch/x86_64/paging.zig"),
+    .riscv64 => @import("arch/riscv64/paging.zig"),
     else => struct {
         pub fn mapPage(_: anytype, _: u64, _: u64, _: u64) ?void {}
         pub const Flags = struct {
@@ -34,60 +38,82 @@ const paging = switch (@import("builtin").cpu.arch) {
     },
 };
 
-const cpu = switch (@import("builtin").cpu.arch) {
+const cpu = switch (builtin.cpu.arch) {
     .x86_64 => @import("arch/x86_64/cpu.zig"),
     .aarch64 => @import("arch/aarch64/cpu.zig"),
+    .riscv64 => @import("arch/riscv64/cpu.zig"),
     else => @compileError("unsupported architecture"),
 };
 
-const arch = switch (@import("builtin").cpu.arch) {
+const arch = switch (builtin.cpu.arch) {
     .x86_64 => @import("arch/x86_64/interrupts.zig"),
     .aarch64 => @import("arch/aarch64/exceptions.zig"),
+    .riscv64 => @import("arch/riscv64/interrupts.zig"),
     else => @compileError("unsupported architecture"),
 };
 
 pub const panic = panic_handler.panic;
 
+// Force-import riscv64 boot module for freestanding so its exported symbols are linked.
+comptime {
+    if (builtin.cpu.arch == .riscv64 and builtin.os.tag != .uefi) {
+        _ = @import("arch/riscv64/boot.zig");
+    }
+}
+
+/// UEFI boot entry point — used on x86_64 and aarch64.
+/// For riscv64 freestanding, _start in entry.S calls riscv64KernelMain instead.
 pub fn main() noreturn {
-    // Phase 1: UEFI text output
-    const con_out = uefi.system_table.con_out orelse halt();
-    con_out.clearScreen() catch {};
-    puts16(con_out, L("Fornax booting...\r\n"));
+    if (builtin.os.tag == .uefi) {
+        // Phase 1: UEFI text output
+        const con_out = uefi.system_table.con_out orelse halt();
+        con_out.clearScreen() catch {};
+        puts16(con_out, L("Fornax booting...\r\n"));
 
-    // Phase 2: GOP framebuffer + exit boot services
-    const boot_info = boot.init() catch |err| {
-        puts16(con_out, L("Boot init failed: "));
-        puts16(con_out, boot.errorName(err));
-        puts16(con_out, L("\r\n"));
-        halt();
-    };
+        // Phase 2: GOP framebuffer + exit boot services
+        const boot_info = boot.init() catch |err| {
+            puts16(con_out, L("Boot init failed: "));
+            puts16(con_out, boot.errorName(err));
+            puts16(con_out, L("\r\n"));
+            halt();
+        };
 
-    // Serial console — init before framebuffer so we get early output
-    serial.init();
+        // Serial console — init before framebuffer so we get early output
+        serial.init();
 
-    // Now we have a framebuffer — switch to graphical console
-    console.init(boot_info.framebuffer);
-    klog.console_level = .info;
-    klog.info("Fornax booting...\n");
+        // Now we have a framebuffer — switch to graphical console
+        console.init(boot_info.framebuffer);
+        klog.console_level = .info;
+        klog.info("Fornax booting...\n");
 
-    // Phase 3: Physical memory manager
-    pmm.init(boot_info.memory_map) catch {
-        klog.err("PMM init failed!\n");
-        halt();
-    };
+        // Phase 3: Physical memory manager
+        pmm.init(boot_info.memory_map) catch {
+            klog.err("PMM init failed!\n");
+            halt();
+        };
 
-    // Phase 7: Kernel heap
-    heap.init();
+        // Phase 7: Kernel heap
+        heap.init();
 
+        kernelInit(boot_info.initrd_base, boot_info.initrd_size);
+    }
+    halt();
+}
+
+/// Shared kernel initialization — called from both UEFI main() and riscv64 boot.zig.
+/// At this point serial, console, PMM, and heap are already initialized.
+pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize) noreturn {
     // Phase 4/5: Architecture-specific init (GDT/IDT/paging)
     arch.init();
     klog.info("Architecture init complete.\n");
 
     // Phase 23: PIC initialization (remap IRQs before any device init)
-    const pic_mod = @import("pic.zig");
-    pic_mod.init();
+    if (builtin.cpu.arch == .x86_64) {
+        const pic_mod = @import("pic.zig");
+        pic_mod.init();
+    }
 
-    // Phase 23: Serial console input (COM1 IRQ 4)
+    // Phase 23: Serial console input (COM1 IRQ 4 on x86_64, UART PLIC IRQ 10 on riscv64)
     serial.enableRxInterrupt();
 
     // Phase 9: IPC
@@ -96,10 +122,17 @@ pub fn main() noreturn {
     // Phase 10: Process manager
     process.init();
 
-    // Architecture-specific: SYSCALL setup
-    if (@import("builtin").cpu.arch == .x86_64) {
-        const syscall_entry = @import("arch/x86_64/syscall_entry.zig");
-        syscall_entry.init();
+    // Architecture-specific: SYSCALL/ECALL setup
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            const syscall_entry = @import("arch/x86_64/syscall_entry.zig");
+            syscall_entry.init();
+        },
+        .riscv64 => {
+            const syscall_entry = @import("arch/riscv64/syscall_entry.zig");
+            syscall_entry.init();
+        },
+        else => {},
     }
 
     // Phase 13: Fault supervisor
@@ -109,8 +142,12 @@ pub fn main() noreturn {
     container.init();
 
     // Phase 15: PCI + virtio-net
-    if (@import("builtin").cpu.arch == .x86_64) {
-        const pci_mod = @import("arch/x86_64/pci.zig");
+    if (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .riscv64) {
+        const pci_mod = switch (builtin.cpu.arch) {
+            .x86_64 => @import("arch/x86_64/pci.zig"),
+            .riscv64 => @import("arch/riscv64/pci.zig"),
+            else => unreachable,
+        };
         pci_mod.enumerate();
         if (virtio_net.init()) {
             klog.info("Network ready.\n");
@@ -142,7 +179,7 @@ pub fn main() noreturn {
     net.init();
 
     // Phase 20: Initrd
-    _ = initrd.init(boot_info.initrd_base, boot_info.initrd_size);
+    _ = initrd.init(initrd_base, initrd_size);
 
     // Phase 21: Mount initrd files at /boot/ and spawn servers
     initrd.mountFiles();

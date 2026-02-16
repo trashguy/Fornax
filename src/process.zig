@@ -10,6 +10,7 @@ const namespace = @import("namespace.zig");
 
 const paging = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/paging.zig"),
+    .riscv64 => @import("arch/riscv64/paging.zig"),
     else => struct {
         pub const PageTable = struct { entries: [512]u64 };
         pub fn createAddressSpace() ?*PageTable {
@@ -28,7 +29,7 @@ const paging = switch (@import("builtin").cpu.arch) {
 
 const gdt = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/gdt.zig"),
-    else => struct {
+    else => struct { // riscv64 and others: no segmentation
         pub fn setKernelStack(_: u64) void {}
         pub const USER_CS: u16 = 0;
         pub const USER_DS: u16 = 0;
@@ -38,6 +39,7 @@ const gdt = switch (@import("builtin").cpu.arch) {
 const cpu = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/cpu.zig"),
     .aarch64 => @import("arch/aarch64/cpu.zig"),
+    .riscv64 => @import("arch/riscv64/cpu.zig"),
     else => struct {
         pub fn halt() noreturn {
             while (true) {}
@@ -47,6 +49,7 @@ const cpu = switch (@import("builtin").cpu.arch) {
 
 const syscall_entry = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/syscall_entry.zig"),
+    .riscv64 => @import("arch/riscv64/syscall_entry.zig"),
     else => struct {
         pub fn setKernelStack(_: u64) void {}
         pub var saved_user_rip: u64 = 0;
@@ -57,6 +60,13 @@ const syscall_entry = switch (@import("builtin").cpu.arch) {
             unreachable;
         }
     },
+};
+
+/// Frame return value slot index:
+/// x86_64: frame[RET_SLOT] = RAX slot, riscv64: frame[9] = a0 slot
+const RET_SLOT: usize = switch (@import("builtin").cpu.arch) {
+    .riscv64 => 9,
+    else => 12,
 };
 
 const MAX_PROCESSES = 64;
@@ -80,7 +90,7 @@ pub const ResourceQuotas = struct {
     cpu_priority: u8 = 128, // 0=lowest, 255=highest
 };
 
-pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, remove, console_read, net_read, net_connect, net_listen, dns_query, icmp_read, pipe_read, pipe_write };
+pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, remove, console_read, net_read, net_connect, net_listen, dns_query, icmp_read, pipe_read, pipe_write, sleep };
 
 pub const FdType = enum(u8) { ipc, net, pipe, blk };
 
@@ -169,6 +179,8 @@ pub const Process = struct {
     pending_fd: u32,
     /// Deferred kernel stack free (can't free while running on it).
     needs_stack_free: bool = false,
+    /// Tick at which a sleeping process should wake up.
+    sleep_until: u32 = 0,
 
     pub fn initFds(self: *Process) void {
         for (&self.fds) |*fd| {
@@ -288,7 +300,10 @@ pub fn init() void {
         p.kernel_stack_top = 0;
         p.user_rip = 0;
         p.user_rsp = 0;
-        p.user_rflags = 0x202; // IF=1
+        p.user_rflags = switch (@import("builtin").cpu.arch) {
+            .riscv64 => @import("arch/riscv64/cpu.zig").SSTATUS_SPIE | @import("arch/riscv64/cpu.zig").SSTATUS_SUM, // SPIE + SUM
+            else => 0x202, // IF=1
+        };
         p.syscall_ret = 0;
         p.saved_kernel_rsp = 0;
         p.brk = 0;
@@ -303,6 +318,7 @@ pub fn init() void {
         p.pending_op = .none;
         p.pending_fd = 0;
         p.needs_stack_free = false;
+        p.sleep_until = 0;
         p.initFds();
     }
     initialized = true;
@@ -352,7 +368,10 @@ pub fn create() ?*Process {
     proc.kernel_stack_top = stack_virt + KERNEL_STACK_PAGES * mem.PAGE_SIZE;
     proc.user_rip = 0;
     proc.user_rsp = 0;
-    proc.user_rflags = 0x202;
+    proc.user_rflags = switch (@import("builtin").cpu.arch) {
+        .riscv64 => @import("arch/riscv64/cpu.zig").SSTATUS_SPIE | @import("arch/riscv64/cpu.zig").SSTATUS_SUM,
+        else => 0x202,
+    };
     proc.syscall_ret = 0;
     proc.saved_kernel_rsp = 0;
     proc.fds = [_]?FdEntry{null} ** MAX_FDS;
@@ -367,6 +386,7 @@ pub fn create() ?*Process {
     proc.pending_op = .none;
     proc.pending_fd = 0;
     proc.needs_stack_free = false;
+    proc.sleep_until = 0;
     namespace.getRootNamespace().cloneInto(&proc.ns);
     proc.ipc_msg = ipc.Message.init(.t_open);
     next_pid += 1;
@@ -468,9 +488,18 @@ pub fn scheduleNext() noreturn {
             // All blocked — enable interrupts and halt until an IRQ fires.
             // The IRQ handler may wake a process (e.g., keyboard input).
             current = null;
-            asm volatile ("sti");
-            asm volatile ("hlt");
-            asm volatile ("cli");
+            switch (@import("builtin").cpu.arch) {
+                .riscv64 => {
+                    asm volatile ("csrsi sstatus, 0x2"); // SIE=1
+                    asm volatile ("wfi");
+                    asm volatile ("csrci sstatus, 0x2"); // SIE=0
+                },
+                else => {
+                    asm volatile ("sti");
+                    asm volatile ("hlt");
+                    asm volatile ("cli");
+                },
+            }
             // Loop back and re-scan for ready processes
             continue;
         } else {
@@ -481,9 +510,13 @@ pub fn scheduleNext() noreturn {
     }
 }
 
-/// Assembly entry point defined in entry.S — returns to userspace via IRETQ.
-/// SysV args: RDI=rip, RSI=rsp, RDX=rflags, RCX=ret_val
-extern fn resume_user_mode(rip: u64, rsp: u64, rflags: u64, ret_val: u64) callconv(.{ .x86_64_sysv = .{} }) noreturn;
+/// Assembly entry point defined in entry.S — returns to userspace.
+/// x86_64: IRETQ. riscv64: SRET.
+/// Args: rip, rsp, flags, ret_val
+extern fn resume_user_mode(rip: u64, rsp: u64, flags: u64, ret_val: u64) callconv(switch (@import("builtin").cpu.arch) {
+    .x86_64 => .{ .x86_64_sysv = .{} },
+    else => .c,
+}) noreturn;
 
 /// Switch to a specific process and jump to its user mode.
 fn switchTo(proc: *Process) noreturn {
@@ -497,6 +530,23 @@ fn switchTo(proc: *Process) noreturn {
     // Switch address space
     if (proc.pml4) |pml4| {
         paging.switchAddressSpace(pml4);
+    }
+
+    // Sleep delivery — check if the sleep timer has elapsed
+    if (proc.pending_op == .sleep) {
+        const timer = @import("timer.zig");
+        const now = timer.getTicks();
+        const elapsed = (now -% proc.sleep_until) < 0x8000_0000;
+        if (elapsed) {
+            proc.syscall_ret = 0;
+            proc.pending_op = .none;
+            proc.sleep_until = 0;
+        } else {
+            // Not yet — re-block
+            proc.state = .blocked;
+            current = null;
+            scheduleNext();
+        }
     }
 
     // Net read delivery — address space is active, so user pointers are valid
@@ -514,7 +564,7 @@ fn switchTo(proc: *Process) noreturn {
                 // fall through to resume
                 if (proc.saved_kernel_rsp != 0) {
                     const frame: [*]u64 = @ptrFromInt(proc.saved_kernel_rsp);
-                    frame[12] = proc.syscall_ret;
+                    frame[RET_SLOT] = proc.syscall_ret;
                     proc.saved_kernel_rsp = 0;
                     syscall_entry.resume_from_kernel_frame(@intFromPtr(frame));
                 } else {
@@ -557,7 +607,7 @@ fn switchTo(proc: *Process) noreturn {
                 proc.pending_fd = 0;
                 if (proc.saved_kernel_rsp != 0) {
                     const frame: [*]u64 = @ptrFromInt(proc.saved_kernel_rsp);
-                    frame[12] = proc.syscall_ret;
+                    frame[RET_SLOT] = proc.syscall_ret;
                     proc.saved_kernel_rsp = 0;
                     syscall_entry.resume_from_kernel_frame(@intFromPtr(frame));
                 } else {
@@ -628,7 +678,7 @@ fn switchTo(proc: *Process) noreturn {
             proc.pending_fd = 0;
             if (proc.saved_kernel_rsp != 0) {
                 const frame: [*]u64 = @ptrFromInt(proc.saved_kernel_rsp);
-                frame[12] = proc.syscall_ret;
+                frame[RET_SLOT] = proc.syscall_ret;
                 proc.saved_kernel_rsp = 0;
                 syscall_entry.resume_from_kernel_frame(@intFromPtr(frame));
             } else {
@@ -670,7 +720,7 @@ fn switchTo(proc: *Process) noreturn {
             proc.pending_fd = 0;
             if (proc.saved_kernel_rsp != 0) {
                 const frame: [*]u64 = @ptrFromInt(proc.saved_kernel_rsp);
-                frame[12] = proc.syscall_ret;
+                frame[RET_SLOT] = proc.syscall_ret;
                 proc.saved_kernel_rsp = 0;
                 syscall_entry.resume_from_kernel_frame(@intFromPtr(frame));
             } else {
@@ -721,13 +771,13 @@ fn switchTo(proc: *Process) noreturn {
     if (proc.saved_kernel_rsp != 0) {
         // Resume from blocked syscall: the process's kernel stack still has
         // the full GPR frame from entry.S. Write the return value into the
-        // saved RAX slot (frame[12]) and jump to the pop/SYSRETQ path.
+        // saved return register slot and jump to the restore/return path.
         const frame: [*]u64 = @ptrFromInt(proc.saved_kernel_rsp);
-        frame[12] = proc.syscall_ret;
+        frame[RET_SLOT] = proc.syscall_ret;
         proc.saved_kernel_rsp = 0;
         syscall_entry.resume_from_kernel_frame(@intFromPtr(frame));
     } else {
-        // First run (no saved kernel frame) — use IRETQ path
+        // First run (no saved kernel frame) — use IRETQ/SRET path
         resume_user_mode(proc.user_rip, proc.user_rsp, proc.user_rflags, proc.syscall_ret);
     }
 }

@@ -26,6 +26,7 @@ pub const Flags = struct {
     pub const HUGE_PAGE: u64 = 1 << 7; // 2MB in PD, 1GB in PDPT
     pub const GLOBAL: u64 = 1 << 8;
     pub const NO_EXECUTE: u64 = @as(u64, 1) << 63;
+    pub const EXEC: u64 = 0; // x86_64: pages are executable by default; no-op for compat with riscv64
 };
 
 /// A page table is 512 entries of 8 bytes each (4KB total).

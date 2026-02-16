@@ -23,6 +23,8 @@ pub const read = syscall.read;
 pub const close = syscall.close;
 pub const create = syscall.create;
 pub const mkdir = syscall.mkdir;
+pub const O_DIR = syscall.O_DIR;
+pub const O_APPEND = syscall.O_APPEND;
 pub const stat = syscall.stat;
 pub const remove = syscall.remove;
 pub const brk = syscall.brk;
@@ -36,6 +38,7 @@ pub const pwrite = syscall.pwrite;
 pub const klog = syscall.klog;
 pub const SysInfo = syscall.SysInfo;
 pub const sysinfo = syscall.sysinfo;
+pub const sleep = syscall.sleep;
 
 // Re-export IPC types at top level.
 pub const IpcMessage = ipc.IpcMessage;

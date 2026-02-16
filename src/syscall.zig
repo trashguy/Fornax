@@ -10,6 +10,7 @@ const namespace = @import("namespace.zig");
 const elf = @import("elf.zig");
 const paging = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/paging.zig"),
+    .riscv64 => @import("arch/riscv64/paging.zig"),
     else => struct {},
 };
 const pmm = @import("pmm.zig");
@@ -41,6 +42,7 @@ pub const SYS = enum(u64) {
     pwrite = 21,
     klog = 22,
     sysinfo = 23,
+    sleep = 24,
 };
 
 /// Error return values.
@@ -128,6 +130,7 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         .pwrite => sysPwrite(arg0, arg1, arg2, arg3),
         .klog => sysKlog(arg0, arg1, arg2),
         .sysinfo => sysSysinfo(arg0),
+        .sleep => sysSleep(arg0),
         .mount, .bind, .unmount, .rfork => {
             klog.warn("syscall: unimplemented nr=");
             klog.warnDec(nr);
@@ -794,6 +797,18 @@ fn sysSysinfo(info_ptr: u64) u64 {
     return 0;
 }
 
+fn sysSleep(ms: u64) u64 {
+    const timer = @import("timer.zig");
+    const proc = process.getCurrent() orelse return EFAULT;
+
+    // At least 1 tick, even for small ms values
+    const ticks_to_sleep: u32 = @intCast(@max(1, ms * timer.TICKS_PER_SEC / 1000));
+    proc.sleep_until = timer.getTicks() +% ticks_to_sleep;
+    proc.pending_op = .sleep;
+    proc.state = .blocked;
+    process.scheduleNext();
+}
+
 /// close(fd) → 0 or error
 fn sysClose(fd: u64) u64 {
     const proc = process.getCurrent() orelse return EBADF;
@@ -1082,7 +1097,7 @@ fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
         .remove => {
             client_proc.syscall_ret = if (is_ok) 0 else ENOENT;
         },
-        .console_read, .net_read, .net_connect, .net_listen, .dns_query, .icmp_read, .pipe_read, .pipe_write => {
+        .console_read, .net_read, .net_connect, .net_listen, .dns_query, .icmp_read, .pipe_read, .pipe_write, .sleep => {
             // These don't go through IPC — should not happen here
         },
         .none => {

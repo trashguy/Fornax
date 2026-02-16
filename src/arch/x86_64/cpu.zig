@@ -94,6 +94,10 @@ pub fn readCr3() u64 {
     );
 }
 
+pub inline fn spinHint() void {
+    asm volatile ("pause");
+}
+
 // MSR numbers
 pub const MSR_EFER = 0xC0000080;
 pub const MSR_STAR = 0xC0000081;

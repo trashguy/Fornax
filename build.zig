@@ -63,7 +63,7 @@ pub fn build(b: *std.Build) void {
     // so mapPage() can't corrupt kernel code entries.
     const user_image_base: u64 = 0x40000000;
 
-    const init_exe = b.addExecutable(.{
+    const init_bin = b.addExecutable(.{
         .name = "init",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cmd/init/main.zig"),
@@ -74,9 +74,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    init_exe.image_base = user_image_base;
+    init_bin.image_base = user_image_base;
 
-    const fsh_exe = b.addExecutable(.{
+    const fsh_bin = b.addExecutable(.{
         .name = "fsh",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cmd/fsh/main.zig"),
@@ -87,9 +87,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    fsh_exe.image_base = user_image_base;
+    fsh_bin.image_base = user_image_base;
 
-    const hello_exe = b.addExecutable(.{
+    const hello_bin = b.addExecutable(.{
         .name = "hello",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cmd/hello/main.zig"),
@@ -100,9 +100,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    hello_exe.image_base = user_image_base;
+    hello_bin.image_base = user_image_base;
 
-    const tcptest_exe = b.addExecutable(.{
+    const tcptest_bin = b.addExecutable(.{
         .name = "tcptest",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cmd/tcptest/main.zig"),
@@ -113,9 +113,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    tcptest_exe.image_base = user_image_base;
+    tcptest_bin.image_base = user_image_base;
 
-    const dnstest_exe = b.addExecutable(.{
+    const dnstest_bin = b.addExecutable(.{
         .name = "dnstest",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cmd/dnstest/main.zig"),
@@ -126,9 +126,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    dnstest_exe.image_base = user_image_base;
+    dnstest_bin.image_base = user_image_base;
 
-    const ping_exe = b.addExecutable(.{
+    const ping_bin = b.addExecutable(.{
         .name = "ping",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cmd/ping/main.zig"),
@@ -139,9 +139,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    ping_exe.image_base = user_image_base;
+    ping_bin.image_base = user_image_base;
 
-    const echo_exe = b.addExecutable(.{
+    const echo_bin = b.addExecutable(.{
         .name = "echo",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cmd/echo/main.zig"),
@@ -152,9 +152,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    echo_exe.image_base = user_image_base;
+    echo_bin.image_base = user_image_base;
 
-    const cat_exe = b.addExecutable(.{
+    const cat_bin = b.addExecutable(.{
         .name = "cat",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cmd/cat/main.zig"),
@@ -165,9 +165,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    cat_exe.image_base = user_image_base;
+    cat_bin.image_base = user_image_base;
 
-    const ls_exe = b.addExecutable(.{
+    const ls_bin = b.addExecutable(.{
         .name = "ls",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cmd/ls/main.zig"),
@@ -178,9 +178,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    ls_exe.image_base = user_image_base;
+    ls_bin.image_base = user_image_base;
 
-    const rm_exe = b.addExecutable(.{
+    const rm_bin = b.addExecutable(.{
         .name = "rm",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cmd/rm/main.zig"),
@@ -191,9 +191,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    rm_exe.image_base = user_image_base;
+    rm_bin.image_base = user_image_base;
 
-    const mkdir_exe = b.addExecutable(.{
+    const mkdir_bin = b.addExecutable(.{
         .name = "mkdir",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cmd/mkdir/main.zig"),
@@ -204,9 +204,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    mkdir_exe.image_base = user_image_base;
+    mkdir_bin.image_base = user_image_base;
 
-    const wc_exe = b.addExecutable(.{
+    const wc_bin = b.addExecutable(.{
         .name = "wc",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cmd/wc/main.zig"),
@@ -217,9 +217,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    wc_exe.image_base = user_image_base;
+    wc_bin.image_base = user_image_base;
 
-    const lsblk_exe = b.addExecutable(.{
+    const lsblk_bin = b.addExecutable(.{
         .name = "lsblk",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cmd/lsblk/main.zig"),
@@ -230,9 +230,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    lsblk_exe.image_base = user_image_base;
+    lsblk_bin.image_base = user_image_base;
 
-    const df_exe = b.addExecutable(.{
+    const df_bin = b.addExecutable(.{
         .name = "df",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cmd/df/main.zig"),
@@ -243,9 +243,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    df_exe.image_base = user_image_base;
+    df_bin.image_base = user_image_base;
 
-    const dmesg_exe = b.addExecutable(.{
+    const dmesg_bin = b.addExecutable(.{
         .name = "dmesg",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cmd/dmesg/main.zig"),
@@ -256,9 +256,35 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    dmesg_exe.image_base = user_image_base;
+    dmesg_bin.image_base = user_image_base;
 
-    const tree_exe = b.addExecutable(.{
+    const head_bin = b.addExecutable(.{
+        .name = "head",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/head/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    head_bin.image_base = user_image_base;
+
+    const tail_bin = b.addExecutable(.{
+        .name = "tail",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/tail/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    tail_bin.image_base = user_image_base;
+
+    const tree_bin = b.addExecutable(.{
         .name = "tree",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cmd/tree/main.zig"),
@@ -269,9 +295,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    tree_exe.image_base = user_image_base;
+    tree_bin.image_base = user_image_base;
 
-    const free_exe = b.addExecutable(.{
+    const free_bin = b.addExecutable(.{
         .name = "free",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cmd/free/main.zig"),
@@ -282,9 +308,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    free_exe.image_base = user_image_base;
+    free_bin.image_base = user_image_base;
 
-    const fxfs_exe = b.addExecutable(.{
+    const fxfs_bin = b.addExecutable(.{
         .name = "fxfs",
         .root_module = b.createModule(.{
             .root_source_file = b.path("srv/fxfs/main.zig"),
@@ -295,9 +321,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    fxfs_exe.image_base = user_image_base;
+    fxfs_bin.image_base = user_image_base;
 
-    const partfs_exe = b.addExecutable(.{
+    const partfs_bin = b.addExecutable(.{
         .name = "partfs",
         .root_module = b.createModule(.{
             .root_source_file = b.path("srv/partfs/main.zig"),
@@ -308,7 +334,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    partfs_exe.image_base = user_image_base;
+    partfs_bin.image_base = user_image_base;
 
     // ── x86_64 UEFI kernel ──────────────────────────────────────────
     const x86_64_target = b.resolveTargetQuery(.{
@@ -327,7 +353,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    const x86_exe = b.addExecutable(.{
+    const x86_bin = b.addExecutable(.{
         .name = "BOOTX64",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
@@ -336,24 +362,24 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    x86_exe.root_module.addOptions("build_options", build_options);
-    x86_exe.addAssemblyFile(b.path("src/arch/x86_64/entry.S"));
+    x86_bin.root_module.addOptions("build_options", build_options);
+    x86_bin.addAssemblyFile(b.path("src/arch/x86_64/entry.S"));
 
-    const x86_install = b.addInstallArtifact(x86_exe, .{
+    const x86_install = b.addInstallArtifact(x86_bin, .{
         .dest_dir = .{ .override = .{ .custom = "esp/EFI/BOOT" } },
         .dest_sub_path = "BOOTX64.EFI",
     });
 
     // ── Initrd: boot-critical servers only ───────────────────────────
-    const x86_initrd = addInitrdStep(b, mkinitrd, "esp/EFI/BOOT", &.{ init_exe, partfs_exe, fxfs_exe });
+    const x86_initrd = addInitrdStep(b, mkinitrd, "esp/EFI/BOOT", &.{ init_bin, partfs_bin, fxfs_bin });
     x86_initrd.step.dependOn(&x86_install.step); // ensure ESP dir exists
 
     // ── Rootfs: install disk-bound programs to zig-out/rootfs/bin/ ──
     const disk_programs: []const *std.Build.Step.Compile = &.{
-        fsh_exe,  echo_exe,    cat_exe,  ls_exe,
-        rm_exe,   mkdir_exe,   wc_exe,   lsblk_exe,
-        df_exe,   dmesg_exe,   tree_exe, free_exe, ping_exe, hello_exe,
-        tcptest_exe, dnstest_exe,
+        fsh_bin,  echo_bin,    cat_bin,  ls_bin,
+        rm_bin,   mkdir_bin,   wc_bin,   lsblk_bin,
+        df_bin,   dmesg_bin,   head_bin, tail_bin, tree_bin, free_bin, ping_bin, hello_bin,
+        tcptest_bin, dnstest_bin,
     };
     for (disk_programs) |prog| {
         const install = b.addInstallArtifact(prog, .{
@@ -369,7 +395,7 @@ pub fn build(b: *std.Build) void {
         .abi = .msvc,
     });
 
-    const aarch64_exe = b.addExecutable(.{
+    const aarch64_bin = b.addExecutable(.{
         .name = "BOOTAA64",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
@@ -378,9 +404,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    aarch64_exe.root_module.addOptions("build_options", build_options);
+    aarch64_bin.root_module.addOptions("build_options", build_options);
 
-    const aarch64_install = b.addInstallArtifact(aarch64_exe, .{
+    const aarch64_install = b.addInstallArtifact(aarch64_bin, .{
         .dest_dir = .{ .override = .{ .custom = "esp-aarch64/EFI/BOOT" } },
         .dest_sub_path = "BOOTAA64.EFI",
     });
@@ -388,6 +414,107 @@ pub fn build(b: *std.Build) void {
     // aarch64 initrd: empty for now (no aarch64 userspace yet)
     const aarch64_initrd = addInitrdStep(b, mkinitrd, "esp-aarch64/EFI/BOOT", &.{});
     aarch64_initrd.step.dependOn(&aarch64_install.step);
+
+    // ── riscv64 freestanding kernel ─────────────────────────────────
+    // RISC-V boots via OpenSBI + direct kernel load (not UEFI PE/COFF,
+    // which Zig's linker doesn't support for riscv64).
+    const riscv64_freestanding = b.resolveTargetQuery(.{
+        .cpu_arch = .riscv64,
+        .os_tag = .freestanding,
+        .abi = .none,
+    });
+
+    const rv_fornax_module = b.createModule(.{
+        .root_source_file = b.path("lib/root.zig"),
+        .target = riscv64_freestanding,
+        .optimize = user_optimize,
+    });
+
+    const riscv64_bin = b.addExecutable(.{
+        .name = "fornax-riscv64",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = riscv64_freestanding,
+            .optimize = optimize,
+            .code_model = .medany, // PC-relative addressing for high addresses (0x80200000)
+        }),
+    });
+
+    riscv64_bin.root_module.addOptions("build_options", build_options);
+    riscv64_bin.addAssemblyFile(b.path("src/arch/riscv64/entry.S"));
+    riscv64_bin.entry = .disabled; // _start is in entry.S
+    riscv64_bin.setLinkerScript(b.path("src/arch/riscv64/kernel.ld"));
+
+    const riscv64_install = b.addInstallArtifact(riscv64_bin, .{
+        .dest_dir = .{ .override = .{ .custom = "esp-riscv64" } },
+    });
+
+    // riscv64 userspace programs
+    const rv_user_programs = .{
+        .{ "init", "cmd/init/main.zig" },
+        .{ "fsh", "cmd/fsh/main.zig" },
+        .{ "hello", "cmd/hello/main.zig" },
+        .{ "echo", "cmd/echo/main.zig" },
+        .{ "cat", "cmd/cat/main.zig" },
+        .{ "ls", "cmd/ls/main.zig" },
+        .{ "rm", "cmd/rm/main.zig" },
+        .{ "mkdir", "cmd/mkdir/main.zig" },
+        .{ "wc", "cmd/wc/main.zig" },
+        .{ "lsblk", "cmd/lsblk/main.zig" },
+        .{ "df", "cmd/df/main.zig" },
+        .{ "dmesg", "cmd/dmesg/main.zig" },
+        .{ "head", "cmd/head/main.zig" },
+        .{ "tail", "cmd/tail/main.zig" },
+        .{ "tree", "cmd/tree/main.zig" },
+        .{ "free", "cmd/free/main.zig" },
+        .{ "ping", "cmd/ping/main.zig" },
+        .{ "tcptest", "cmd/tcptest/main.zig" },
+        .{ "dnstest", "cmd/dnstest/main.zig" },
+        .{ "fxfs", "srv/fxfs/main.zig" },
+        .{ "partfs", "srv/partfs/main.zig" },
+    };
+
+    // Build riscv64 initrd programs (init, partfs, fxfs)
+    var rv_initrd_bins: [3]*std.Build.Step.Compile = undefined;
+    var rv_disk_bin_buf: [32]*std.Build.Step.Compile = undefined;
+    var rv_disk_bin_count: usize = 0;
+
+    inline for (rv_user_programs) |prog_info| {
+        const rv_prog = b.addExecutable(.{
+            .name = prog_info[0],
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(prog_info[1]),
+                .target = riscv64_freestanding,
+                .optimize = user_optimize,
+                .imports = &.{
+                    .{ .name = "fornax", .module = rv_fornax_module },
+                },
+            }),
+        });
+        rv_prog.image_base = user_image_base;
+
+        const name: []const u8 = prog_info[0];
+        if (std.mem.eql(u8, name, "init")) {
+            rv_initrd_bins[0] = rv_prog;
+        } else if (std.mem.eql(u8, name, "partfs")) {
+            rv_initrd_bins[1] = rv_prog;
+        } else if (std.mem.eql(u8, name, "fxfs")) {
+            rv_initrd_bins[2] = rv_prog;
+        } else {
+            rv_disk_bin_buf[rv_disk_bin_count] = rv_prog;
+            rv_disk_bin_count += 1;
+        }
+    }
+
+    const rv_initrd = addInitrdStep(b, mkinitrd, "esp-riscv64", &rv_initrd_bins);
+    rv_initrd.step.dependOn(&riscv64_install.step);
+
+    for (rv_disk_bin_buf[0..rv_disk_bin_count]) |prog| {
+        const install = b.addInstallArtifact(prog, .{
+            .dest_dir = .{ .override = .{ .custom = "rootfs-riscv64/bin" } },
+        });
+        rv_initrd.step.dependOn(&install.step);
+    }
 
     // ── Named steps ─────────────────────────────────────────────────
     const mkfxfs_install = b.addInstallArtifact(mkfxfs, .{});
@@ -405,6 +532,10 @@ pub fn build(b: *std.Build) void {
     const aarch64_step = b.step("aarch64", "Build aarch64 UEFI kernel");
     aarch64_step.dependOn(&aarch64_install.step);
     aarch64_step.dependOn(&aarch64_initrd.step);
+
+    const riscv64_step = b.step("riscv64", "Build riscv64 freestanding kernel");
+    riscv64_step.dependOn(&riscv64_install.step);
+    riscv64_step.dependOn(&rv_initrd.step);
 
     // Default: build both
     b.getInstallStep().dependOn(&x86_install.step);

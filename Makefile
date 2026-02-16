@@ -1,5 +1,5 @@
-.PHONY: all x86_64 aarch64 run run-x86_64 run-aarch64 disk disk-x86_64 disk-aarch64 clean clean-disk help
-.PHONY: release release-x86_64 release-aarch64 run-release disk-img disk-format
+.PHONY: all x86_64 aarch64 riscv64 run run-x86_64 run-aarch64 run-riscv64 disk disk-x86_64 disk-aarch64 clean clean-disk help
+.PHONY: release release-x86_64 release-aarch64 release-riscv64 run-release disk-img disk-format
 
 all: x86_64 aarch64
 
@@ -9,6 +9,9 @@ x86_64:
 aarch64:
 	zig build aarch64
 
+riscv64:
+	zig build riscv64
+
 # Release builds: ReleaseSafe everywhere (keeps bounds/overflow checks)
 release: release-x86_64 release-aarch64
 
@@ -17,6 +20,9 @@ release-x86_64:
 
 release-aarch64:
 	zig build aarch64 -Doptimize=ReleaseSafe
+
+release-riscv64:
+	zig build riscv64 -Doptimize=ReleaseSafe
 
 run: run-x86_64
 
@@ -28,6 +34,9 @@ run-release: release-x86_64
 
 run-aarch64: aarch64
 	./scripts/run-aarch64.sh
+
+run-riscv64: riscv64
+	./scripts/run-riscv64.sh
 
 disk: disk-x86_64
 
@@ -60,10 +69,12 @@ help:
 	@echo "  make                Build both architectures (debug kernel, ReleaseSafe userspace)"
 	@echo "  make x86_64         Build x86_64"
 	@echo "  make aarch64        Build aarch64"
+	@echo "  make riscv64        Build riscv64"
 	@echo "  make release        Build both architectures (ReleaseSafe everywhere)"
 	@echo "  make run             Run x86_64 in QEMU"
 	@echo "  make run-release     Run x86_64 in QEMU (ReleaseSafe kernel)"
 	@echo "  make run-aarch64     Run aarch64 in QEMU"
+	@echo "  make run-riscv64     Run riscv64 in QEMU"
 	@echo "  make disk            Create x86_64 bootable disk image"
 	@echo "  make clean-disk      Remove disk image (re-created and formatted on next run)"
 	@echo "  make clean           Remove build artifacts and disk images"

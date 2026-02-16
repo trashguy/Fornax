@@ -7,12 +7,14 @@ const mem = @import("mem.zig");
 
 const paging = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/paging.zig"),
+    .riscv64 => @import("arch/riscv64/paging.zig"),
     else => struct {
         pub const PageTable = struct { entries: [512]u64 };
         pub const Flags = struct {
             pub const PRESENT: u64 = 1;
             pub const WRITABLE: u64 = 2;
             pub const USER: u64 = 4;
+            pub const EXEC: u64 = 0;
         };
         pub fn mapPage(_: anytype, _: u64, _: u64, _: u64) ?void {}
         pub inline fn physPtr(phys: u64) [*]u8 {
@@ -27,6 +29,12 @@ const ELFCLASS64 = 2;
 const ELFDATA2LSB = 1;
 const ET_EXEC = 2;
 const EM_X86_64 = 62;
+const EM_RISCV = 243;
+const EM_EXPECTED = switch (@import("builtin").cpu.arch) {
+    .x86_64 => EM_X86_64,
+    .riscv64 => EM_RISCV,
+    else => @compileError("unsupported architecture for ELF loading"),
+};
 const PT_LOAD = 1;
 const PF_W = 2;
 const PF_X = 1;
@@ -86,7 +94,7 @@ pub fn load(page_table: *paging.PageTable, elf_data: []const u8) LoadError!LoadR
     if (!std.mem.eql(u8, header.e_ident[0..4], &ELF_MAGIC)) return error.InvalidMagic;
     if (header.e_ident[4] != ELFCLASS64) return error.Not64Bit;
     if (header.e_type != ET_EXEC) return error.NotExecutable;
-    if (header.e_machine != EM_X86_64) return error.WrongArch;
+    if (header.e_machine != EM_EXPECTED) return error.WrongArch;
     if (header.e_phnum == 0) return error.NoSegments;
 
     var highest_addr: u64 = 0;
@@ -127,6 +135,7 @@ fn loadSegment(page_table: *paging.PageTable, elf_data: []const u8, phdr: *align
     // Determine page flags
     var flags: u64 = paging.Flags.PRESENT | paging.Flags.USER;
     if (phdr.p_flags & PF_W != 0) flags |= paging.Flags.WRITABLE;
+    if (phdr.p_flags & PF_X != 0) flags |= paging.Flags.EXEC;
 
     // Map pages for this segment
     var vaddr = vaddr_start;

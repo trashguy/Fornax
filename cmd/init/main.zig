@@ -38,6 +38,10 @@ fn loadBin(name: []const u8) ?[]const u8 {
 export fn _start() noreturn {
     out.puts("init: started\n");
 
+    // Ensure standard directories exist
+    _ = fx.mkdir("/var");
+    _ = fx.mkdir("/var/log");
+
     while (true) {
         const elf_data = loadBin("fsh") orelse {
             out.puts("init: failed to load /bin/fsh\n");
