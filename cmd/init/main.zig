@@ -1,6 +1,6 @@
 /// Fornax init — PID 1.
 ///
-/// Loads fsh from /bin/fsh and respawns it in a loop.
+/// Spawns fsh on each virtual terminal (VT 0-3).
 const fx = @import("fornax");
 
 /// 4 MB buffer for loading ELF binaries (matches spawn syscall limit).
@@ -8,6 +8,8 @@ const fx = @import("fornax");
 var elf_buf: [4 * 1024 * 1024]u8 linksection(".bss") = undefined;
 
 const out = fx.io.Writer.stdout;
+
+const NUM_VTS = 4;
 
 /// Load an ELF from /bin/<name> into elf_buf. Returns the slice, or null on failure.
 fn loadBin(name: []const u8) ?[]const u8 {
@@ -42,21 +44,35 @@ export fn _start() noreturn {
     _ = fx.mkdir("/var");
     _ = fx.mkdir("/var/log");
 
-    while (true) {
-        const elf_data = loadBin("fsh") orelse {
-            out.puts("init: failed to load /bin/fsh\n");
-            fx.exit(1);
-        };
+    // Load fsh once
+    const elf_data = loadBin("fsh") orelse {
+        out.puts("init: failed to load /bin/fsh\n");
+        fx.exit(1);
+    };
 
-        out.puts("init: spawning fsh...\n");
+    // Spawn fsh on each VT
+    var num_shells: u8 = 0;
+    for (0..NUM_VTS) |i| {
+        // Set current process's VT (child inherits it)
+        var vt_cmd = [_]u8{ 'v', 't', ' ', '0' + @as(u8, @intCast(i)) };
+        _ = fx.write(0, &vt_cmd);
+
         const pid = fx.spawn(elf_data, &.{}, null);
-        out.print("init: spawn returned {d}\n", .{@as(u64, @bitCast(@as(i64, pid)))});
-        if (pid < 0) {
-            out.puts("init: failed to spawn fsh\n");
-            fx.exit(1);
+        if (pid >= 0) {
+            num_shells += 1;
+            out.print("init: fsh on VT {d}, pid={d}\n", .{ i, @as(u64, @bitCast(@as(i64, pid))) });
+        } else {
+            out.print("init: failed to spawn fsh on VT {d}\n", .{i});
         }
-
-        _ = fx.wait(@intCast(pid));
-        out.puts("init: fsh exited, respawning\n");
     }
+
+    // Wait for all shells to exit
+    var exited: u8 = 0;
+    while (exited < num_shells) {
+        _ = fx.wait(0);
+        exited += 1;
+    }
+
+    out.puts("init: all shells exited\n");
+    fx.exit(0);
 }

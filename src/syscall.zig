@@ -172,16 +172,16 @@ fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
             if (count == 0) return 0;
             const buf: [*]const u8 = @ptrFromInt(buf_ptr);
             const len: usize = @intCast(@min(count, 64));
-            keyboard.handleCtl(buf[0..len]);
+            keyboard.handleCtl(proc.vt, buf[0..len]);
             return len;
         }
         if ((fd == 1 or fd == 2) and proc.fds[fd] == null) {
-            // Default: direct framebuffer console + serial
+            // Default: direct framebuffer console + serial (routed to process's VT)
             if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
             if (count == 0) return 0;
             const buf: [*]const u8 = @ptrFromInt(buf_ptr);
             const len: usize = @intCast(@min(count, 4096));
-            console.puts(buf[0..len]);
+            console.putsVt(proc.vt, buf[0..len]);
             return len;
         }
         // Fall through to normal fd table path below
@@ -931,9 +931,9 @@ fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
             if (count == 0) return 0;
 
             // Check if data is already available
-            if (keyboard.dataAvailable()) {
+            if (keyboard.dataAvailable(proc0.vt)) {
                 const dest: [*]u8 = @ptrFromInt(buf_ptr);
-                const n = keyboard.read(dest, @intCast(@min(count, 4096)));
+                const n = keyboard.read(proc0.vt, dest, @intCast(@min(count, 4096)));
                 return n;
             }
 
@@ -941,7 +941,7 @@ fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
             proc0.pending_op = .console_read;
             proc0.ipc_recv_buf_ptr = buf_ptr;
             proc0.pending_fd = @intCast(@min(count, 4096)); // stash requested size
-            keyboard.registerWaiter(@intCast(proc0.pid), buf_ptr, @intCast(@min(count, 4096)));
+            keyboard.registerWaiter(proc0.vt, @intCast(proc0.pid), buf_ptr, @intCast(@min(count, 4096)));
             proc0.state = .blocked;
             process.scheduleNext();
         }

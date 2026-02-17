@@ -192,6 +192,8 @@ pub const Process = struct {
     needs_stack_free: bool = false,
     /// Tick at which a sleeping process should wake up.
     sleep_until: u32 = 0,
+    /// Virtual terminal index (0-3) for console I/O routing.
+    vt: u8 = 0,
 
     pub fn initFds(self: *Process) void {
         for (&self.fds) |*fd| {
@@ -364,6 +366,7 @@ pub fn init() void {
         p.pending_fd = 0;
         p.needs_stack_free = false;
         p.sleep_until = 0;
+        p.vt = 0;
         p.initFds();
     }
     initialized = true;
@@ -432,6 +435,7 @@ pub fn create() ?*Process {
     proc.pending_fd = 0;
     proc.needs_stack_free = false;
     proc.sleep_until = 0;
+    proc.vt = if (current) |cur| cur.vt else 0;
     namespace.getRootNamespace().cloneInto(&proc.ns);
     proc.ipc_msg = ipc.Message.init(.t_open);
     next_pid += 1;
@@ -690,16 +694,16 @@ fn switchTo(proc: *Process) noreturn {
     // Console read delivery — address space is active, so user pointers are valid
     if (proc.pending_op == .console_read) {
         const keyboard = @import("keyboard.zig");
-        if (keyboard.dataAvailable()) {
+        if (keyboard.dataAvailable(proc.vt)) {
             if (proc.ipc_recv_buf_ptr != 0 and proc.ipc_recv_buf_ptr < 0x0000_8000_0000_0000) {
                 const dest: [*]u8 = @ptrFromInt(proc.ipc_recv_buf_ptr);
                 const buf_size = proc.pending_fd; // we stash the count in pending_fd
-                const n = keyboard.read(dest, buf_size);
+                const n = keyboard.read(proc.vt, dest, buf_size);
                 proc.syscall_ret = n;
             } else {
                 proc.syscall_ret = 0;
             }
-            keyboard.clearWaiter();
+            keyboard.clearWaiter(proc.vt);
         } else {
             // Data not ready yet (spurious wake) — re-block
             proc.state = .blocked;

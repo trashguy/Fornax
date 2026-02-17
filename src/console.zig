@@ -12,27 +12,22 @@ pub const Framebuffer = struct {
 const bg_color: u32 = 0x00001A;
 const fg_color_rgb: u32 = 0xCCCCCC;
 
-var fb: Framebuffer = undefined;
-var cursor_x: u32 = 0;
-var cursor_y: u32 = 0;
-var cols: u32 = 0;
-var rows: u32 = 0;
-var initialized: bool = false;
+pub const NUM_VTS: u8 = 4;
+const MAX_COLS: u32 = 200;
+const MAX_ROWS: u32 = 80;
+
+// ── Character grid cell ──────────────────────────────────────────
+
+const Cell = struct {
+    char: u8 = ' ',
+    /// Color byte: lo nibble = fg index (0=default, 1-8=ANSI), hi nibble = bg index.
+    /// Reverse video is applied at store time (fg/bg swapped before storing).
+    color: u8 = 0,
+};
 
 // ── ANSI CSI state machine ─────────────────────────────────────────
 
 const ParseState = enum { normal, esc_seen, csi_param };
-var parse_state: ParseState = .normal;
-
-var csi_params: [8]u16 = undefined;
-var csi_param_count: u8 = 0;
-var csi_private: bool = false;
-
-// ── Attribute state ────────────────────────────────────────────────
-
-var reverse_video: bool = false;
-var fg_override: ?u32 = null;
-var bg_override: ?u32 = null;
 
 const ansi_palette = [8]u32{
     0x000000, // 0 black
@@ -44,6 +39,32 @@ const ansi_palette = [8]u32{
     0x00CCCC, // 6 cyan
     0xCCCCCC, // 7 white
 };
+
+// ── Per-VT display state ─────────────────────────────────────────
+
+const VtDisplay = struct {
+    grid: [MAX_COLS * MAX_ROWS]Cell,
+    cursor_x: u32,
+    cursor_y: u32,
+    reverse_video: bool,
+    fg_override: ?u8, // ANSI palette index 0-7
+    bg_override: ?u8,
+    parse_state: ParseState,
+    csi_params: [8]u16,
+    csi_param_count: u8,
+    csi_private: bool,
+};
+
+// ── Global state ─────────────────────────────────────────────────
+
+var fb: Framebuffer = undefined;
+var cols: u32 = 0;
+var rows: u32 = 0;
+var initialized: bool = false;
+pub var active_vt: u8 = 0;
+var vts: [NUM_VTS]VtDisplay linksection(".bss") = undefined;
+
+// ── Public API ───────────────────────────────────────────────────
 
 pub fn getCols() u32 {
     return cols;
@@ -57,146 +78,226 @@ pub fn init(framebuffer: Framebuffer) void {
     fb = framebuffer;
     cols = fb.width / font.char_width;
     rows = fb.height / font.char_height;
-    cursor_x = 0;
-    cursor_y = 0;
+    for (&vts) |*vt| {
+        initVt(vt);
+    }
+    active_vt = 0;
     initialized = true;
-    clearScreen();
+    clearFramebuffer();
 }
 
-pub fn clearScreen() void {
+fn initVt(vt: *VtDisplay) void {
+    vt.cursor_x = 0;
+    vt.cursor_y = 0;
+    vt.reverse_video = false;
+    vt.fg_override = null;
+    vt.bg_override = null;
+    vt.parse_state = .normal;
+    vt.csi_param_count = 0;
+    vt.csi_private = false;
+    for (&vt.csi_params) |*p| p.* = 0;
+    for (&vt.grid) |*cell| {
+        cell.char = ' ';
+        cell.color = 0;
+    }
+}
+
+/// Clear framebuffer to default background.
+fn clearFramebuffer() void {
     const total = fb.stride * fb.height;
     const bg = packColor(bg_color);
     for (0..total) |i| {
         fb.base[i] = bg;
     }
-    cursor_x = 0;
-    cursor_y = 0;
 }
 
+pub fn clearScreen() void {
+    clearScreenForVt(active_vt);
+}
+
+fn clearScreenForVt(idx: u8) void {
+    const vt = &vts[idx];
+    vt.cursor_x = 0;
+    vt.cursor_y = 0;
+    // Clear grid
+    const r = @min(rows, MAX_ROWS);
+    const c = @min(cols, MAX_COLS);
+    for (0..r) |row| {
+        for (0..c) |col| {
+            vt.grid[row * MAX_COLS + col] = .{ .char = ' ', .color = 0 };
+        }
+    }
+    if (idx == active_vt) {
+        clearFramebuffer();
+    }
+}
+
+/// Switch active virtual terminal and repaint.
+pub fn switchVt(n: u8) void {
+    if (n >= NUM_VTS) return;
+    active_vt = n;
+    repaint(n);
+}
+
+/// Repaint framebuffer from VT's character grid.
+fn repaint(idx: u8) void {
+    if (!initialized) return;
+    const vt = &vts[idx];
+    const r = @min(rows, MAX_ROWS);
+    const c = @min(cols, MAX_COLS);
+    for (0..r) |row| {
+        for (0..c) |col| {
+            const cell = vt.grid[row * MAX_COLS + col];
+            const fg_rgb = cellToFgRgb(cell.color);
+            const bg_rgb = cellToBgRgb(cell.color);
+            drawGlyph(@intCast(col), @intCast(row), cell.char, fg_rgb, bg_rgb);
+        }
+    }
+}
+
+// ── Output functions ─────────────────────────────────────────────
+
+/// Write string to active VT (for kernel messages, logging).
 pub fn puts(s: []const u8) void {
     for (s) |c| {
         putChar(c);
     }
 }
 
+/// Write string to a specific VT.
+pub fn putsVt(idx: u8, s: []const u8) void {
+    for (s) |c| {
+        putCharForVt(idx, c);
+    }
+}
+
+/// Write character to active VT.
 pub fn putChar(c: u8) void {
+    putCharForVt(active_vt, c);
+}
+
+/// Write character to a specific VT.
+pub fn putCharForVt(idx: u8, c: u8) void {
     // Mirror all output to serial console
     if (c == '\n') serial.putChar('\r');
     serial.putChar(c);
 
     if (!initialized) return;
+    if (idx >= NUM_VTS) return;
 
-    switch (parse_state) {
+    const vt = &vts[idx];
+
+    switch (vt.parse_state) {
         .normal => {
             if (c == 0x1B) {
-                parse_state = .esc_seen;
+                vt.parse_state = .esc_seen;
                 return;
             }
-            putCharNormal(c);
+            putCharNormalVt(vt, idx, c);
         },
         .esc_seen => {
             if (c == '[') {
-                parse_state = .csi_param;
-                csi_param_count = 0;
-                csi_params[0] = 0;
-                csi_private = false;
+                vt.parse_state = .csi_param;
+                vt.csi_param_count = 0;
+                vt.csi_params[0] = 0;
+                vt.csi_private = false;
             } else {
-                parse_state = .normal;
+                vt.parse_state = .normal;
                 // Not a CSI sequence — drop the ESC
             }
         },
         .csi_param => {
             if (c == '?') {
-                csi_private = true;
+                vt.csi_private = true;
             } else if (c >= '0' and c <= '9') {
-                if (csi_param_count == 0) csi_param_count = 1;
-                const idx = csi_param_count - 1;
-                if (idx < csi_params.len) {
-                    csi_params[idx] = csi_params[idx] *% 10 +% (c - '0');
+                if (vt.csi_param_count == 0) vt.csi_param_count = 1;
+                const i = vt.csi_param_count - 1;
+                if (i < vt.csi_params.len) {
+                    vt.csi_params[i] = vt.csi_params[i] *% 10 +% (c - '0');
                 }
             } else if (c == ';') {
-                if (csi_param_count < csi_params.len) {
-                    csi_param_count += 1;
-                    csi_params[csi_param_count - 1] = 0;
+                if (vt.csi_param_count < vt.csi_params.len) {
+                    vt.csi_param_count += 1;
+                    vt.csi_params[vt.csi_param_count - 1] = 0;
                 }
             } else if (c >= 0x40 and c <= 0x7E) {
                 // Final byte — execute and reset
-                executeCsi(c);
-                parse_state = .normal;
+                executeCsiVt(vt, idx, c);
+                vt.parse_state = .normal;
             } else {
                 // Unknown char in CSI — abort
-                parse_state = .normal;
+                vt.parse_state = .normal;
             }
         },
     }
 }
 
-fn executeCsi(final: u8) void {
-    const p0: u16 = if (csi_param_count >= 1) csi_params[0] else 0;
-    const p1: u16 = if (csi_param_count >= 2) csi_params[1] else 0;
+fn executeCsiVt(vt: *VtDisplay, idx: u8, final: u8) void {
+    const p0: u16 = if (vt.csi_param_count >= 1) vt.csi_params[0] else 0;
+    const p1: u16 = if (vt.csi_param_count >= 2) vt.csi_params[1] else 0;
 
     switch (final) {
         'H', 'f' => {
             // Cursor position: ESC[row;colH (1-based)
             const row = if (p0 > 0) p0 - 1 else 0;
             const col = if (p1 > 0) p1 - 1 else 0;
-            cursor_y = @min(row, rows -| 1);
-            cursor_x = @min(col, cols -| 1);
+            vt.cursor_y = @min(row, rows -| 1);
+            vt.cursor_x = @min(col, cols -| 1);
         },
         'A' => {
             // Cursor up
             const n: u32 = if (p0 > 0) p0 else 1;
-            cursor_y -|= n;
+            vt.cursor_y -|= n;
         },
         'B' => {
             // Cursor down
             const n: u32 = if (p0 > 0) p0 else 1;
-            cursor_y = @min(cursor_y + n, rows -| 1);
+            vt.cursor_y = @min(vt.cursor_y + n, rows -| 1);
         },
         'C' => {
             // Cursor forward
             const n: u32 = if (p0 > 0) p0 else 1;
-            cursor_x = @min(cursor_x + n, cols -| 1);
+            vt.cursor_x = @min(vt.cursor_x + n, cols -| 1);
         },
         'D' => {
             // Cursor back
             const n: u32 = if (p0 > 0) p0 else 1;
-            cursor_x -|= n;
+            vt.cursor_x -|= n;
         },
         'J' => {
             if (p0 == 2) {
-                clearScreen();
+                clearScreenForVt(idx);
             }
         },
         'K' => {
             // Clear to end of line
-            clearToEndOfLine();
+            clearToEndOfLineVt(vt, idx);
         },
         'm' => {
             // SGR — Select Graphic Rendition
-            if (csi_param_count == 0) {
+            if (vt.csi_param_count == 0) {
                 // ESC[m = reset
-                reverse_video = false;
-                fg_override = null;
-                bg_override = null;
+                vt.reverse_video = false;
+                vt.fg_override = null;
+                vt.bg_override = null;
                 return;
             }
             var i: u8 = 0;
-            while (i < csi_param_count) : (i += 1) {
-                const p = csi_params[i];
+            while (i < vt.csi_param_count) : (i += 1) {
+                const p = vt.csi_params[i];
                 switch (p) {
                     0 => {
-                        reverse_video = false;
-                        fg_override = null;
-                        bg_override = null;
+                        vt.reverse_video = false;
+                        vt.fg_override = null;
+                        vt.bg_override = null;
                     },
                     1 => {}, // bold — ignore
-                    7 => reverse_video = true,
-                    27 => reverse_video = false,
-                    30...37 => fg_override = ansi_palette[p - 30],
-                    39 => fg_override = null,
-                    40...47 => bg_override = ansi_palette[p - 40],
-                    49 => bg_override = null,
+                    7 => vt.reverse_video = true,
+                    27 => vt.reverse_video = false,
+                    30...37 => vt.fg_override = @intCast(p - 30),
+                    39 => vt.fg_override = null,
+                    40...47 => vt.bg_override = @intCast(p - 40),
+                    49 => vt.bg_override = null,
                     else => {},
                 }
             }
@@ -211,55 +312,61 @@ fn executeCsi(final: u8) void {
     }
 }
 
-fn putCharNormal(c: u8) void {
+fn putCharNormalVt(vt: *VtDisplay, idx: u8, c: u8) void {
     if (c == '\n') {
-        cursor_x = 0;
-        cursor_y += 1;
-        if (cursor_y >= rows) {
-            scrollUp();
-            cursor_y = rows - 1;
+        vt.cursor_x = 0;
+        vt.cursor_y += 1;
+        if (vt.cursor_y >= rows) {
+            scrollUpVt(vt, idx);
+            vt.cursor_y = rows - 1;
         }
         return;
     }
 
     if (c == '\r') {
-        cursor_x = 0;
+        vt.cursor_x = 0;
         return;
     }
 
     // Backspace: move cursor back one position
     if (c == 0x08) {
-        if (cursor_x > 0) {
-            cursor_x -= 1;
+        if (vt.cursor_x > 0) {
+            vt.cursor_x -= 1;
         }
         return;
     }
 
-    if (cursor_x >= cols) {
-        cursor_x = 0;
-        cursor_y += 1;
-        if (cursor_y >= rows) {
-            scrollUp();
-            cursor_y = rows - 1;
+    if (vt.cursor_x >= cols) {
+        vt.cursor_x = 0;
+        vt.cursor_y += 1;
+        if (vt.cursor_y >= rows) {
+            scrollUpVt(vt, idx);
+            vt.cursor_y = rows - 1;
         }
     }
 
-    drawGlyph(cursor_x, cursor_y, c);
-    cursor_x += 1;
+    // Compute cell color (reverse video applied at store time)
+    const color = makeCellColor(vt);
+
+    // Update grid
+    if (vt.cursor_y < MAX_ROWS and vt.cursor_x < MAX_COLS) {
+        vt.grid[vt.cursor_y * MAX_COLS + vt.cursor_x] = .{ .char = c, .color = color };
+    }
+
+    // Draw to framebuffer only if this is the active VT
+    if (idx == active_vt) {
+        const fg_rgb = cellToFgRgb(color);
+        const bg_rgb = cellToBgRgb(color);
+        drawGlyph(vt.cursor_x, vt.cursor_y, c, fg_rgb, bg_rgb);
+    }
+
+    vt.cursor_x += 1;
 }
 
-fn drawGlyph(col: u32, row: u32, c: u8) void {
+fn drawGlyph(col: u32, row: u32, c: u8, fg_rgb: u32, bg_rgb: u32) void {
     const glyph = font.getGlyph(c);
     const px = col * font.char_width;
     const py = row * font.char_height;
-
-    var fg_rgb = fg_override orelse fg_color_rgb;
-    var bg_rgb = bg_override orelse bg_color;
-    if (reverse_video) {
-        const tmp = fg_rgb;
-        fg_rgb = bg_rgb;
-        bg_rgb = tmp;
-    }
 
     const fg = packColor(fg_rgb);
     const bg = packColor(bg_rgb);
@@ -274,37 +381,95 @@ fn drawGlyph(col: u32, row: u32, c: u8) void {
     }
 }
 
-fn clearToEndOfLine() void {
-    if (cursor_x >= cols) return;
-    const bg_rgb = bg_override orelse bg_color;
-    const bg = packColor(if (reverse_video) (fg_override orelse fg_color_rgb) else bg_rgb);
+fn clearToEndOfLineVt(vt: *VtDisplay, idx: u8) void {
+    if (vt.cursor_x >= cols) return;
 
-    const px_start = cursor_x * font.char_width;
-    const py = cursor_y * font.char_height;
+    // Clear grid cells from cursor to end of line
+    const color = makeCellColor(vt);
+    if (vt.cursor_y < MAX_ROWS) {
+        const c = @min(cols, MAX_COLS);
+        for (vt.cursor_x..c) |col| {
+            vt.grid[vt.cursor_y * MAX_COLS + col] = .{ .char = ' ', .color = color };
+        }
+    }
 
-    for (0..font.char_height) |y| {
-        const base = (py + @as(u32, @intCast(y))) * fb.stride + px_start;
-        const remaining = cols * font.char_width - px_start;
-        for (0..remaining) |x| {
-            fb.base[base + @as(u32, @intCast(x))] = bg;
+    // Clear framebuffer only if active VT
+    if (idx == active_vt) {
+        const bg_rgb = cellToBgRgb(color);
+        const bg = packColor(bg_rgb);
+
+        const px_start = vt.cursor_x * font.char_width;
+        const py = vt.cursor_y * font.char_height;
+
+        for (0..font.char_height) |y| {
+            const base = (py + @as(u32, @intCast(y))) * fb.stride + px_start;
+            const remaining = cols * font.char_width - px_start;
+            for (0..remaining) |x| {
+                fb.base[base + @as(u32, @intCast(x))] = bg;
+            }
         }
     }
 }
 
-fn scrollUp() void {
-    const line_pixels = font.char_height * fb.stride;
-    const total_lines = (rows - 1) * line_pixels;
-
-    // Move rows up by one text row
-    for (0..total_lines) |i| {
-        fb.base[i] = fb.base[i + line_pixels];
+fn scrollUpVt(vt: *VtDisplay, idx: u8) void {
+    // Scroll grid: move rows up by one
+    const r = @min(rows, MAX_ROWS);
+    const c = @min(cols, MAX_COLS);
+    for (1..r) |row| {
+        for (0..c) |col| {
+            vt.grid[(row - 1) * MAX_COLS + col] = vt.grid[row * MAX_COLS + col];
+        }
+    }
+    // Clear last row in grid
+    if (r > 0) {
+        for (0..c) |col| {
+            vt.grid[(r - 1) * MAX_COLS + col] = .{ .char = ' ', .color = 0 };
+        }
     }
 
-    // Clear the last text row
-    const bg = packColor(bg_color);
-    for (total_lines..total_lines + line_pixels) |i| {
-        fb.base[i] = bg;
+    // Scroll framebuffer only if active VT
+    if (idx == active_vt) {
+        const line_pixels = font.char_height * fb.stride;
+        const total_lines = (rows - 1) * line_pixels;
+
+        // Move rows up by one text row
+        for (0..total_lines) |i| {
+            fb.base[i] = fb.base[i + line_pixels];
+        }
+
+        // Clear the last text row
+        const bg = packColor(bg_color);
+        for (total_lines..total_lines + line_pixels) |i| {
+            fb.base[i] = bg;
+        }
     }
+}
+
+// ── Color helpers ────────────────────────────────────────────────
+
+/// Compute cell color byte from current VT attribute state.
+/// Reverse video is applied here (fg/bg indices swapped).
+fn makeCellColor(vt: *const VtDisplay) u8 {
+    var fg_idx: u8 = if (vt.fg_override) |idx| idx + 1 else 0;
+    var bg_idx: u8 = if (vt.bg_override) |idx| idx + 1 else 0;
+    if (vt.reverse_video) {
+        const tmp = fg_idx;
+        fg_idx = bg_idx;
+        bg_idx = tmp;
+    }
+    return fg_idx | (bg_idx << 4);
+}
+
+/// Convert cell color byte's fg nibble to RGB.
+fn cellToFgRgb(color: u8) u32 {
+    const idx = color & 0x0F;
+    return if (idx == 0) fg_color_rgb else ansi_palette[idx - 1];
+}
+
+/// Convert cell color byte's bg nibble to RGB.
+fn cellToBgRgb(color: u8) u32 {
+    const idx = (color >> 4) & 0x0F;
+    return if (idx == 0) bg_color else ansi_palette[idx - 1];
 }
 
 /// Convert 0xRRGGBB to the correct pixel format.
@@ -319,6 +484,8 @@ fn packColor(rgb: u32) u32 {
         return rgb;
     }
 }
+
+// ── Numeric output (kernel logging) ──────────────────────────────
 
 /// Print an unsigned integer in decimal.
 pub fn putDec(val: u64) void {

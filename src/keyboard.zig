@@ -1,8 +1,8 @@
 /// Keyboard module — translates evdev keycodes to ASCII.
 ///
-/// Provides a 256-byte ring buffer for processed characters.
-/// Supports line mode (default) with echo/backspace/enter and raw mode.
-/// Tracks shift, ctrl, alt, and caps lock state.
+/// Per-VT input state: each virtual terminal has its own ring buffer,
+/// line editing buffer, raw/echo modes, and waiter.
+/// Modifier keys (shift/ctrl/alt/caps) remain global (hardware state).
 
 const console = @import("console.zig");
 const serial = @import("serial.zig");
@@ -10,41 +10,51 @@ const process = @import("process.zig");
 
 /// Ring buffer for processed characters.
 const RING_SIZE: usize = 256;
-var ring: [RING_SIZE]u8 = undefined;
-var ring_head: usize = 0; // next write position
-var ring_tail: usize = 0; // next read position
-
 /// Line editing buffer (for line mode).
 const LINE_SIZE: usize = 256;
-var line_buf: [LINE_SIZE]u8 = undefined;
-var line_len: usize = 0;
 
-/// Modifier state
+const NUM_VTS = console.NUM_VTS;
+
+// ── Per-VT input state ──────────────────────────────────────────
+
+const VtInput = struct {
+    ring: [RING_SIZE]u8 = [_]u8{0} ** RING_SIZE,
+    ring_head: usize = 0,
+    ring_tail: usize = 0,
+    line_buf: [LINE_SIZE]u8 = [_]u8{0} ** LINE_SIZE,
+    line_len: usize = 0,
+    raw_mode: bool = false,
+    echo_on: bool = true,
+    waiting_pid: ?u16 = null,
+    waiting_buf_ptr: u64 = 0,
+    waiting_buf_size: usize = 0,
+};
+
+var vt_inputs: [NUM_VTS]VtInput = [_]VtInput{.{}} ** NUM_VTS;
+
+// ── Global modifier state (hardware) ────────────────────────────
+
 var shift_held: bool = false;
 var ctrl_held: bool = false;
 var alt_held: bool = false;
 var caps_lock: bool = false;
 
-/// Console mode
-var raw_mode: bool = false;
-var echo_on: bool = true;
-
-/// Blocking support: PID of process waiting for console input.
-var waiting_pid: ?u16 = null;
-/// User buffer pointer and size for the waiting read.
-var waiting_buf_ptr: u64 = 0;
-var waiting_buf_size: usize = 0;
+// ── Control commands ─────────────────────────────────────────────
 
 /// Handle a console control command (Plan 9 style: write to fd 0).
-pub fn handleCtl(cmd: []const u8) void {
+/// vt = the calling process's VT (for rawon/rawoff/echo/size).
+pub fn handleCtl(vt: u8, cmd: []const u8) void {
+    if (vt >= NUM_VTS) return;
+    const input = &vt_inputs[vt];
+
     if (eql(cmd, "rawon")) {
-        raw_mode = true;
+        input.raw_mode = true;
     } else if (eql(cmd, "rawoff")) {
-        raw_mode = false;
+        input.raw_mode = false;
     } else if (eql(cmd, "echo on")) {
-        echo_on = true;
+        input.echo_on = true;
     } else if (eql(cmd, "echo off")) {
-        echo_on = false;
+        input.echo_on = false;
     } else if (eql(cmd, "size")) {
         // Return "cols rows\n" via ring buffer
         var buf: [24]u8 = undefined;
@@ -55,8 +65,16 @@ pub fn handleCtl(cmd: []const u8) void {
         len += formatDecInto(buf[len..], console.getRows());
         buf[len] = '\n';
         len += 1;
-        for (buf[0..len]) |c| pushToRing(c);
-        wakeWaiter();
+        for (buf[0..len]) |c| pushToRingVt(input, c);
+        wakeWaiterVt(input);
+    } else if (cmd.len >= 4 and cmd[0] == 'v' and cmd[1] == 't' and cmd[2] == ' ') {
+        // "vt N" — set calling process's VT
+        if (process.getCurrent()) |proc| {
+            const n = cmd[3] -% '0';
+            if (n < NUM_VTS) {
+                proc.vt = n;
+            }
+        }
     }
 }
 
@@ -79,10 +97,12 @@ fn formatDecInto(buf: []u8, val: u32) usize {
     return i;
 }
 
+// ── Key event handling ───────────────────────────────────────────
+
 /// Handle an evdev key event from the virtio-input driver.
 /// code = Linux keycode, value = 0 (release), 1 (press), 2 (repeat).
 pub fn handleEvdevKey(code: u16, value: u32) void {
-    // Handle modifier keys
+    // Handle modifier keys (global — hardware state)
     switch (code) {
         KEY_LEFTSHIFT, KEY_RIGHTSHIFT => {
             shift_held = (value != 0);
@@ -106,8 +126,35 @@ pub fn handleEvdevKey(code: u16, value: u32) void {
     // Only process on press and repeat (not release)
     if (value == 0) return;
 
+    // Alt+F1-F4: switch virtual terminals
+    if (alt_held) {
+        switch (code) {
+            KEY_F1 => {
+                console.switchVt(0);
+                return;
+            },
+            KEY_F2 => {
+                console.switchVt(1);
+                return;
+            },
+            KEY_F3 => {
+                console.switchVt(2);
+                return;
+            },
+            KEY_F4 => {
+                console.switchVt(3);
+                return;
+            },
+            else => {},
+        }
+    }
+
+    const vt = console.active_vt;
+    if (vt >= NUM_VTS) return;
+    const input = &vt_inputs[vt];
+
     // Arrow/Home/End keys: emit ANSI escape sequences in raw mode
-    if (raw_mode) {
+    if (input.raw_mode) {
         const esc_char: ?u8 = switch (code) {
             KEY_UP => 'A',
             KEY_DOWN => 'B',
@@ -118,115 +165,135 @@ pub fn handleEvdevKey(code: u16, value: u32) void {
             else => null,
         };
         if (esc_char) |c| {
-            pushToRing(0x1B);
-            pushToRing('[');
-            pushToRing(c);
-            wakeWaiter();
+            pushToRingVt(input, 0x1B);
+            pushToRingVt(input, '[');
+            pushToRingVt(input, c);
+            wakeWaiterVt(input);
             return;
         }
     }
 
     // Translate keycode to ASCII
     const ascii = translateToAscii(code) orelse return;
-    handleChar(ascii);
+    handleCharVt(vt, ascii);
 }
 
 /// Handle a raw ASCII character (from serial or translated evdev key).
+/// Routes to the active VT's input state.
 pub fn handleChar(ascii: u8) void {
-    if (raw_mode) {
+    handleCharVt(console.active_vt, ascii);
+}
+
+fn handleCharVt(vt: u8, ascii: u8) void {
+    if (vt >= NUM_VTS) return;
+    const input = &vt_inputs[vt];
+
+    if (input.raw_mode) {
         // Raw mode: push immediately to ring buffer
-        pushToRing(ascii);
-        wakeWaiter();
+        pushToRingVt(input, ascii);
+        wakeWaiterVt(input);
     } else {
         // Line mode
         if (ascii == '\n' or ascii == '\r') {
             // Submit line
-            if (echo_on) console.putChar('\n');
+            if (input.echo_on) console.putChar('\n');
             // Copy line buffer to ring
-            for (line_buf[0..line_len]) |c| {
-                pushToRing(c);
+            for (input.line_buf[0..input.line_len]) |c| {
+                pushToRingVt(input, c);
             }
-            pushToRing('\n');
-            line_len = 0;
-            wakeWaiter();
+            pushToRingVt(input, '\n');
+            input.line_len = 0;
+            wakeWaiterVt(input);
         } else if (ascii == 0x08 or ascii == 0x7F) {
             // Backspace
-            if (line_len > 0) {
-                line_len -= 1;
-                if (echo_on) eraseChar();
+            if (input.line_len > 0) {
+                input.line_len -= 1;
+                if (input.echo_on) eraseChar();
             }
         } else if (ascii >= 0x20 or ascii == '\t') {
             // Printable character or tab
-            if (line_len < LINE_SIZE) {
-                line_buf[line_len] = ascii;
-                line_len += 1;
-                if (echo_on) console.putChar(ascii);
+            if (input.line_len < LINE_SIZE) {
+                input.line_buf[input.line_len] = ascii;
+                input.line_len += 1;
+                if (input.echo_on) console.putChar(ascii);
             }
         } else {
             // Control characters (Ctrl-C = 0x03, Ctrl-D = 0x04, etc.)
-            pushToRing(ascii);
-            wakeWaiter();
+            pushToRingVt(input, ascii);
+            wakeWaiterVt(input);
         }
     }
 }
 
-/// Read from the ring buffer. Returns number of bytes read.
-pub fn read(buf: [*]u8, max_len: usize) usize {
+// ── Per-VT read/waiter API ───────────────────────────────────────
+
+/// Read from the specified VT's ring buffer. Returns number of bytes read.
+pub fn read(vt: u8, buf: [*]u8, max_len: usize) usize {
+    if (vt >= NUM_VTS) return 0;
+    const input = &vt_inputs[vt];
     var count: usize = 0;
-    while (count < max_len and ring_tail != ring_head) {
-        buf[count] = ring[ring_tail];
-        ring_tail = (ring_tail + 1) % RING_SIZE;
+    while (count < max_len and input.ring_tail != input.ring_head) {
+        buf[count] = input.ring[input.ring_tail];
+        input.ring_tail = (input.ring_tail + 1) % RING_SIZE;
         count += 1;
         // In line mode, stop after newline
-        if (!raw_mode and count > 0 and buf[count - 1] == '\n') break;
+        if (!input.raw_mode and count > 0 and buf[count - 1] == '\n') break;
     }
     return count;
 }
 
-/// Check if data is available to read.
-pub fn dataAvailable() bool {
-    if (ring_tail == ring_head) return false;
-    if (raw_mode) return true;
+/// Check if data is available to read on a specific VT.
+pub fn dataAvailable(vt: u8) bool {
+    if (vt >= NUM_VTS) return false;
+    const input = &vt_inputs[vt];
+    if (input.ring_tail == input.ring_head) return false;
+    if (input.raw_mode) return true;
     // In line mode, only return true if there's a complete line (contains \n)
-    var i = ring_tail;
-    while (i != ring_head) {
-        if (ring[i] == '\n') return true;
+    var i = input.ring_tail;
+    while (i != input.ring_head) {
+        if (input.ring[i] == '\n') return true;
         i = (i + 1) % RING_SIZE;
     }
     return false;
 }
 
-/// Register a process as waiting for console input.
-pub fn registerWaiter(pid: u16, buf_ptr: u64, buf_size: usize) void {
-    waiting_pid = pid;
-    waiting_buf_ptr = buf_ptr;
-    waiting_buf_size = buf_size;
+/// Register a process as waiting for input on a specific VT.
+pub fn registerWaiter(vt: u8, pid: u16, buf_ptr: u64, buf_size: usize) void {
+    if (vt >= NUM_VTS) return;
+    const input = &vt_inputs[vt];
+    input.waiting_pid = pid;
+    input.waiting_buf_ptr = buf_ptr;
+    input.waiting_buf_size = buf_size;
 }
 
 /// Get the waiting process info for delivery in switchTo.
-pub fn getWaiter() ?struct { pid: u16, buf_ptr: u64, buf_size: usize } {
-    const pid = waiting_pid orelse return null;
-    return .{ .pid = pid, .buf_ptr = waiting_buf_ptr, .buf_size = waiting_buf_size };
+pub fn getWaiter(vt: u8) ?struct { pid: u16, buf_ptr: u64, buf_size: usize } {
+    if (vt >= NUM_VTS) return null;
+    const input = &vt_inputs[vt];
+    const pid = input.waiting_pid orelse return null;
+    return .{ .pid = pid, .buf_ptr = input.waiting_buf_ptr, .buf_size = input.waiting_buf_size };
 }
 
 /// Clear the waiter after delivery.
-pub fn clearWaiter() void {
-    waiting_pid = null;
-    waiting_buf_ptr = 0;
-    waiting_buf_size = 0;
+pub fn clearWaiter(vt: u8) void {
+    if (vt >= NUM_VTS) return;
+    const input = &vt_inputs[vt];
+    input.waiting_pid = null;
+    input.waiting_buf_ptr = 0;
+    input.waiting_buf_size = 0;
 }
 
-// ---- Internal helpers ----
+// ── Internal helpers ─────────────────────────────────────────────
 
-fn pushToRing(c: u8) void {
-    const next = (ring_head + 1) % RING_SIZE;
-    if (next == ring_tail) return; // buffer full, drop character
-    ring[ring_head] = c;
-    ring_head = next;
+fn pushToRingVt(input: *VtInput, c: u8) void {
+    const next = (input.ring_head + 1) % RING_SIZE;
+    if (next == input.ring_tail) return; // buffer full, drop character
+    input.ring[input.ring_head] = c;
+    input.ring_head = next;
 }
 
-fn wakeWaiter() void {
-    const pid = waiting_pid orelse return;
+fn wakeWaiterVt(input: *VtInput) void {
+    const pid = input.waiting_pid orelse return;
     if (process.getByPid(pid)) |proc| {
         if (proc.state == .blocked) {
             proc.state = .ready;
@@ -423,6 +490,13 @@ const KEY_SLASH: u16 = 53;
 const KEY_RIGHTSHIFT: u16 = 54;
 const KEY_SPACE: u16 = 57;
 const KEY_CAPSLOCK: u16 = 58;
+
+// Function keys (for VT switching)
+const KEY_F1: u16 = 59;
+const KEY_F2: u16 = 60;
+const KEY_F3: u16 = 61;
+const KEY_F4: u16 = 62;
+
 const KEY_DELETE: u16 = 111;
 const KEY_RIGHTCTRL: u16 = 97;
 const KEY_LEFTALT: u16 = 56;
