@@ -453,6 +453,58 @@ const touch_bin = b.addExecutable(.{
     });
     dd_bin.image_base = user_image_base;
 
+    const chmod_bin = b.addExecutable(.{
+        .name = "chmod",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/chmod/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    chmod_bin.image_base = user_image_base;
+
+    const chown_bin = b.addExecutable(.{
+        .name = "chown",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/chown/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    chown_bin.image_base = user_image_base;
+
+    const chgrp_bin = b.addExecutable(.{
+        .name = "chgrp",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/chgrp/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    chgrp_bin.image_base = user_image_base;
+
+    const ip_bin = b.addExecutable(.{
+        .name = "ip",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/ip/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    ip_bin.image_base = user_image_base;
+
     const grep_bin = b.addExecutable(.{
         .name = "grep",
         .root_module = b.createModule(.{
@@ -590,6 +642,7 @@ const touch_bin = b.addExecutable(.{
         tcptest_bin, dnstest_bin, shutdown_bin, reboot_bin,
         ps_bin, kill_bin, du_bin, top_bin,
         cp_bin, mv_bin, touch_bin, truncate_bin, dd_bin,
+        chmod_bin, chown_bin, chgrp_bin, ip_bin,
         grep_bin, sed_bin, awk_bin, less_bin,
         fe_bin,
     };
@@ -693,6 +746,10 @@ const touch_bin = b.addExecutable(.{
         .{ "touch", "cmd/touch/main.zig" },
         .{ "truncate", "cmd/truncate/main.zig" },
         .{ "dd", "cmd/dd/main.zig" },
+        .{ "chmod", "cmd/chmod/main.zig" },
+        .{ "chown", "cmd/chown/main.zig" },
+        .{ "chgrp", "cmd/chgrp/main.zig" },
+        .{ "ip", "cmd/ip/main.zig" },
         .{ "grep", "cmd/grep/main.zig" },
         .{ "sed", "cmd/sed/main.zig" },
         .{ "awk", "cmd/awk/main.zig" },

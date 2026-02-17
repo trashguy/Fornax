@@ -33,6 +33,10 @@ pub const OpenResult = struct {
 /// Parse a /net/* path and perform the open operation.
 /// `path` should have the leading "/net/" stripped (e.g., "tcp/clone").
 pub fn netOpen(path: []const u8) ?OpenResult {
+    if (eql(path, "status")) {
+        return .{ .kind = .net_status, .conn = 0 };
+    }
+
     if (startsWith(path, "tcp/clone")) {
         // Allocate a new TCP connection
         const idx = tcp.alloc() orelse return null;
@@ -186,6 +190,46 @@ pub fn netRead(kind: NetFdKind, conn: u8, buf: []u8, read_done: *bool) ?u16 {
         },
         .icmp_ctl => {
             return 0;
+        },
+        .net_status => {
+            if (read_done.*) return 0;
+            // Format: mac XXXXXXXXXXXX\nip A.B.C.D\ngateway A.B.C.D\nmask A.B.C.D\n
+            var pos: u16 = 0;
+            // mac line
+            const mac_prefix = "mac ";
+            @memcpy(buf[pos..][0..mac_prefix.len], mac_prefix);
+            pos += mac_prefix.len;
+            const mac = net.getMac();
+            for (mac) |b| {
+                buf[pos] = formatHexNibble(b >> 4);
+                buf[pos + 1] = formatHexNibble(b & 0xF);
+                pos += 2;
+            }
+            buf[pos] = '\n';
+            pos += 1;
+            // ip line
+            const ip_prefix = "ip ";
+            @memcpy(buf[pos..][0..ip_prefix.len], ip_prefix);
+            pos += ip_prefix.len;
+            pos += formatIp(buf[pos..], net.getIp());
+            buf[pos] = '\n';
+            pos += 1;
+            // gateway line
+            const gw_prefix = "gateway ";
+            @memcpy(buf[pos..][0..gw_prefix.len], gw_prefix);
+            pos += gw_prefix.len;
+            pos += formatIp(buf[pos..], net.getGateway());
+            buf[pos] = '\n';
+            pos += 1;
+            // mask line
+            const mask_prefix = "mask ";
+            @memcpy(buf[pos..][0..mask_prefix.len], mask_prefix);
+            pos += mask_prefix.len;
+            pos += formatIp(buf[pos..], net.getSubnet());
+            buf[pos] = '\n';
+            pos += 1;
+            read_done.* = true;
+            return pos;
         },
     }
 }
@@ -506,6 +550,10 @@ fn eql(a: []const u8, b: []const u8) bool {
         if (x != y) return false;
     }
     return true;
+}
+
+fn formatHexNibble(val: u8) u8 {
+    return if (val < 10) '0' + val else 'a' + val - 10;
 }
 
 fn trimNewline(s: []const u8) []const u8 {

@@ -1867,6 +1867,9 @@ fn handleStat(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
     writeU32LE(resp.data[4..8], if (isDirectory(inode)) 1 else 0);
     writeU64LE(resp.data[8..16], inode.mtime);
     writeU64LE(resp.data[16..24], inode.ctime);
+    writeU32LE(resp.data[24..28], @as(u32, inode.mode));
+    writeU16LE(resp.data[28..30], inode.uid);
+    writeU16LE(resp.data[30..32], inode.gid);
     resp.data_len = 64;
 }
 
@@ -2420,6 +2423,79 @@ fn handleTruncate(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
     resp.data_len = 0;
 }
 
+fn handleWstat(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
+    if (req.data_len < 24) {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    }
+
+    const handle_id = readU32LE(req.data[0..4]);
+    const mask = readU32LE(req.data[4..8]);
+    const new_mode = readU32LE(req.data[8..12]);
+    const new_uid = readU32LE(req.data[12..16]);
+    const new_gid = readU32LE(req.data[16..20]);
+    const caller_uid = readU32LE(req.data[20..24]);
+
+    const h = getHandle(handle_id) orelse {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    };
+
+    var inode = readInode(h.inode_nr) orelse {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    };
+
+    // Apply requested changes
+    if (mask & 0x1 != 0) {
+        // Mode: update permission bits only, preserve file type
+        inode.mode = (inode.mode & S_IFMT) | @as(u16, @truncate(new_mode & 0o7777));
+    }
+    if (mask & 0x2 != 0) {
+        // UID: only root (uid 0) can chown
+        if (caller_uid != 0) {
+            resp.* = fx.IpcMessage.init(fx.R_ERROR);
+            return;
+        }
+        inode.uid = @truncate(new_uid);
+    }
+    if (mask & 0x4 != 0) {
+        // GID: only root or owner can chgrp
+        if (caller_uid != 0 and caller_uid != inode.uid) {
+            resp.* = fx.IpcMessage.init(fx.R_ERROR);
+            return;
+        }
+        inode.gid = @truncate(new_gid);
+    }
+
+    // Update ctime
+    inode.ctime = getTime();
+
+    // Write inode back
+    var inode_data: [INODE_ITEM_SIZE]u8 = undefined;
+    writeU16LE(inode_data[0..2], inode.mode);
+    writeU16LE(inode_data[2..4], inode.uid);
+    writeU16LE(inode_data[4..6], inode.gid);
+    writeU16LE(inode_data[6..8], inode.nlinks);
+    writeU64LE(inode_data[8..16], inode.size);
+    writeU64LE(inode_data[16..24], inode.atime);
+    writeU64LE(inode_data[24..32], inode.mtime);
+    writeU64LE(inode_data[32..40], inode.ctime);
+
+    if (!btreeUpdate(.{ .inode_nr = h.inode_nr, .item_type = INODE_ITEM, .offset = 0 }, &inode_data)) {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    }
+
+    if (!commitTransaction()) {
+        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        return;
+    }
+
+    resp.* = fx.IpcMessage.init(fx.R_OK);
+    resp.data_len = 0;
+}
+
 fn formatDisk() bool {
     // Probe disk size: try reading blocks to find total capacity
     // A 64MB disk = 16384 blocks. Try common sizes.
@@ -2545,6 +2621,7 @@ export fn _start() noreturn {
             fx.T_REMOVE => handleRemove(&msg, &reply),
             fx.T_RENAME => handleRename(&msg, &reply),
             fx.T_TRUNCATE => handleTruncate(&msg, &reply),
+            fx.T_WSTAT => handleWstat(&msg, &reply),
             else => {
                 reply = fx.IpcMessage.init(fx.R_ERROR);
             },

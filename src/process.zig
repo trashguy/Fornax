@@ -90,7 +90,7 @@ pub const ResourceQuotas = struct {
     cpu_priority: u8 = 128, // 0=lowest, 255=highest
 };
 
-pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, remove, rename, truncate, console_read, net_read, net_connect, net_listen, dns_query, icmp_read, pipe_read, pipe_write, sleep };
+pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, remove, rename, truncate, wstat, console_read, net_read, net_connect, net_listen, dns_query, icmp_read, pipe_read, pipe_write, sleep };
 
 pub const FdType = enum(u8) { ipc, net, pipe, blk, proc, dev_null, dev_zero, dev_random };
 
@@ -116,6 +116,7 @@ pub const NetFdKind = enum(u8) {
     icmp_clone,
     icmp_ctl,
     icmp_data,
+    net_status,
 };
 
 /// File descriptor entry: channel ID + which end of the channel.
@@ -194,6 +195,8 @@ pub const Process = struct {
     sleep_until: u32 = 0,
     /// Virtual terminal index (0-3) for console I/O routing.
     vt: u8 = 0,
+    /// Process user ID (for permission checks).
+    uid: u16 = 0,
 
     pub fn initFds(self: *Process) void {
         for (&self.fds) |*fd| {
@@ -436,6 +439,7 @@ pub fn create() ?*Process {
     proc.needs_stack_free = false;
     proc.sleep_until = 0;
     proc.vt = if (current) |cur| cur.vt else 0;
+    proc.uid = 0;
     namespace.getRootNamespace().cloneInto(&proc.ns);
     proc.ipc_msg = ipc.Message.init(.t_open);
     next_pid += 1;

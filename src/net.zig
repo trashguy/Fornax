@@ -62,6 +62,14 @@ pub fn getMac() [6]u8 {
     return our_mac;
 }
 
+pub fn getGateway() [4]u8 {
+    return gateway_ip;
+}
+
+pub fn getSubnet() [4]u8 {
+    return subnet_mask;
+}
+
 pub fn isInitialized() bool {
     return initialized;
 }

@@ -48,6 +48,7 @@ pub const SYS = enum(u64) {
     getpid = 26,
     rename = 27,
     truncate = 28,
+    wstat = 29,
 };
 
 /// Error return values.
@@ -146,6 +147,7 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         .getpid => sysGetpid(),
         .rename => sysRename(arg0, arg1, arg2, arg3),
         .truncate => sysTruncate(arg0, arg1),
+        .wstat => sysWstat(arg0, arg1, arg2, arg3, arg4),
         .mount, .bind, .unmount, .rfork => {
             klog.warn("syscall: unimplemented nr=");
             klog.warnDec(nr);
@@ -1487,6 +1489,34 @@ fn sysTruncate(fd: u64, new_size: u64) u64 {
     process.scheduleNext();
 }
 
+/// wstat(fd, mode, uid, gid, mask) → 0 or negative error.
+/// Sends T_WSTAT to the server to modify inode metadata.
+fn sysWstat(fd: u64, mode: u64, uid: u64, gid: u64, mask: u64) u64 {
+    const proc = process.getCurrent() orelse return ENOSYS;
+    const entry = proc.getFdEntry(@intCast(fd)) orelse return EBADF;
+
+    const chan = ipc.getChannel(entry.channel_id) orelse return EBADF;
+    if (entry.server_handle == 0) return ENOSYS;
+
+    // Build T_WSTAT: [handle:u32][mask:u32][mode:u32][uid:u32][gid:u32][caller_uid:u32] = 24 bytes
+    proc.ipc_msg = ipc.Message.init(.t_wstat);
+    writeU32LE(proc.ipc_msg.data_buf[0..4], entry.server_handle);
+    writeU32LE(proc.ipc_msg.data_buf[4..8], @truncate(mask));
+    writeU32LE(proc.ipc_msg.data_buf[8..12], @truncate(mode));
+    writeU32LE(proc.ipc_msg.data_buf[12..16], @truncate(uid));
+    writeU32LE(proc.ipc_msg.data_buf[16..20], @truncate(gid));
+    writeU32LE(proc.ipc_msg.data_buf[20..24], @as(u32, proc.uid));
+    proc.ipc_msg.data_len = 24;
+
+    proc.pending_op = .wstat;
+    proc.pending_fd = @intCast(fd);
+    proc.syscall_ret = 0;
+
+    sendToServer(chan, proc);
+    proc.state = .blocked;
+    process.scheduleNext();
+}
+
 /// ipc_recv(fd, msg_buf_ptr) → 0 on success, negative on error.
 /// Server-side: receive the next message on a channel.
 /// Blocks if no message is pending.
@@ -1608,7 +1638,7 @@ fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
         .remove, .rename => {
             client_proc.syscall_ret = if (is_ok) 0 else ENOENT;
         },
-        .truncate => {
+        .truncate, .wstat => {
             client_proc.syscall_ret = if (is_ok) 0 else EIO;
         },
         .console_read, .net_read, .net_connect, .net_listen, .dns_query, .icmp_read, .pipe_read, .pipe_write, .sleep => {
@@ -1871,6 +1901,7 @@ fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64, argv_p
 
     // Copy namespace from parent (Plan 9: children inherit namespace)
     parent.ns.cloneInto(&child.ns);
+    child.uid = parent.uid;
 
     // Copy fd mappings from parent to child
     if (fd_map_len > 0) {

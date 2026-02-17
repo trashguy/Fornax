@@ -34,6 +34,7 @@ pub const SYS = enum(u64) {
     getpid = 26,
     rename = 27,
     truncate = 28,
+    wstat = 29,
 };
 
 const ipc = @import("ipc.zig");
@@ -113,6 +114,16 @@ pub fn rename(old_path: []const u8, new_path: []const u8) i32 {
 
 pub fn truncate(fd: i32, size: u64) i32 {
     const result = syscall2(.truncate, @bitCast(@as(i64, fd)), size);
+    return @bitCast(@as(u32, @truncate(result)));
+}
+
+// wstat mask bits
+pub const WSTAT_MODE: u32 = 0x1;
+pub const WSTAT_UID: u32 = 0x2;
+pub const WSTAT_GID: u32 = 0x4;
+
+pub fn wstat(fd: i32, mode: u16, uid: u16, gid: u16, mask: u32) i32 {
+    const result = syscall5(.wstat, @bitCast(@as(i64, fd)), mode, uid, gid, mask);
     return @bitCast(@as(u32, @truncate(result)));
 }
 

@@ -45,6 +45,10 @@ pub const seek = syscall.seek;
 pub const getpid = syscall.getpid;
 pub const rename = syscall.rename;
 pub const truncate = syscall.truncate;
+pub const wstat = syscall.wstat;
+pub const WSTAT_MODE = syscall.WSTAT_MODE;
+pub const WSTAT_UID = syscall.WSTAT_UID;
+pub const WSTAT_GID = syscall.WSTAT_GID;
 
 // Re-export IPC types at top level.
 pub const IpcMessage = ipc.IpcMessage;
@@ -63,6 +67,7 @@ pub const R_OK = ipc.R_OK;
 pub const R_ERROR = ipc.R_ERROR;
 pub const T_RENAME = ipc.T_RENAME;
 pub const T_TRUNCATE = ipc.T_TRUNCATE;
+pub const T_WSTAT = ipc.T_WSTAT;
 
 // Re-export argv helpers at top level.
 pub const ARGV_BASE = syscall.ARGV_BASE;

@@ -38,6 +38,7 @@ pub const T_CREATE: u32 = 7;
 pub const T_REMOVE: u32 = 8;
 pub const T_RENAME: u32 = 9;
 pub const T_TRUNCATE: u32 = 10;
+pub const T_WSTAT: u32 = 11;
 pub const R_OK: u32 = 128;
 pub const R_ERROR: u32 = 129;
 
@@ -54,7 +55,10 @@ pub const Stat = extern struct {
     file_type: u32, // 0=file, 1=directory
     mtime: u64, // uptime seconds at last modification
     ctime: u64, // uptime seconds at creation
-    _reserved: [40]u8,
+    mode: u32, // full mode (type + permission bits)
+    uid: u16,
+    gid: u16,
+    _reserved: [32]u8,
 };
 
 /// FD mapping for spawn: maps a parent fd to a child fd slot.
