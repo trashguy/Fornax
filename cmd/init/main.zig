@@ -1,6 +1,7 @@
 /// Fornax init — PID 1.
 ///
-/// Spawns fsh on each virtual terminal (VT 0-3).
+/// Spawns login on each virtual terminal (VT 0-3).
+/// When a login/shell exits, init respawns login on that VT.
 const fx = @import("fornax");
 
 /// 4 MB buffer for loading ELF binaries (matches spawn syscall limit).
@@ -10,6 +11,9 @@ var elf_buf: [4 * 1024 * 1024]u8 linksection(".bss") = undefined;
 const out = fx.io.Writer.stdout;
 
 const NUM_VTS = 4;
+
+/// Per-VT tracking
+var vt_pids: [NUM_VTS]i32 = .{ -1, -1, -1, -1 };
 
 /// Load an ELF from /bin/<name> into elf_buf. Returns the slice, or null on failure.
 fn loadBin(name: []const u8) ?[]const u8 {
@@ -37,42 +41,99 @@ fn loadBin(name: []const u8) ?[]const u8 {
     return elf_buf[0..total];
 }
 
+/// Spawn login on a given VT, return pid or -1.
+fn spawnLogin(elf_data: []const u8, vt: usize) i32 {
+    // Set init's VT so the child inherits it
+    var vt_cmd = [_]u8{ 'v', 't', ' ', '0' + @as(u8, @intCast(vt)) };
+    _ = fx.write(0, &vt_cmd);
+
+    const pid = fx.spawn(elf_data, &.{}, null);
+    if (pid >= 0) {
+        out.print("init: login on VT {d}, pid={d}\n", .{ vt, @as(u64, @bitCast(@as(i64, pid))) });
+    } else {
+        out.print("init: failed to spawn login on VT {d}\n", .{vt});
+    }
+    return pid;
+}
+
+/// Check if a process is still alive via /proc/<pid>/status.
+fn isAlive(pid: i32) bool {
+    if (pid < 0) return false;
+    var path_buf: [32]u8 = undefined;
+    var pos: usize = 0;
+
+    // Build "/proc/<pid>/status"
+    const prefix = "/proc/";
+    @memcpy(path_buf[pos..][0..prefix.len], prefix);
+    pos += prefix.len;
+
+    var dec_buf: [10]u8 = undefined;
+    const pid_str = fx.fmt.formatDec(&dec_buf, @as(u64, @bitCast(@as(i64, pid))));
+    @memcpy(path_buf[pos..][0..pid_str.len], pid_str);
+    pos += pid_str.len;
+
+    const suffix = "/status";
+    @memcpy(path_buf[pos..][0..suffix.len], suffix);
+    pos += suffix.len;
+
+    const fd = fx.open(path_buf[0..pos]);
+    if (fd < 0) return false;
+    _ = fx.close(fd);
+    return true;
+}
+
 export fn _start() noreturn {
     out.puts("init: started\n");
 
-    // Ensure standard directories exist (dev/proc/net/tmp baked into rootfs image)
+    // Ensure standard directories exist
     _ = fx.mkdir("/var");
     _ = fx.mkdir("/var/log");
+    _ = fx.mkdir("/etc");
+    _ = fx.mkdir("/home");
 
-    // Load fsh once
-    const elf_data = loadBin("fsh") orelse {
-        out.puts("init: failed to load /bin/fsh\n");
-        fx.exit(1);
+    // Restrict /etc/shadow to root only (mode 0600)
+    const shadow_fd = fx.open("/etc/shadow");
+    if (shadow_fd >= 0) {
+        _ = fx.wstat(shadow_fd, 0o600, 0, 0, fx.WSTAT_MODE);
+        _ = fx.close(shadow_fd);
+    }
+
+    // Load login once
+    const elf_data = loadBin("login") orelse {
+        // Fall back to fsh if login doesn't exist
+        const fsh_data = loadBin("fsh") orelse {
+            out.puts("init: failed to load /bin/login and /bin/fsh\n");
+            fx.exit(1);
+        };
+        // Spawn fsh directly on each VT (fallback mode)
+        for (0..NUM_VTS) |i| {
+            var vt_cmd = [_]u8{ 'v', 't', ' ', '0' + @as(u8, @intCast(i)) };
+            _ = fx.write(0, &vt_cmd);
+            const pid = fx.spawn(fsh_data, &.{}, null);
+            if (pid >= 0) vt_pids[i] = pid;
+        }
+        // Wait loop for fallback
+        while (true) {
+            _ = fx.wait(0);
+        }
     };
 
-    // Spawn fsh on each VT
-    var num_shells: u8 = 0;
+    // Spawn login on each VT
     for (0..NUM_VTS) |i| {
-        // Set current process's VT (child inherits it)
-        var vt_cmd = [_]u8{ 'v', 't', ' ', '0' + @as(u8, @intCast(i)) };
-        _ = fx.write(0, &vt_cmd);
+        vt_pids[i] = spawnLogin(elf_data, i);
+    }
 
-        const pid = fx.spawn(elf_data, &.{}, null);
-        if (pid >= 0) {
-            num_shells += 1;
-            out.print("init: fsh on VT {d}, pid={d}\n", .{ i, @as(u64, @bitCast(@as(i64, pid))) });
-        } else {
-            out.print("init: failed to spawn fsh on VT {d}\n", .{i});
+    // Respawn loop: when any child exits, check which VT lost its login
+    while (true) {
+        _ = fx.wait(0); // blocks until a child exits
+
+        for (0..NUM_VTS) |i| {
+            if (vt_pids[i] >= 0 and !isAlive(vt_pids[i])) {
+                out.print("init: respawning login on VT {d}\n", .{i});
+                // Need to reload ELF since elf_buf may have been reused
+                const new_elf = loadBin("login") orelse continue;
+                vt_pids[i] = spawnLogin(new_elf, i);
+            }
         }
     }
-
-    // Wait for all shells to exit
-    var exited: u8 = 0;
-    while (exited < num_shells) {
-        _ = fx.wait(0);
-        exited += 1;
-    }
-
-    out.puts("init: all shells exited\n");
-    fx.exit(0);
 }

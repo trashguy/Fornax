@@ -49,6 +49,8 @@ pub const SYS = enum(u64) {
     rename = 27,
     truncate = 28,
     wstat = 29,
+    setuid = 30,
+    getuid = 31,
 };
 
 /// Error return values.
@@ -148,6 +150,8 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         .rename => sysRename(arg0, arg1, arg2, arg3),
         .truncate => sysTruncate(arg0, arg1),
         .wstat => sysWstat(arg0, arg1, arg2, arg3, arg4),
+        .setuid => sysSetuid(arg0, arg1),
+        .getuid => sysGetuid(),
         .mount, .bind, .unmount, .rfork => {
             klog.warn("syscall: unimplemented nr=");
             klog.warnDec(nr);
@@ -625,6 +629,8 @@ fn procRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
             }
 
             pos = appendKV(&text_buf, pos, "pages", target.pages_used);
+            pos = appendKV(&text_buf, pos, "uid", target.uid);
+            pos = appendKV(&text_buf, pos, "gid", target.gid);
 
             const offset: usize = entry_ptr.read_offset;
             if (offset >= pos) return 0;
@@ -679,6 +685,122 @@ fn devRandomFill(buf: []u8) void {
         i += n;
     }
     dev_random_state = state;
+}
+
+/// Format a u16 as exactly 4 hex digits into buf[0..4].
+fn fmtHex4(buf: *[4]u8, val: u16) void {
+    const hex = "0123456789abcdef";
+    buf[0] = hex[@as(u4, @truncate(val >> 12))];
+    buf[1] = hex[@as(u4, @truncate(val >> 8))];
+    buf[2] = hex[@as(u4, @truncate(val >> 4))];
+    buf[3] = hex[@as(u4, @truncate(val))];
+}
+
+/// Format a u8 as exactly 2 hex digits into buf[0..2].
+fn fmtHex2(buf: *[2]u8, val: u8) void {
+    const hex = "0123456789abcdef";
+    buf[0] = hex[@as(u4, @truncate(val >> 4))];
+    buf[1] = hex[@as(u4, @truncate(val))];
+}
+
+/// Read handler for /dev/pci — one text line per PCI device.
+/// Format: "BB:SS.F VVVV:DDDD CC:SS:PP\n"
+fn pciRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
+    const pci = switch (@import("builtin").cpu.arch) {
+        .x86_64 => @import("arch/x86_64/pci.zig"),
+        .riscv64 => @import("arch/riscv64/pci.zig"),
+        else => @compileError("unsupported arch"),
+    };
+    const devs = pci.getDevices();
+
+    // Generate text into static buffer
+    // Each line: "BB:SS.F VVVV:DDDD CC:SS:PP\n" = 27 chars max
+    // Max 32 devices = 864 bytes
+    var text_buf: [1024]u8 = undefined;
+    var pos: usize = 0;
+
+    for (devs) |d| {
+        if (pos + 27 > text_buf.len) break;
+        // BB:SS.F
+        fmtHex2(text_buf[pos..][0..2], d.bus);
+        pos += 2;
+        text_buf[pos] = ':';
+        pos += 1;
+        fmtHex2(text_buf[pos..][0..2], d.slot);
+        pos += 2;
+        text_buf[pos] = '.';
+        pos += 1;
+        text_buf[pos] = '0' + @as(u8, @truncate(d.func & 0x7));
+        pos += 1;
+        text_buf[pos] = ' ';
+        pos += 1;
+        // VVVV:DDDD
+        fmtHex4(text_buf[pos..][0..4], d.vendor_id);
+        pos += 4;
+        text_buf[pos] = ':';
+        pos += 1;
+        fmtHex4(text_buf[pos..][0..4], d.device_id);
+        pos += 4;
+        text_buf[pos] = ' ';
+        pos += 1;
+        // CC:SS:PP
+        fmtHex2(text_buf[pos..][0..2], d.class_code);
+        pos += 2;
+        text_buf[pos] = ':';
+        pos += 1;
+        fmtHex2(text_buf[pos..][0..2], d.subclass);
+        pos += 2;
+        text_buf[pos] = ':';
+        pos += 1;
+        fmtHex2(text_buf[pos..][0..2], d.prog_if);
+        pos += 2;
+        text_buf[pos] = '\n';
+        pos += 1;
+    }
+
+    const dest: [*]u8 = @ptrFromInt(buf_ptr);
+    const max_bytes: usize = @intCast(@min(count, 4096));
+    const offset: usize = entry_ptr.read_offset;
+    if (offset >= pos) return 0;
+    const available = pos - offset;
+    const to_copy = @min(available, max_bytes);
+    @memcpy(dest[0..to_copy], text_buf[offset..][0..to_copy]);
+    entry_ptr.read_offset += @intCast(to_copy);
+    return to_copy;
+}
+
+fn usbRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
+    const xhci = @import("xhci.zig");
+    var text_buf: [2048]u8 = undefined;
+    const pos = xhci.formatDeviceInfo(&text_buf);
+
+    const dest: [*]u8 = @ptrFromInt(buf_ptr);
+    const max_bytes: usize = @intCast(@min(count, 4096));
+    const offset: usize = entry_ptr.read_offset;
+    if (offset >= pos) return 0;
+    const available = pos - offset;
+    const to_copy = @min(available, max_bytes);
+    @memcpy(dest[0..to_copy], text_buf[offset..][0..to_copy]);
+    entry_ptr.read_offset += @intCast(to_copy);
+    return to_copy;
+}
+
+fn mouseRead(proc: *process.Process, entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
+    _ = entry_ptr;
+    const xhci = @import("xhci.zig");
+    if (!xhci.mouseDataAvailable()) {
+        // Block until mouse data available
+        xhci.setMouseWaiter(proc);
+        proc.pending_op = .console_read;
+        proc.ipc_recv_buf_ptr = buf_ptr;
+        proc.pending_fd = @intCast(@min(count, 4096));
+        proc.state = .blocked;
+        process.scheduleNext();
+    }
+    // Data available — read directly
+    const dest: [*]u8 = @ptrFromInt(buf_ptr);
+    const max_bytes: usize = @intCast(@min(count, 4096));
+    return xhci.mouseRead(dest, max_bytes);
 }
 
 fn procWrite(entry: process.FdEntry, buf_ptr: u64, count: u64) u64 {
@@ -751,8 +873,8 @@ fn sysOpen(path_ptr: u64, path_len: u64) u64 {
         return proc.allocBlkFd() orelse return EMFILE;
     }
 
-    // Intercept /dev/null, /dev/zero, /dev/random
-    if (path_len >= 9 and path_slice[0] == '/' and path_slice[1] == 'd' and
+    // Intercept /dev/null, /dev/zero, /dev/random, /dev/pci, /dev/usb, /dev/mouse
+    if (path_len >= 8 and path_slice[0] == '/' and path_slice[1] == 'd' and
         path_slice[2] == 'e' and path_slice[3] == 'v' and path_slice[4] == '/')
     {
         if (strEql(path_slice, "/dev/null")) {
@@ -763,6 +885,15 @@ fn sysOpen(path_ptr: u64, path_len: u64) u64 {
         }
         if (strEql(path_slice, "/dev/random")) {
             return proc.allocDevFd(.dev_random) orelse return EMFILE;
+        }
+        if (strEql(path_slice, "/dev/pci")) {
+            return proc.allocDevFd(.dev_pci) orelse return EMFILE;
+        }
+        if (strEql(path_slice, "/dev/usb")) {
+            return proc.allocDevFd(.dev_usb) orelse return EMFILE;
+        }
+        if (strEql(path_slice, "/dev/mouse")) {
+            return proc.allocDevFd(.dev_mouse) orelse return EMFILE;
         }
     }
 
@@ -1021,6 +1152,15 @@ fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
         const n = @min(count, 4096);
         devRandomFill(dest[0..n]);
         return n;
+    }
+    if (entry_ptr.fd_type == .dev_pci) {
+        return pciRead(entry_ptr, buf_ptr, count);
+    }
+    if (entry_ptr.fd_type == .dev_usb) {
+        return usbRead(entry_ptr, buf_ptr, count);
+    }
+    if (entry_ptr.fd_type == .dev_mouse) {
+        return mouseRead(proc, entry_ptr, buf_ptr, count);
     }
 
     const chan = ipc.getChannel(entry_ptr.channel_id) orelse return EBADF;
@@ -1517,6 +1657,21 @@ fn sysWstat(fd: u64, mode: u64, uid: u64, gid: u64, mask: u64) u64 {
     process.scheduleNext();
 }
 
+/// setuid(uid, gid) — set process uid and gid. Only root (uid 0) can call this.
+fn sysSetuid(uid: u64, gid: u64) u64 {
+    const proc = process.getCurrent() orelse return ENOSYS;
+    if (proc.uid != 0) return EINVAL;
+    proc.uid = @truncate(uid);
+    proc.gid = @truncate(gid);
+    return 0;
+}
+
+/// getuid() — returns uid in low 16 bits, gid in bits 16-31.
+fn sysGetuid() u64 {
+    const proc = process.getCurrent() orelse return ENOSYS;
+    return @as(u64, proc.uid) | (@as(u64, proc.gid) << 16);
+}
+
 /// ipc_recv(fd, msg_buf_ptr) → 0 on success, negative on error.
 /// Server-side: receive the next message on a channel.
 /// Blocks if no message is pending.
@@ -1733,8 +1888,11 @@ fn sysExec(elf_ptr: u64, elf_len: u64) u64 {
     // Old PML4 + user pages leaked (cleanup is future work)
     proc.pml4 = new_pml4;
     proc.user_rip = load_result.entry_point;
-    proc.user_rsp = stack_top;
-    proc.user_rflags = 0x202; // IF=1, reserved bit 1
+    proc.user_rsp = mem.USER_STACK_INIT;
+    proc.user_rflags = switch (@import("builtin").cpu.arch) {
+        .riscv64 => @import("arch/riscv64/cpu.zig").SSTATUS_SPIE | @import("arch/riscv64/cpu.zig").SSTATUS_SUM,
+        else => 0x202, // IF=1
+    };
     proc.brk = load_result.brk;
     proc.pages_used = 0;
     proc.saved_kernel_rsp = 0; // Force IRETQ path in switchTo
@@ -1902,6 +2060,7 @@ fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64, argv_p
     // Copy namespace from parent (Plan 9: children inherit namespace)
     parent.ns.cloneInto(&child.ns);
     child.uid = parent.uid;
+    child.gid = parent.gid;
 
     // Copy fd mappings from parent to child
     if (fd_map_len > 0) {

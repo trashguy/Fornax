@@ -92,7 +92,7 @@ pub const ResourceQuotas = struct {
 
 pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, remove, rename, truncate, wstat, console_read, net_read, net_connect, net_listen, dns_query, icmp_read, pipe_read, pipe_write, sleep };
 
-pub const FdType = enum(u8) { ipc, net, pipe, blk, proc, dev_null, dev_zero, dev_random };
+pub const FdType = enum(u8) { ipc, net, pipe, blk, proc, dev_null, dev_zero, dev_random, dev_pci, dev_usb, dev_mouse };
 
 pub const ProcFdKind = enum(u8) {
     dir,
@@ -197,6 +197,8 @@ pub const Process = struct {
     vt: u8 = 0,
     /// Process user ID (for permission checks).
     uid: u16 = 0,
+    /// Process group ID.
+    gid: u16 = 0,
 
     pub fn initFds(self: *Process) void {
         for (&self.fds) |*fd| {

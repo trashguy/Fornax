@@ -68,13 +68,29 @@ echo "==> Creating 64 MB disk image..."
 dd if=/dev/zero of="$DISK_IMG" bs=1M count=64 status=none
 
 # Create rootfs staging directories
-mkdir -p "$ROOTFS_DIR/etc" "$ROOTFS_DIR/tmp" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/dev" "$ROOTFS_DIR/net"
+mkdir -p "$ROOTFS_DIR/etc" "$ROOTFS_DIR/tmp" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/dev" "$ROOTFS_DIR/net" "$ROOTFS_DIR/home"
 
 # Create placeholder fstab
 cat > "$ROOTFS_DIR/etc/fstab" << 'FSTAB'
 # /etc/fstab - Fornax filesystem table
 # Root (/) and /dev/ are kernel-mounted
 FSTAB
+
+# Create default /etc/passwd (root has no password)
+cat > "$ROOTFS_DIR/etc/passwd" << 'PASSWD'
+root:x:0:0:System Administrator:/:/bin/fsh
+PASSWD
+
+# Create default /etc/shadow (root has no password)
+cat > "$ROOTFS_DIR/etc/shadow" << 'SHADOW'
+root:x
+SHADOW
+
+# Create default /etc/group
+cat > "$ROOTFS_DIR/etc/group" << 'GROUP'
+root:x:0:root
+users:x:100:
+GROUP
 
 # GPT partition table
 echo "==> Creating GPT partition table..."
@@ -97,6 +113,9 @@ exec qemu-system-x86_64 \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0 \
     -device virtio-keyboard-pci \
+    -device nec-usb-xhci,id=xhci \
+    -device usb-kbd,bus=xhci.0 \
+    -device usb-mouse,bus=xhci.0 \
     -drive file="$DISK_IMG",format=raw,if=none,id=blk0 \
     -device virtio-blk-pci,drive=blk0 \
     "$@"

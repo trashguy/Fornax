@@ -12,6 +12,10 @@ pub const io = @import("io.zig");
 pub const str = @import("str.zig");
 pub const path = @import("path.zig");
 pub const mem = @import("mem.zig");
+pub const crypt = @import("crypt.zig");
+pub const passwd = @import("passwd.zig");
+pub const shadow = @import("shadow.zig");
+pub const group = @import("group.zig");
 
 // Re-export syscall functions at top level for backward compatibility.
 pub const SYS = syscall.SYS;
@@ -43,6 +47,9 @@ pub const shutdown = syscall.shutdown;
 pub const reboot = syscall.reboot;
 pub const seek = syscall.seek;
 pub const getpid = syscall.getpid;
+pub const setuid = syscall.setuid;
+pub const getuid = syscall.getuid;
+pub const getgid = syscall.getgid;
 pub const rename = syscall.rename;
 pub const truncate = syscall.truncate;
 pub const wstat = syscall.wstat;

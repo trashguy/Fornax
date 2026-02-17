@@ -46,6 +46,11 @@ pub const PciDevice = struct {
             (self.device_id == 0x1001 or self.device_id == 0x1042);
     }
 
+    /// Check if this is an xHCI USB 3.0 controller (class 0x0C, subclass 0x03, prog_if 0x30).
+    pub fn isXhci(self: *const PciDevice) bool {
+        return self.class_code == 0x0C and self.subclass == 0x03 and self.prog_if == 0x30;
+    }
+
     /// Get the I/O port base from BAR0 (for legacy virtio devices).
     pub fn ioBase(self: *const PciDevice) ?u16 {
         const bar0 = self.bar[0];
@@ -210,6 +215,13 @@ pub fn findVirtioNet() ?*PciDevice {
 pub fn findVirtioBlk() ?*PciDevice {
     for (0..device_count) |i| {
         if (devices[i].isVirtioBlk()) return &devices[i];
+    }
+    return null;
+}
+
+pub fn findXhci() ?*PciDevice {
+    for (0..device_count) |i| {
+        if (devices[i].isXhci()) return &devices[i];
     }
     return null;
 }

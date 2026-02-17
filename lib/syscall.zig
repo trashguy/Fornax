@@ -35,6 +35,8 @@ pub const SYS = enum(u64) {
     rename = 27,
     truncate = 28,
     wstat = 29,
+    setuid = 30,
+    getuid = 31,
 };
 
 const ipc = @import("ipc.zig");
@@ -208,6 +210,19 @@ pub fn seek(fd: i32, offset: u64, whence: u32) i64 {
 
 pub fn getpid() u32 {
     return @truncate(syscall1(.getpid, 0));
+}
+
+pub fn setuid(uid: u16, gid: u16) i32 {
+    const result = syscall2(.setuid, uid, gid);
+    return @bitCast(@as(u32, @truncate(result)));
+}
+
+pub fn getuid() u16 {
+    return @truncate(syscall1(.getuid, 0));
+}
+
+pub fn getgid() u16 {
+    return @truncate(syscall1(.getuid, 0) >> 16);
 }
 
 /// Build a serialized argv block: [argc: u32][total_len: u32][str0\0str1\0...]

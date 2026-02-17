@@ -169,6 +169,14 @@ pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize) noreturn {
         if (!virtio_input.init()) {
             klog.info("No keyboard device found.\n");
         }
+
+        // Phase 400: xHCI USB controller
+        if (builtin.cpu.arch == .x86_64) {
+            const xhci = @import("xhci.zig");
+            if (xhci.init()) {
+                klog.info("USB ready.\n");
+            }
+        }
     }
 
     // Phase 100: Timer tick counter (for TCP retransmission)

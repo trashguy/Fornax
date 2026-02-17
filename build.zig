@@ -570,6 +570,97 @@ const touch_bin = b.addExecutable(.{
     });
     fe_bin.image_base = user_image_base;
 
+    const lspci_bin = b.addExecutable(.{
+        .name = "lspci",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/lspci/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    lspci_bin.image_base = user_image_base;
+
+    const lsusb_bin = b.addExecutable(.{
+        .name = "lsusb",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/lsusb/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    lsusb_bin.image_base = user_image_base;
+
+    const login_bin = b.addExecutable(.{
+        .name = "login",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/login/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    login_bin.image_base = user_image_base;
+
+    const id_bin = b.addExecutable(.{
+        .name = "id",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/id/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    id_bin.image_base = user_image_base;
+
+    const whoami_bin = b.addExecutable(.{
+        .name = "whoami",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/whoami/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    whoami_bin.image_base = user_image_base;
+
+    const adduser_bin = b.addExecutable(.{
+        .name = "adduser",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/adduser/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    adduser_bin.image_base = user_image_base;
+
+    const su_bin = b.addExecutable(.{
+        .name = "su",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/su/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    su_bin.image_base = user_image_base;
+
     const fxfs_bin = b.addExecutable(.{
         .name = "fxfs",
         .root_module = b.createModule(.{
@@ -644,7 +735,8 @@ const touch_bin = b.addExecutable(.{
         cp_bin, mv_bin, touch_bin, truncate_bin, dd_bin,
         chmod_bin, chown_bin, chgrp_bin, ip_bin,
         grep_bin, sed_bin, awk_bin, less_bin,
-        fe_bin,
+        fe_bin, lspci_bin, lsusb_bin,
+        login_bin, id_bin, whoami_bin, adduser_bin, su_bin,
     };
     for (disk_programs) |prog| {
         const install = b.addInstallArtifact(prog, .{
@@ -755,6 +847,13 @@ const touch_bin = b.addExecutable(.{
         .{ "awk", "cmd/awk/main.zig" },
         .{ "less", "cmd/less/main.zig" },
         .{ "fe", "cmd/fe/main.zig" },
+        .{ "lspci", "cmd/lspci/main.zig" },
+        .{ "lsusb", "cmd/lsusb/main.zig" },
+        .{ "login", "cmd/login/main.zig" },
+        .{ "id", "cmd/id/main.zig" },
+        .{ "whoami", "cmd/whoami/main.zig" },
+        .{ "adduser", "cmd/adduser/main.zig" },
+        .{ "su", "cmd/su/main.zig" },
         .{ "fxfs", "srv/fxfs/main.zig" },
         .{ "partfs", "srv/partfs/main.zig" },
     };

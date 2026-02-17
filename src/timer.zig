@@ -70,5 +70,11 @@ fn handleIrq() bool {
         }
     }
 
+    // Poll USB HID events (x86_64 only)
+    if (builtin.cpu.arch == .x86_64) {
+        const xhci = @import("xhci.zig");
+        xhci.pollUsbHid();
+    }
+
     return true;
 }

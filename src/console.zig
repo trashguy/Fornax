@@ -58,8 +58,8 @@ const VtDisplay = struct {
 // ── Global state ─────────────────────────────────────────────────
 
 var fb: Framebuffer = undefined;
-var cols: u32 = 0;
-var rows: u32 = 0;
+var cols: u32 = 80;
+var rows: u32 = 24;
 var initialized: bool = false;
 pub var active_vt: u8 = 0;
 var vts: [NUM_VTS]VtDisplay linksection(".bss") = undefined;

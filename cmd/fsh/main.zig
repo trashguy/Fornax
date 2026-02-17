@@ -66,7 +66,17 @@ fn envInit() void {
     for (&env_vars) |*v| {
         v.active = false;
     }
-    _ = envSet("PWD", "/");
+
+    const uid = fx.getuid();
+    if (fx.passwd.lookupByUid(uid)) |entry| {
+        const home = entry.homeSlice();
+        _ = envSet("HOME", if (home.len > 0) home else "/");
+        _ = envSet("PWD", if (home.len > 0) home else "/");
+        _ = envSet("USER", entry.usernameSlice());
+    } else {
+        _ = envSet("HOME", "/");
+        _ = envSet("PWD", "/");
+    }
 }
 
 fn envGet(name: []const u8) ?[]const u8 {
@@ -1491,6 +1501,29 @@ fn executeTokens(tokens: []const []const u8) void {
 
 // ── Entry point ────────────────────────────────────────────────────
 
+var prompt_buf: [64]u8 = undefined;
+
+fn buildPrompt() []const u8 {
+    var pos: usize = 0;
+    const user = envGet("USER") orelse "?";
+    if (pos + user.len > prompt_buf.len) return "$ ";
+    @memcpy(prompt_buf[pos..][0..user.len], user);
+    pos += user.len;
+
+    const suffix = "@fornax";
+    if (pos + suffix.len > prompt_buf.len) return "$ ";
+    @memcpy(prompt_buf[pos..][0..suffix.len], suffix);
+    pos += suffix.len;
+
+    // # for root, $ for regular users
+    const trail: []const u8 = if (fx.getuid() == 0) "# " else "$ ";
+    if (pos + trail.len > prompt_buf.len) return "$ ";
+    @memcpy(prompt_buf[pos..][0..trail.len], trail);
+    pos += trail.len;
+
+    return prompt_buf[0..pos];
+}
+
 export fn _start() noreturn {
     builtinClear();
     out.puts("fsh: Fornax shell\n");
@@ -1498,7 +1531,7 @@ export fn _start() noreturn {
     aliasInit();
 
     while (true) {
-        const line = editLine("fornax% ") orelse break;
+        const line = editLine(buildPrompt()) orelse break;
         if (line.len == 0) continue;
         processLine(line);
     }

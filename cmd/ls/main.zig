@@ -67,7 +67,14 @@ fn listDir(path: []const u8) void {
                 if (flag_long) {
                     const mode_str = formatMode(st.mode);
                     var uid_buf: [10]u8 = undefined;
-                    const uid_str = fmtDec(st.uid, &uid_buf);
+                    var uid_name_buf: [32]u8 = undefined;
+                    var uid_name_len: usize = 0;
+                    if (fx.passwd.lookupByUid(st.uid)) |pw_entry| {
+                        const uname = pw_entry.usernameSlice();
+                        @memcpy(uid_name_buf[0..uname.len], uname);
+                        uid_name_len = uname.len;
+                    }
+                    const uid_str = if (uid_name_len > 0) uid_name_buf[0..uid_name_len] else fmtDec(st.uid, &uid_buf);
                     var size_buf: [10]u8 = undefined;
                     const size_str = if (flag_human) fmtHuman(st.size, &size_buf) else fmtDec(st.size, &size_buf);
                     out.print("{s} {s} {s} {s}\n", .{ &mode_str, uid_str, size_str, name });
