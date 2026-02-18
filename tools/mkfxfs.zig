@@ -149,8 +149,8 @@ const LeafBuilder = struct {
     fn addItem(self: *LeafBuilder, key: Key, data: []const u8) !void {
         const data_size: u16 = @intCast(data.len);
 
-        // Check space
-        if (self.header_cursor + LEAF_ITEM_HEADER_SIZE > self.data_cursor - data.len) {
+        // Check space (avoid unsigned underflow by adding instead of subtracting)
+        if (self.header_cursor + LEAF_ITEM_HEADER_SIZE + data.len > self.data_cursor) {
             return error.LeafFull;
         }
 

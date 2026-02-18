@@ -189,3 +189,35 @@ pub fn resetSystem() noreturn {
     );
     halt();
 }
+
+/// SBI base extension call — returns (error, value) in a0/a1.
+pub fn sbiBaseCall(fid: u64) struct { err: i64, val: u64 } {
+    var err: i64 = undefined;
+    var val: u64 = undefined;
+    asm volatile ("ecall"
+        : [a0] "={a0}" (err),
+          [a1] "={a1}" (val),
+        : [a7] "{a7}" (@as(u64, 0x10)), // SBI extension: BASE
+          [a6] "{a6}" (fid),
+        : .{ .memory = true }
+    );
+    return .{ .err = err, .val = val };
+}
+
+/// SBI get_mvendorid (base extension FID 4).
+pub fn sbiGetMvendorid() u64 {
+    const r = sbiBaseCall(4);
+    return if (r.err == 0) r.val else 0;
+}
+
+/// SBI get_marchid (base extension FID 5).
+pub fn sbiGetMarchid() u64 {
+    const r = sbiBaseCall(5);
+    return if (r.err == 0) r.val else 0;
+}
+
+/// SBI get_mimpid (base extension FID 6).
+pub fn sbiGetMimpid() u64 {
+    const r = sbiBaseCall(6);
+    return if (r.err == 0) r.val else 0;
+}

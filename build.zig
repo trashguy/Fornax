@@ -4,6 +4,8 @@ const Target = std.Target;
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const cluster = b.option(bool, "cluster", "Enable clustering support (gossip discovery, remote namespaces, scheduler)") orelse false;
+    const user_strip = b.option(bool, "strip", "Strip debug info from userspace binaries") orelse
+        (optimize != .Debug); // strip by default on release builds
 
     // Userspace always uses ReleaseSafe: keeps bounds/overflow checks while
     // producing small stack frames. Debug mode overflows the 256 KB user stack.
@@ -69,6 +71,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/init/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -82,6 +85,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/fsh/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -95,6 +99,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/hello/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -108,6 +113,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/tcptest/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -121,6 +127,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/dnstest/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -134,6 +141,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/ping/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -147,6 +155,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/echo/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -160,6 +169,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/cat/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -173,6 +183,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/ls/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -186,6 +197,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/rm/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -199,6 +211,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/mkdir/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -212,6 +225,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/wc/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -225,6 +239,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/lsblk/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -238,6 +253,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/df/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -251,6 +267,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/dmesg/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -264,6 +281,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/head/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -277,6 +295,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/tail/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -290,6 +309,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/tree/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -303,6 +323,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/free/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -316,6 +337,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/shutdown/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -329,6 +351,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/reboot/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -342,6 +365,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/ps/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -355,6 +379,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/kill/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -368,6 +393,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/du/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -381,6 +407,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/top/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -394,6 +421,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/cp/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -407,6 +435,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("cmd/mv/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -420,6 +449,7 @@ const touch_bin = b.addExecutable(.{
             .root_source_file = b.path("cmd/touch/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -433,6 +463,7 @@ const touch_bin = b.addExecutable(.{
             .root_source_file = b.path("cmd/truncate/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -446,6 +477,7 @@ const touch_bin = b.addExecutable(.{
             .root_source_file = b.path("cmd/dd/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -459,6 +491,7 @@ const touch_bin = b.addExecutable(.{
             .root_source_file = b.path("cmd/chmod/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -472,6 +505,7 @@ const touch_bin = b.addExecutable(.{
             .root_source_file = b.path("cmd/chown/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -485,6 +519,7 @@ const touch_bin = b.addExecutable(.{
             .root_source_file = b.path("cmd/chgrp/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -498,6 +533,7 @@ const touch_bin = b.addExecutable(.{
             .root_source_file = b.path("cmd/ip/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -511,6 +547,7 @@ const touch_bin = b.addExecutable(.{
             .root_source_file = b.path("cmd/grep/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -524,6 +561,7 @@ const touch_bin = b.addExecutable(.{
             .root_source_file = b.path("cmd/sed/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -537,6 +575,7 @@ const touch_bin = b.addExecutable(.{
             .root_source_file = b.path("cmd/awk/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -550,6 +589,7 @@ const touch_bin = b.addExecutable(.{
             .root_source_file = b.path("cmd/less/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -563,6 +603,7 @@ const touch_bin = b.addExecutable(.{
             .root_source_file = b.path("cmd/fe/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -576,6 +617,7 @@ const touch_bin = b.addExecutable(.{
             .root_source_file = b.path("cmd/lspci/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -589,6 +631,7 @@ const touch_bin = b.addExecutable(.{
             .root_source_file = b.path("cmd/lsusb/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -596,12 +639,27 @@ const touch_bin = b.addExecutable(.{
     });
     lsusb_bin.image_base = user_image_base;
 
+    const lscpu_bin = b.addExecutable(.{
+        .name = "lscpu",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/lscpu/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    lscpu_bin.image_base = user_image_base;
+
     const login_bin = b.addExecutable(.{
         .name = "login",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cmd/login/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -615,6 +673,7 @@ const touch_bin = b.addExecutable(.{
             .root_source_file = b.path("cmd/id/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -628,6 +687,7 @@ const touch_bin = b.addExecutable(.{
             .root_source_file = b.path("cmd/whoami/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -641,6 +701,7 @@ const touch_bin = b.addExecutable(.{
             .root_source_file = b.path("cmd/adduser/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -654,6 +715,7 @@ const touch_bin = b.addExecutable(.{
             .root_source_file = b.path("cmd/su/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -661,12 +723,41 @@ const touch_bin = b.addExecutable(.{
     });
     su_bin.image_base = user_image_base;
 
+    const unzip_bin = b.addExecutable(.{
+        .name = "unzip",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/unzip/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    unzip_bin.image_base = user_image_base;
+
+    const tar_bin = b.addExecutable(.{
+        .name = "tar",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/tar/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    tar_bin.image_base = user_image_base;
+
     const fxfs_bin = b.addExecutable(.{
         .name = "fxfs",
         .root_module = b.createModule(.{
             .root_source_file = b.path("srv/fxfs/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -680,6 +771,7 @@ const touch_bin = b.addExecutable(.{
             .root_source_file = b.path("srv/partfs/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
             .imports = &.{
                 .{ .name = "fornax", .module = fornax_module },
             },
@@ -735,8 +827,10 @@ const touch_bin = b.addExecutable(.{
         cp_bin, mv_bin, touch_bin, truncate_bin, dd_bin,
         chmod_bin, chown_bin, chgrp_bin, ip_bin,
         grep_bin, sed_bin, awk_bin, less_bin,
-        fe_bin, lspci_bin, lsusb_bin,
+        fe_bin, lspci_bin, lsusb_bin, lscpu_bin,
         login_bin, id_bin, whoami_bin, adduser_bin, su_bin,
+        unzip_bin,
+        tar_bin,
     };
     for (disk_programs) |prog| {
         const install = b.addInstallArtifact(prog, .{
@@ -849,11 +943,14 @@ const touch_bin = b.addExecutable(.{
         .{ "fe", "cmd/fe/main.zig" },
         .{ "lspci", "cmd/lspci/main.zig" },
         .{ "lsusb", "cmd/lsusb/main.zig" },
+        .{ "lscpu", "cmd/lscpu/main.zig" },
         .{ "login", "cmd/login/main.zig" },
         .{ "id", "cmd/id/main.zig" },
         .{ "whoami", "cmd/whoami/main.zig" },
         .{ "adduser", "cmd/adduser/main.zig" },
         .{ "su", "cmd/su/main.zig" },
+        .{ "unzip", "cmd/unzip/main.zig" },
+        .{ "tar", "cmd/tar/main.zig" },
         .{ "fxfs", "srv/fxfs/main.zig" },
         .{ "partfs", "srv/partfs/main.zig" },
     };
@@ -870,6 +967,7 @@ const touch_bin = b.addExecutable(.{
                 .root_source_file = b.path(prog_info[1]),
                 .target = riscv64_freestanding,
                 .optimize = user_optimize,
+                .strip = if (user_strip) true else null,
                 .imports = &.{
                     .{ .name = "fornax", .module = rv_fornax_module },
                 },

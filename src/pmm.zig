@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const boot = @import("boot.zig");
 const klog = @import("klog.zig");
+const SpinLock = @import("spinlock.zig").SpinLock;
 
 const page_size = 4096;
 
@@ -12,6 +13,9 @@ var free_pages: usize = 0;
 var search_hint: usize = 0;
 var usable_pages: usize = 0;
 var initialized: bool = false;
+
+/// Spinlock guarding PMM bitmap, free_pages, and search_hint.
+pub var pmm_lock: SpinLock = .{};
 
 pub const PmmError = error{
     NoConventionalMemory,
@@ -145,6 +149,8 @@ pub fn initDirect(ram_base: u64, ram_size: u64, reserved_end: u64) void {
 
 pub fn allocPage() ?usize {
     if (!initialized) return null;
+    pmm_lock.lock();
+    defer pmm_lock.unlock();
     // Start scanning from where we last found a free page (avoids O(n) rescan)
     var checked: usize = 0;
     while (checked < total_pages) : (checked += 1) {
@@ -161,6 +167,8 @@ pub fn allocPage() ?usize {
 
 pub fn freePage(phys_addr: usize) void {
     if (!initialized) return;
+    pmm_lock.lock();
+    defer pmm_lock.unlock();
     const page = phys_addr / page_size;
     if (page < total_pages and !isFree(page)) {
         markFree(page);

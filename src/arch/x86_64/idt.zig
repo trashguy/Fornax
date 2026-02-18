@@ -59,6 +59,9 @@ pub const ExceptionFrame = extern struct {
 /// ISR stub address table defined in entry.S.
 extern const isr_stub_table: [48]u64;
 
+/// IPI stub addresses defined in entry.S: [0]=vec 253, [1]=vec 254, [2]=vec 255.
+extern const ipi_stub_table: [3]u64;
+
 /// Exception handler wrapper called from entry.S using System V ABI.
 export fn handleExceptionWrapper(frame: *ExceptionFrame) callconv(.{ .x86_64_sysv = .{} }) void {
     const interrupts = @import("interrupts.zig");
@@ -83,6 +86,11 @@ pub fn init() void {
         setGate(@intCast(i), isr_stub_table[i]);
     }
 
+    // Install IPI handlers (vectors 253-255) for SMP
+    setGate(253, ipi_stub_table[0]); // TLB shootdown
+    setGate(254, ipi_stub_table[1]); // Schedule IPI
+    setGate(255, ipi_stub_table[2]); // Spurious APIC
+
     idt_ptr = .{
         .limit = @sizeOf(@TypeOf(idt_entries)) - 1,
         .base = @intFromPtr(&idt_entries),
@@ -93,5 +101,13 @@ pub fn init() void {
         : [idt_ptr] "r" (&idt_ptr),
     );
 
-    klog.info("IDT: loaded (256 entries, 48 handlers)\n");
+    klog.info("IDT: loaded (256 entries, 51 handlers)\n");
+}
+
+/// Reload IDT on an AP core (reuses BSP's IDT).
+pub fn reloadForAp() void {
+    asm volatile ("lidt (%[idt_ptr])"
+        :
+        : [idt_ptr] "r" (&idt_ptr),
+    );
 }

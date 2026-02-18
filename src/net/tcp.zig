@@ -747,7 +747,7 @@ fn wakeWaiter(waiter_pid: *u16, is_error: bool) void {
             if (is_error) {
                 proc.syscall_ret = 0xFFFF_FFFF_FFFF_FFF2; // -ECONNRESET equivalent
             }
-            proc.state = .ready;
+            process.markReady(proc);
         }
     }
 }

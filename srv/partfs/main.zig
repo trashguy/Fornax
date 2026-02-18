@@ -304,8 +304,8 @@ fn handleRead(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
                 entries_written += 1;
             }
 
-            // Virtual device entries: null, zero, random, pci, usb, mouse
-            const vdevs = [_][]const u8{ "null", "zero", "random", "pci", "usb", "mouse" };
+            // Virtual device entries: null, zero, random, pci, usb, mouse, cpu
+            const vdevs = [_][]const u8{ "null", "zero", "random", "pci", "usb", "mouse", "cpu" };
             for (vdevs, 0..) |vname, vi| {
                 const entry_idx: u32 = 1 + part_count + @as(u32, @intCast(vi));
                 if (entry_idx < skip) continue;

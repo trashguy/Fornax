@@ -20,7 +20,7 @@ export fn _start() noreturn {
     }
 
     // Print header
-    out.puts("  PID  PPID  STATE     PAGES\n");
+    out.puts("  PID  PPID  STATE     PAGES  CORE\n");
 
     // Parse DirEntry structs (72 bytes each: name[64] + file_type u32 + size u32)
     const entry_size = 72;
@@ -58,13 +58,15 @@ export fn _start() noreturn {
         const ppid_val = findValue(status_text, "ppid ");
         const state_val = findStringValue(status_text, "state ");
         const pages_val = findValue(status_text, "pages ");
+        const core_val = findValue(status_text, "core ");
 
-        // Format output: "  PID  PPID  STATE     PAGES"
+        // Format output: "  PID  PPID  STATE     PAGES  CORE"
         padNum(pid_val, 5);
         padNum(ppid_val, 6);
         out.puts("  ");
         padStr(state_val, 10);
         padNum(pages_val, 5);
+        padNum(core_val, 6);
         out.putc('\n');
     }
 

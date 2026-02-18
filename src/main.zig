@@ -22,6 +22,7 @@ const mem = @import("mem.zig");
 const namespace = @import("namespace.zig");
 const panic_handler = @import("panic.zig");
 const klog = @import("klog.zig");
+const percpu = @import("percpu.zig");
 
 const paging = switch (builtin.cpu.arch) {
     .x86_64 => @import("arch/x86_64/paging.zig"),
@@ -95,22 +96,31 @@ pub fn main() noreturn {
         // Phase 7: Kernel heap
         heap.init();
 
-        kernelInit(boot_info.initrd_base, boot_info.initrd_size);
+        kernelInit(boot_info.initrd_base, boot_info.initrd_size, boot_info.rsdp);
     }
     halt();
 }
 
 /// Shared kernel initialization — called from both UEFI main() and riscv64 boot.zig.
 /// At this point serial, console, PMM, and heap are already initialized.
-pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize) noreturn {
+pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize, rsdp: ?[*]const u8) noreturn {
     // Phase 4/5: Architecture-specific init (GDT/IDT/paging)
     arch.init();
     klog.info("Architecture init complete.\n");
+
+    // SMP: Per-CPU data structures (BSP core 0)
+    percpu.init();
 
     // Phase 23: PIC initialization (remap IRQs before any device init)
     if (builtin.cpu.arch == .x86_64) {
         const pic_mod = @import("pic.zig");
         pic_mod.init();
+    }
+
+    // SMP: ACPI MADT parsing + LAPIC init + AP startup (x86_64 only)
+    if (builtin.cpu.arch == .x86_64) {
+        const apic = @import("arch/x86_64/apic.zig");
+        apic.init(rsdp);
     }
 
     // Phase 23: Serial console input (COM1 IRQ 4 on x86_64, UART PLIC IRQ 10 on riscv64)

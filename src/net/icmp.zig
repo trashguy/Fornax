@@ -242,7 +242,7 @@ fn wakeWaiter(waiter_pid: *u16) void {
 
     if (process.getByPid(pid)) |proc| {
         if (proc.state == .blocked) {
-            proc.state = .ready;
+            process.markReady(proc);
         }
     }
 }

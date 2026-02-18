@@ -8,6 +8,7 @@ const pmm = @import("pmm.zig");
 const klog = @import("klog.zig");
 const paging = @import("arch/x86_64/paging.zig");
 const keyboard = @import("keyboard.zig");
+const process = @import("process.zig");
 const mem = @import("mem.zig");
 
 // ── TRB (Transfer Request Block) ────────────────────────────────────
@@ -213,7 +214,7 @@ fn pushMouseEvent(ev: MouseEvent) void {
     mouse_ring[mouse_ring_write % MOUSE_RING_SIZE] = ev;
     mouse_ring_write +%= 1;
     if (mouse_waiter) |w| {
-        w.state = .ready;
+        process.markReady(w);
         mouse_waiter = null;
     }
 }

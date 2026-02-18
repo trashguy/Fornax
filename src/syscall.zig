@@ -99,7 +99,7 @@ fn sendToServer(chan: *ipc.Channel, proc: *process.Process) void {
     if (chan.server.recv_waiting and chan.server.blocked_pid != 0) {
         if (process.getByPid(chan.server.blocked_pid)) |server_proc| {
             server_proc.ipc_pending_msg = &proc.ipc_msg;
-            server_proc.state = .ready;
+            process.markReady(server_proc);
             server_proc.syscall_ret = 0;
             chan.server.recv_waiting = false;
             chan.server.blocked_pid = 0;
@@ -346,7 +346,7 @@ fn sysExit(status: u64) noreturn {
                     if (wait_pid == proc.pid or wait_pid == 0) {
                         // Wake parent with our exit status
                         parent.syscall_ret = status;
-                        parent.state = .ready;
+                        process.markReady(parent);
                         parent.waiting_for_pid = null;
                         // Reaped immediately — go to free
                         proc.state = .free;
@@ -631,6 +631,7 @@ fn procRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
             pos = appendKV(&text_buf, pos, "pages", target.pages_used);
             pos = appendKV(&text_buf, pos, "uid", target.uid);
             pos = appendKV(&text_buf, pos, "gid", target.gid);
+            pos = appendKV(&text_buf, pos, "core", target.assigned_core);
 
             const offset: usize = entry_ptr.read_offset;
             if (offset >= pos) return 0;
@@ -769,6 +770,118 @@ fn pciRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
     return to_copy;
 }
 
+/// Read handler for /dev/cpu — CPU info as key-value text.
+fn cpuInfoRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
+    const builtin = @import("builtin");
+    const percpu = @import("percpu.zig");
+    var text_buf: [512]u8 = undefined;
+    var pos: usize = 0;
+
+    // Architecture
+    const arch_str = switch (builtin.cpu.arch) {
+        .x86_64 => "x86_64",
+        .riscv64 => "riscv64",
+        .aarch64 => "aarch64",
+        else => "unknown",
+    };
+    pos = appendStr(&text_buf, pos, "arch ");
+    pos = appendStr(&text_buf, pos, arch_str);
+    pos = appendStr(&text_buf, pos, "\n");
+
+    // Core count
+    pos = appendKV(&text_buf, pos, "cores", percpu.cores_online);
+
+    if (builtin.cpu.arch == .x86_64) {
+        const cpu = @import("arch/x86_64/cpu.zig");
+
+        // Vendor string (CPUID leaf 0)
+        const leaf0 = cpu.cpuid(0, 0);
+        var vendor: [12]u8 = undefined;
+        @memcpy(vendor[0..4], @as(*const [4]u8, @ptrCast(&leaf0.ebx)));
+        @memcpy(vendor[4..8], @as(*const [4]u8, @ptrCast(&leaf0.edx)));
+        @memcpy(vendor[8..12], @as(*const [4]u8, @ptrCast(&leaf0.ecx)));
+        pos = appendStr(&text_buf, pos, "vendor ");
+        pos = appendStr(&text_buf, pos, &vendor);
+        pos = appendStr(&text_buf, pos, "\n");
+
+        // Brand string (CPUID leaves 0x80000002-0x80000004)
+        const ext_max = cpu.cpuid(0x80000000, 0).eax;
+        if (ext_max >= 0x80000004) {
+            pos = appendStr(&text_buf, pos, "model ");
+            inline for ([_]u32{ 0x80000002, 0x80000003, 0x80000004 }) |leaf| {
+                const r = cpu.cpuid(leaf, 0);
+                const regs = [4]u32{ r.eax, r.ebx, r.ecx, r.edx };
+                for (regs) |reg| {
+                    const bytes = @as(*const [4]u8, @ptrCast(&reg));
+                    for (bytes) |b| {
+                        if (b == 0) break;
+                        if (pos < text_buf.len) {
+                            text_buf[pos] = b;
+                            pos += 1;
+                        }
+                    }
+                }
+            }
+            pos = appendStr(&text_buf, pos, "\n");
+        }
+
+        // Family/model/stepping (CPUID leaf 1)
+        const leaf1 = cpu.cpuid(1, 0);
+        const stepping = leaf1.eax & 0xF;
+        const base_model = (leaf1.eax >> 4) & 0xF;
+        const base_family = (leaf1.eax >> 8) & 0xF;
+        const ext_model = (leaf1.eax >> 16) & 0xF;
+        const ext_family = (leaf1.eax >> 20) & 0xFF;
+        const family = if (base_family == 0xF) base_family + ext_family else base_family;
+        const model = if (base_family == 0xF or base_family == 0x6) (ext_model << 4) | base_model else base_model;
+        pos = appendKV(&text_buf, pos, "family", family);
+        pos = appendKV(&text_buf, pos, "model_id", model);
+        pos = appendKV(&text_buf, pos, "stepping", stepping);
+
+        // Threads per core (CPUID leaf 1 EBX[23:16]) and topology
+        const logical_per_pkg = (leaf1.ebx >> 16) & 0xFF;
+        if (logical_per_pkg > 0) {
+            pos = appendKV(&text_buf, pos, "threads_per_pkg", logical_per_pkg);
+        }
+    }
+
+    if (builtin.cpu.arch == .riscv64) {
+        const cpu = @import("arch/riscv64/cpu.zig");
+
+        // ISA string (known at compile time from target)
+        pos = appendStr(&text_buf, pos, "isa rv64imafdc\n");
+
+        // SBI vendor/arch/implementation IDs
+        const mvendorid = cpu.sbiGetMvendorid();
+        const marchid = cpu.sbiGetMarchid();
+        const mimpid = cpu.sbiGetMimpid();
+
+        pos = appendKV(&text_buf, pos, "mvendorid", mvendorid);
+        pos = appendKV(&text_buf, pos, "marchid", marchid);
+        pos = appendKV(&text_buf, pos, "mimpid", mimpid);
+    }
+
+    const dest: [*]u8 = @ptrFromInt(buf_ptr);
+    const max_bytes: usize = @intCast(@min(count, 4096));
+    const offset: usize = entry_ptr.read_offset;
+    if (offset >= pos) return 0;
+    const available = pos - offset;
+    const to_copy = @min(available, max_bytes);
+    @memcpy(dest[0..to_copy], text_buf[offset..][0..to_copy]);
+    entry_ptr.read_offset += @intCast(to_copy);
+    return to_copy;
+}
+
+fn appendStr(buf: []u8, pos: usize, s: []const u8) usize {
+    var p = pos;
+    for (s) |c| {
+        if (p >= buf.len) break;
+        buf[p] = c;
+        p += 1;
+    }
+    return p;
+}
+
 fn usbRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
     const xhci = @import("xhci.zig");
     var text_buf: [2048]u8 = undefined;
@@ -832,7 +945,7 @@ fn procWrite(entry: process.FdEntry, buf_ptr: u64, count: u64) u64 {
                     if (parent.waiting_for_pid) |wait_pid| {
                         if (wait_pid == target.pid or wait_pid == 0) {
                             parent.syscall_ret = target.exit_status;
-                            parent.state = .ready;
+                            process.markReady(parent);
                             parent.waiting_for_pid = null;
                             target.state = .free;
                             target.parent_pid = null;
@@ -894,6 +1007,9 @@ fn sysOpen(path_ptr: u64, path_len: u64) u64 {
         }
         if (strEql(path_slice, "/dev/mouse")) {
             return proc.allocDevFd(.dev_mouse) orelse return EMFILE;
+        }
+        if (strEql(path_slice, "/dev/cpu")) {
+            return proc.allocDevFd(.dev_cpu) orelse return EMFILE;
         }
     }
 
@@ -1161,6 +1277,9 @@ fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
     }
     if (entry_ptr.fd_type == .dev_mouse) {
         return mouseRead(proc, entry_ptr, buf_ptr, count);
+    }
+    if (entry_ptr.fd_type == .dev_cpu) {
+        return cpuInfoRead(entry_ptr, buf_ptr, count);
     }
 
     const chan = ipc.getChannel(entry_ptr.channel_id) orelse return EBADF;
@@ -1826,7 +1945,7 @@ fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
     if ((client_proc.pending_op != .read and client_proc.pending_op != .stat) or client_proc.ipc_pending_msg == null) {
         client_proc.pending_op = .none;
     }
-    client_proc.state = .ready;
+    process.markReady(client_proc);
     chan.client.send_waiting = false;
     chan.client.blocked_pid = 0;
 

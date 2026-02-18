@@ -6,7 +6,11 @@
 /// Wake pattern: waker just marks the process as .ready. Actual data delivery
 /// happens in process.switchTo() after the target's address space is loaded,
 /// same as console_read and net_read.
+///
+/// SMP: Per-pipe spinlock guards all buffer/refcount operations. Global alloc
+/// lock guards pipe slot allocation. Lock ordering: alloc_lock → pipe.lock.
 const process = @import("process.zig");
+const SpinLock = @import("spinlock.zig").SpinLock;
 
 pub const MAX_PIPES = 32;
 pub const PIPE_BUF_SIZE = 4096;
@@ -21,12 +25,20 @@ pub const Pipe = struct {
     read_waiter: ?u16 = null,
     write_waiter: ?u16 = null,
     active: bool = false,
+    /// Per-pipe spinlock for SMP safety.
+    lock: SpinLock = .{},
 };
 
 var pipes: [MAX_PIPES]Pipe = [_]Pipe{.{}} ** MAX_PIPES;
 
+/// Global lock for pipe slot allocation.
+var alloc_lock: SpinLock = .{};
+
 /// Allocate a new pipe. Returns pipe_id or null if full.
 pub fn alloc() ?u8 {
+    alloc_lock.lock();
+    defer alloc_lock.unlock();
+
     for (&pipes, 0..) |*p, i| {
         if (!p.active) {
             p.* = .{};
@@ -39,7 +51,7 @@ pub fn alloc() ?u8 {
     return null;
 }
 
-/// Free a pipe slot.
+/// Free a pipe slot. Caller must hold pipe lock or ensure exclusive access.
 pub fn free(id: u8) void {
     if (id >= MAX_PIPES) return;
     pipes[id].active = false;
@@ -50,6 +62,9 @@ pub fn free(id: u8) void {
 pub fn pipeRead(id: u8, dest: []u8) ?usize {
     if (id >= MAX_PIPES) return 0;
     const p = &pipes[id];
+    p.lock.lock();
+    defer p.lock.unlock();
+
     if (!p.active) return 0;
 
     if (p.count == 0) {
@@ -67,7 +82,7 @@ pub fn pipeRead(id: u8, dest: []u8) ?usize {
     // Wake blocked writer if any — they'll retry in switchTo
     if (p.write_waiter) |wpid| {
         if (process.getByPid(wpid)) |wproc| {
-            if (wproc.state == .blocked) wproc.state = .ready;
+            if (wproc.state == .blocked) process.markReady(wproc);
         }
         p.write_waiter = null;
     }
@@ -82,6 +97,9 @@ pub const EPIPE: usize = 0xFFFFFFFFFFFFFFFF;
 pub fn pipeWrite(id: u8, src: []const u8) ?usize {
     if (id >= MAX_PIPES) return EPIPE;
     const p = &pipes[id];
+    p.lock.lock();
+    defer p.lock.unlock();
+
     if (!p.active) return EPIPE;
 
     if (p.readers == 0) return EPIPE;
@@ -101,7 +119,7 @@ pub fn pipeWrite(id: u8, src: []const u8) ?usize {
     // Wake blocked reader if any — they'll get data in switchTo
     if (p.read_waiter) |rpid| {
         if (process.getByPid(rpid)) |rproc| {
-            if (rproc.state == .blocked) rproc.state = .ready;
+            if (rproc.state == .blocked) process.markReady(rproc);
         }
         p.read_waiter = null;
     }
@@ -113,6 +131,8 @@ pub fn pipeWrite(id: u8, src: []const u8) ?usize {
 pub fn hasDataOrEof(id: u8) bool {
     if (id >= MAX_PIPES) return true;
     const p = &pipes[id];
+    p.lock.lock();
+    defer p.lock.unlock();
     if (!p.active) return true;
     return p.count > 0 or p.writers == 0;
 }
@@ -121,6 +141,8 @@ pub fn hasDataOrEof(id: u8) bool {
 pub fn hasSpaceOrBroken(id: u8) bool {
     if (id >= MAX_PIPES) return true;
     const p = &pipes[id];
+    p.lock.lock();
+    defer p.lock.unlock();
     if (!p.active) return true;
     return p.count < PIPE_BUF_SIZE or p.readers == 0;
 }
@@ -129,13 +151,16 @@ pub fn hasSpaceOrBroken(id: u8) bool {
 pub fn closeReadEnd(id: u8) void {
     if (id >= MAX_PIPES) return;
     const p = &pipes[id];
+    p.lock.lock();
+    defer p.lock.unlock();
+
     if (!p.active) return;
     if (p.readers > 0) p.readers -= 1;
 
     // Wake blocked writer — they'll get EPIPE on retry in switchTo
     if (p.write_waiter) |wpid| {
         if (process.getByPid(wpid)) |wproc| {
-            if (wproc.state == .blocked) wproc.state = .ready;
+            if (wproc.state == .blocked) process.markReady(wproc);
         }
         p.write_waiter = null;
     }
@@ -147,13 +172,16 @@ pub fn closeReadEnd(id: u8) void {
 pub fn closeWriteEnd(id: u8) void {
     if (id >= MAX_PIPES) return;
     const p = &pipes[id];
+    p.lock.lock();
+    defer p.lock.unlock();
+
     if (!p.active) return;
     if (p.writers > 0) p.writers -= 1;
 
     // Wake blocked reader — they'll get EOF in switchTo
     if (p.read_waiter) |rpid| {
         if (process.getByPid(rpid)) |rproc| {
-            if (rproc.state == .blocked) rproc.state = .ready;
+            if (rproc.state == .blocked) process.markReady(rproc);
         }
         p.read_waiter = null;
     }
@@ -164,21 +192,33 @@ pub fn closeWriteEnd(id: u8) void {
 /// Increment reader count (used when spawning child with pipe fd).
 pub fn incrementReaders(id: u8) void {
     if (id >= MAX_PIPES) return;
-    if (pipes[id].active) pipes[id].readers += 1;
+    const p = &pipes[id];
+    p.lock.lock();
+    defer p.lock.unlock();
+    if (p.active) p.readers += 1;
 }
 
 /// Increment writer count (used when spawning child with pipe fd).
 pub fn incrementWriters(id: u8) void {
     if (id >= MAX_PIPES) return;
-    if (pipes[id].active) pipes[id].writers += 1;
+    const p = &pipes[id];
+    p.lock.lock();
+    defer p.lock.unlock();
+    if (p.active) p.writers += 1;
 }
 
 pub fn setReadWaiter(id: u8, pid: u16) void {
     if (id >= MAX_PIPES) return;
-    pipes[id].read_waiter = pid;
+    const p = &pipes[id];
+    p.lock.lock();
+    defer p.lock.unlock();
+    p.read_waiter = pid;
 }
 
 pub fn setWriteWaiter(id: u8, pid: u16) void {
     if (id >= MAX_PIPES) return;
-    pipes[id].write_waiter = pid;
+    const p = &pipes[id];
+    p.lock.lock();
+    defer p.lock.unlock();
+    p.write_waiter = pid;
 }

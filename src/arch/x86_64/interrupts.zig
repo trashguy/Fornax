@@ -7,6 +7,7 @@ const paging = @import("paging.zig");
 const supervisor = @import("../../supervisor.zig");
 const process = @import("../../process.zig");
 const pic = @import("../../pic.zig");
+const apic = @import("apic.zig");
 
 const exception_names = [_][]const u8{
     "Division Error", // 0
@@ -80,6 +81,31 @@ inline fn inlineHex(val: u64) void {
 }
 
 pub fn handleException(frame: *idt.ExceptionFrame) void {
+    // IPI dispatch (vectors 253-255, LAPIC-sourced)
+    if (frame.vector >= 253) {
+        switch (frame.vector) {
+            253 => {
+                // TLB shootdown IPI — flush TLB if pending
+                const percpu = @import("../../percpu.zig");
+                const my_core = percpu.getCoreId();
+                if (@atomicLoad(bool, &percpu.percpu_array[my_core].tlb_flush_pending, .acquire)) {
+                    cpu.flushTlb();
+                    @atomicStore(bool, &percpu.percpu_array[my_core].tlb_flush_pending, false, .release);
+                }
+            },
+            254 => {
+                // Schedule IPI — wakes core from hlt; run queue checked in scheduler loop
+            },
+            255 => {
+                // Spurious APIC vector — no action needed
+                return; // No EOI for spurious
+            },
+            else => {},
+        }
+        apic.sendEoi();
+        return;
+    }
+
     // IRQ dispatch (vectors 32-47)
     if (frame.vector >= 32 and frame.vector < 48) {
         const irq: u8 = @intCast(frame.vector - 32);

@@ -355,7 +355,7 @@ fn wakeWaiter(is_error: bool) void {
             if (is_error) {
                 proc.syscall_ret = 0xFFFF_FFFF_FFFF_FFF6; // -ENOENT equivalent
             }
-            proc.state = .ready;
+            process.markReady(proc);
         }
     }
 }

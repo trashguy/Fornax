@@ -189,3 +189,12 @@ fn reloadSegments() void {
         : .{ .rax = true }
     );
 }
+
+/// Reload GDT + segments on an AP core (reuses BSP's GDT, no TSS setup).
+pub fn reloadGdtForAp() void {
+    asm volatile ("lgdt (%[gdt_ptr])"
+        :
+        : [gdt_ptr] "r" (&gdt_ptr),
+    );
+    reloadSegments();
+}

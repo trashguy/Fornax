@@ -6,8 +6,12 @@
 /// send() blocks until a receiver calls recv().
 /// recv() blocks until a sender calls send().
 /// Transfer happens at rendezvous — no kernel buffering.
+///
+/// SMP: Per-channel spinlock guards endpoint state. Global alloc lock guards
+/// channel allocation. Lock ordering: alloc_lock → channel.lock.
 const heap = @import("heap.zig");
 const klog = @import("klog.zig");
+const SpinLock = @import("spinlock.zig").SpinLock;
 
 /// Maximum number of channels system-wide.
 const MAX_CHANNELS = 256;
@@ -102,6 +106,8 @@ pub const Channel = struct {
     /// Kernel-backed data: if non-null, reads are served directly from this
     /// buffer (no IPC message passing). Used for initrd file server.
     kernel_data: ?[]const u8,
+    /// Per-channel spinlock for SMP safety.
+    lock: SpinLock = .{},
 };
 
 var channels: [MAX_CHANNELS]Channel = [_]Channel{.{
@@ -110,6 +116,9 @@ var channels: [MAX_CHANNELS]Channel = [_]Channel{.{
     .client = empty_end,
     .kernel_data = null,
 }} ** MAX_CHANNELS;
+
+/// Global lock for channel allocation.
+var alloc_lock: SpinLock = .{};
 
 var initialized: bool = false;
 
@@ -132,6 +141,9 @@ pub const IpcError = error{
 pub fn channelCreate() IpcError!struct { server: ChannelId, client: ChannelId } {
     if (!initialized) return error.NotInitialized;
 
+    alloc_lock.lock();
+    defer alloc_lock.unlock();
+
     for (0..MAX_CHANNELS) |i| {
         if (channels[i].state == .free) {
             channels[i] = .{
@@ -150,6 +162,9 @@ pub fn channelCreate() IpcError!struct { server: ChannelId, client: ChannelId } 
 /// Create a kernel-backed channel: reads served directly from data, no server process.
 pub fn channelCreateKernelBacked(data: []const u8) IpcError!ChannelId {
     if (!initialized) return error.NotInitialized;
+
+    alloc_lock.lock();
+    defer alloc_lock.unlock();
 
     for (0..MAX_CHANNELS) |i| {
         if (channels[i].state == .free) {
@@ -173,6 +188,9 @@ pub fn send(chan_id: ChannelId, msg: *Message) IpcError!void {
     if (chan_id >= MAX_CHANNELS) return error.InvalidChannel;
 
     const chan = &channels[chan_id];
+    chan.lock.lock();
+    defer chan.lock.unlock();
+
     if (chan.state != .open) return error.ChannelClosed;
 
     // Synchronous rendezvous: store message for receiver
@@ -187,6 +205,9 @@ pub fn recv(chan_id: ChannelId, out_msg: *Message) IpcError!void {
     if (chan_id >= MAX_CHANNELS) return error.InvalidChannel;
 
     const chan = &channels[chan_id];
+    chan.lock.lock();
+    defer chan.lock.unlock();
+
     if (chan.state != .open) return error.ChannelClosed;
 
     if (chan.client.pending_msg) |pending| {
@@ -204,6 +225,9 @@ pub fn reply(chan_id: ChannelId, msg: *Message) IpcError!void {
     if (chan_id >= MAX_CHANNELS) return error.InvalidChannel;
 
     const chan = &channels[chan_id];
+    chan.lock.lock();
+    defer chan.lock.unlock();
+
     if (chan.state != .open) return error.ChannelClosed;
 
     chan.server.pending_msg = msg;
@@ -212,10 +236,15 @@ pub fn reply(chan_id: ChannelId, msg: *Message) IpcError!void {
 /// Close a channel.
 pub fn channelClose(chan_id: ChannelId) void {
     if (chan_id >= MAX_CHANNELS) return;
-    channels[chan_id].state = .closed;
+    const chan = &channels[chan_id];
+    chan.lock.lock();
+    defer chan.lock.unlock();
+    chan.state = .closed;
 }
 
 /// Get a channel by ID (for kernel use).
+/// NOTE: The returned pointer is NOT lock-protected. Callers in syscall.zig
+/// must handle locking externally if they do complex multi-step operations.
 pub fn getChannel(chan_id: ChannelId) ?*Channel {
     if (chan_id >= MAX_CHANNELS) return null;
     if (channels[chan_id].state == .free) return null;

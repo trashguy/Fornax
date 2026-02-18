@@ -7,6 +7,7 @@ const klog = @import("klog.zig");
 const mem = @import("mem.zig");
 const ipc = @import("ipc.zig");
 const namespace = @import("namespace.zig");
+const SpinLock = @import("spinlock.zig").SpinLock;
 
 const paging = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/paging.zig"),
@@ -47,15 +48,17 @@ const cpu = switch (@import("builtin").cpu.arch) {
     },
 };
 
+const percpu = @import("percpu.zig");
+
 const syscall_entry = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/syscall_entry.zig"),
     .riscv64 => @import("arch/riscv64/syscall_entry.zig"),
     else => struct {
         pub fn setKernelStack(_: u64) void {}
-        pub var saved_user_rip: u64 = 0;
-        pub var saved_user_rsp: u64 = 0;
-        pub var saved_user_rflags: u64 = 0;
-        pub var saved_kernel_rsp: u64 = 0;
+        pub fn getSavedUserRip() u64 { return 0; }
+        pub fn getSavedUserRsp() u64 { return 0; }
+        pub fn getSavedUserRflags() u64 { return 0; }
+        pub fn getSavedKernelRsp() u64 { return 0; }
         pub fn resume_from_kernel_frame(_: u64) noreturn {
             unreachable;
         }
@@ -92,7 +95,7 @@ pub const ResourceQuotas = struct {
 
 pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, remove, rename, truncate, wstat, console_read, net_read, net_connect, net_listen, dns_query, icmp_read, pipe_read, pipe_write, sleep };
 
-pub const FdType = enum(u8) { ipc, net, pipe, blk, proc, dev_null, dev_zero, dev_random, dev_pci, dev_usb, dev_mouse };
+pub const FdType = enum(u8) { ipc, net, pipe, blk, proc, dev_null, dev_zero, dev_random, dev_pci, dev_usb, dev_mouse, dev_cpu };
 
 pub const ProcFdKind = enum(u8) {
     dir,
@@ -199,6 +202,12 @@ pub const Process = struct {
     uid: u16 = 0,
     /// Process group ID.
     gid: u16 = 0,
+    /// Core this process is assigned to run on.
+    assigned_core: u8 = 0,
+    /// Core affinity: -1 = any core, >=0 = pinned to specific core.
+    core_affinity: i16 = -1,
+    /// Bitmap of cores that have run this process (for TLB shootdown).
+    cores_ran_on: u128 = 0,
 
     pub fn initFds(self: *Process) void {
         for (&self.fds) |*fd| {
@@ -339,10 +348,22 @@ var processes: [MAX_PROCESSES]Process = undefined;
 var initialized: bool = false;
 var next_pid: u32 = 1;
 
-/// Currently running process.
-var current: ?*Process = null;
+/// Spinlock guarding process table allocation (next_pid, state transitions).
+pub var table_lock: SpinLock = .{};
+
 /// Index for round-robin scheduling.
 var schedule_index: usize = 0;
+
+/// Get the currently running process on this core (from per-CPU state).
+fn current() ?*Process {
+    const ptr = percpu.get().current orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
+/// Set the currently running process on this core (in per-CPU state).
+fn setCurrentInternal(proc: ?*Process) void {
+    percpu.get().current = if (proc) |p| @ptrCast(p) else null;
+}
 
 pub fn init() void {
     for (&processes) |*p| {
@@ -384,15 +405,22 @@ pub fn init() void {
 pub fn create() ?*Process {
     if (!initialized) return null;
 
-    // Find a free slot
-    var slot: ?*Process = null;
-    for (&processes) |*p| {
-        if (p.state == .free) {
-            slot = p;
-            break;
+    // Find a free slot (under table lock)
+    const proc = blk: {
+        table_lock.lock();
+        defer table_lock.unlock();
+        var slot: ?*Process = null;
+        for (&processes) |*p| {
+            if (p.state == .free) {
+                slot = p;
+                break;
+            }
         }
-    }
-    const proc = slot orelse return null;
+        const p = slot orelse break :blk null;
+        // Claim the slot immediately so no other core takes it
+        p.state = .blocked;
+        break :blk p;
+    } orelse return null;
 
     // Free deferred kernel stack from previous incarnation
     if (proc.needs_stack_free) {
@@ -413,10 +441,9 @@ pub fn create() ?*Process {
     const stack_virt = if (paging.isInitialized()) stack_base + mem.KERNEL_VIRT_BASE else stack_base;
 
     // Parent is whoever is currently running (null for kernel-spawned processes)
-    const parent_pid: ?u32 = if (current) |cur| cur.pid else null;
+    const parent_pid: ?u32 = if (current()) |cur| cur.pid else null;
 
-    proc.pid = next_pid;
-    proc.state = .ready;
+    proc.pid = @atomicRmw(u32, &next_pid, .Add, 1, .monotonic);
     proc.pml4 = addr_space;
     proc.kernel_stack_top = stack_virt + KERNEL_STACK_PAGES * mem.PAGE_SIZE;
     proc.user_rip = 0;
@@ -440,23 +467,30 @@ pub fn create() ?*Process {
     proc.pending_fd = 0;
     proc.needs_stack_free = false;
     proc.sleep_until = 0;
-    proc.vt = if (current) |cur| cur.vt else 0;
+    proc.vt = if (current()) |cur| cur.vt else 0;
     proc.uid = 0;
     namespace.getRootNamespace().cloneInto(&proc.ns);
     proc.ipc_msg = ipc.Message.init(.t_open);
-    next_pid += 1;
+
+    // Assign core: kernel-spawned → BSP; otherwise least-loaded core
+    proc.assigned_core = if (current()) |_| leastLoadedCore() else 0;
+    proc.core_affinity = -1; // any core
+    proc.cores_ran_on = 0;
+
+    // Enqueue on the assigned core's run queue
+    markReady(proc);
 
     return proc;
 }
 
-/// Get the currently running process.
+/// Get the currently running process on this core.
 pub fn getCurrent() ?*Process {
-    return current;
+    return current();
 }
 
-/// Set the currently running process.
+/// Set the currently running process on this core.
 pub fn setCurrent(proc: ?*Process) void {
-    current = proc;
+    setCurrentInternal(proc);
 }
 
 /// Get a process by PID.
@@ -465,6 +499,77 @@ pub fn getByPid(pid: u32) ?*Process {
         if (p.state != .free and p.pid == pid) return p;
     }
     return null;
+}
+
+/// Pick the online core with the shortest run queue.
+fn leastLoadedCore() u8 {
+    var best: u8 = 0;
+    var best_len: u32 = percpu.percpu_array[0].run_queue.len;
+    var i: u8 = 1;
+    while (i < percpu.cores_online) : (i += 1) {
+        const len = percpu.percpu_array[i].run_queue.len;
+        if (len < best_len) {
+            best = i;
+            best_len = len;
+        }
+    }
+    return best;
+}
+
+/// Get the process table index for a given process pointer.
+pub fn procIndex(proc: *const Process) u16 {
+    return @intCast((@intFromPtr(proc) - @intFromPtr(&processes[0])) / @sizeOf(Process));
+}
+
+/// Mark a process as ready and enqueue it on its assigned core's run queue.
+/// If the target core is different from the current core, sends a schedule IPI.
+pub fn markReady(proc: *Process) void {
+    proc.state = .ready;
+    const target_core = proc.assigned_core;
+    _ = percpu.percpu_array[target_core].run_queue.push(procIndex(proc));
+
+    // Send IPI if target core is remote (and LAPIC is available)
+    if (@import("builtin").cpu.arch == .x86_64) {
+        if (percpu.cores_online > 1 and target_core != percpu.getCoreId()) {
+            const apic = @import("arch/x86_64/apic.zig");
+            apic.sendIpi(apic.lapic_ids[target_core], apic.IPI_SCHEDULE);
+        }
+    }
+}
+
+/// Send TLB shootdown IPI to all cores that have run this process.
+/// Called when tearing down page tables (process exit, exec).
+/// The current core flushes its own TLB directly; remote cores get an IPI.
+pub fn tlbShootdown(proc: *const Process) void {
+    if (@import("builtin").cpu.arch != .x86_64) return;
+    if (percpu.cores_online <= 1) return;
+
+    const my_core = percpu.getCoreId();
+    const bitmap = proc.cores_ran_on;
+    const apic = @import("arch/x86_64/apic.zig");
+
+    var core: u8 = 0;
+    while (core < percpu.cores_online) : (core += 1) {
+        if (bitmap & (@as(u128, 1) << @intCast(core)) == 0) continue;
+        if (core == my_core) {
+            // Flush own TLB by reloading CR3
+            const cpu_mod = @import("arch/x86_64/cpu.zig");
+            cpu_mod.flushTlb();
+        } else {
+            // Set pending flag and send IPI
+            @atomicStore(bool, &percpu.percpu_array[core].tlb_flush_pending, true, .release);
+            apic.sendIpi(apic.lapic_ids[core], apic.IPI_TLB_SHOOTDOWN);
+        }
+    }
+}
+
+/// Mark a process as ready by PID. Returns false if PID not found.
+pub fn markReadyByPid(pid: u32) bool {
+    if (getByPid(pid)) |proc| {
+        markReady(proc);
+        return true;
+    }
+    return false;
 }
 
 /// Recursively kill all children of a process (Fornax orphan policy).
@@ -496,11 +601,11 @@ pub fn getProcessTable() *[64]Process {
 /// Save current user context from the syscall entry point globals.
 /// Called at the start of syscall dispatch to snapshot the user state.
 pub fn saveCurrentContext() void {
-    if (current) |proc| {
-        proc.user_rip = syscall_entry.saved_user_rip;
-        proc.user_rsp = syscall_entry.saved_user_rsp;
-        proc.user_rflags = syscall_entry.saved_user_rflags;
-        proc.saved_kernel_rsp = syscall_entry.saved_kernel_rsp;
+    if (current()) |proc| {
+        proc.user_rip = syscall_entry.getSavedUserRip();
+        proc.user_rsp = syscall_entry.getSavedUserRsp();
+        proc.user_rflags = syscall_entry.getSavedUserRflags();
+        proc.saved_kernel_rsp = syscall_entry.getSavedKernelRsp();
     }
 }
 
@@ -508,25 +613,55 @@ pub fn saveCurrentContext() void {
 /// If no process is ready, halts the system.
 pub fn scheduleNext() noreturn {
     // Mark current as no longer running (if it was)
-    if (current) |proc| {
+    if (current()) |proc| {
         if (proc.state == .running) {
-            proc.state = .ready;
+            // Re-enqueue on this core's run queue
+            markReady(proc);
         }
     }
 
+    const my_core = percpu.getCoreId();
+    const my_queue = &percpu.percpu_array[my_core].run_queue;
+
     while (true) {
-        // Round-robin: scan from schedule_index
-        var checked: usize = 0;
-        while (checked < MAX_PROCESSES) : (checked += 1) {
-            schedule_index = (schedule_index + 1) % MAX_PROCESSES;
-            const proc = &processes[schedule_index];
+        // Try to pop from local run queue
+        if (my_queue.pop()) |pid| {
+            const proc = &processes[pid];
             if (proc.state == .ready) {
                 switchTo(proc);
             }
+            // If the process is no longer ready (e.g., it was killed),
+            // just loop and try the next entry.
+            continue;
         }
 
-        // No ready process found
-        // Check if any processes are alive (blocked or zombie awaiting reap)
+        // Run queue empty — try work stealing from other cores
+        if (percpu.cores_online > 1) {
+            var victim: u8 = (my_core +% 1) % percpu.cores_online;
+            var attempts: u8 = 0;
+            while (attempts < percpu.cores_online - 1) : (attempts += 1) {
+                if (victim != my_core) {
+                    const stolen = my_queue.stealHalf(&percpu.percpu_array[victim].run_queue);
+                    if (stolen > 0) {
+                        // Update assigned_core for stolen processes
+                        var peek: u32 = 0;
+                        while (peek < stolen) : (peek += 1) {
+                            const idx = (my_queue.head +% peek) % percpu.RUN_QUEUE_SIZE;
+                            const spid = my_queue.entries[idx];
+                            if (spid < MAX_PROCESSES) {
+                                processes[spid].assigned_core = my_core;
+                            }
+                        }
+                        break; // Got work, will pop on next iteration
+                    }
+                }
+                victim = (victim +% 1) % percpu.cores_online;
+            }
+            // If we stole work, loop back to pop
+            if (!my_queue.isEmpty()) continue;
+        }
+
+        // No ready process found — check if any are alive
         var any_alive = false;
         for (&processes) |*p| {
             if (p.state == .blocked or p.state == .zombie) {
@@ -536,13 +671,15 @@ pub fn scheduleNext() noreturn {
         }
 
         if (any_alive) {
-            // Poll network — processes TCP segments and timer ticks
-            const net = @import("net.zig");
-            net.poll();
+            // BSP: poll network
+            if (my_core == 0) {
+                const net = @import("net.zig");
+                net.poll();
+            }
 
-            // All blocked — enable interrupts and halt until an IRQ fires.
-            // The IRQ handler may wake a process (e.g., keyboard input).
-            current = null;
+            // Idle — enable interrupts and halt until an IRQ/IPI fires
+            setCurrentInternal(null);
+            percpu.percpu_array[my_core].idle_ticks +%= 1;
             switch (@import("builtin").cpu.arch) {
                 .riscv64 => {
                     asm volatile ("csrsi sstatus, 0x2"); // SIE=1
@@ -555,11 +692,22 @@ pub fn scheduleNext() noreturn {
                     asm volatile ("cli");
                 },
             }
-            // Loop back and re-scan for ready processes
             continue;
         } else {
+            // On non-BSP cores, just idle forever if no processes
+            if (my_core != 0) {
+                setCurrentInternal(null);
+                while (true) {
+                    asm volatile ("sti");
+                    asm volatile ("hlt");
+                    asm volatile ("cli");
+                    // Check if new work appeared
+                    if (!my_queue.isEmpty()) break;
+                }
+                continue;
+            }
             klog.err("\n[All processes exited. System halting.]\n");
-            current = null;
+            setCurrentInternal(null);
             cpu.halt();
         }
     }
@@ -575,8 +723,10 @@ extern fn resume_user_mode(rip: u64, rsp: u64, flags: u64, ret_val: u64) callcon
 
 /// Switch to a specific process and jump to its user mode.
 fn switchTo(proc: *Process) noreturn {
-    current = proc;
+    setCurrentInternal(proc);
     proc.state = .running;
+    // Track which cores have run this process (for TLB shootdown)
+    proc.cores_ran_on |= @as(u128, 1) << @intCast(percpu.getCoreId());
 
     // Set up kernel stack for this process
     syscall_entry.setKernelStack(proc.kernel_stack_top);
@@ -599,7 +749,7 @@ fn switchTo(proc: *Process) noreturn {
         } else {
             // Not yet — re-block
             proc.state = .blocked;
-            current = null;
+            setCurrentInternal(null);
             scheduleNext();
         }
     }
@@ -637,7 +787,7 @@ fn switchTo(proc: *Process) noreturn {
                 // Still no data — re-block
                 tcp.setReadWaiter(fd_entry.net_conn, @intCast(proc.pid));
                 proc.state = .blocked;
-                current = null;
+                setCurrentInternal(null);
                 scheduleNext();
             }
         } else {
@@ -680,7 +830,7 @@ fn switchTo(proc: *Process) noreturn {
                 // Still no data — re-block (timeout or spurious wake)
                 icmp_mod.setReadWaiter(fd_entry.net_conn, @intCast(proc.pid));
                 proc.state = .blocked;
-                current = null;
+                setCurrentInternal(null);
                 scheduleNext();
             }
         } else {
@@ -714,7 +864,7 @@ fn switchTo(proc: *Process) noreturn {
             // Data not ready yet (spurious wake) — re-block
             proc.state = .blocked;
             proc.pending_op = .console_read;
-            current = null;
+            setCurrentInternal(null);
             // Return to scheduler by re-scanning
             scheduleNext();
         }
@@ -757,7 +907,7 @@ fn switchTo(proc: *Process) noreturn {
             // Still no data — re-block
             pipe_mod.setReadWaiter(fd_entry.pipe_id, @intCast(proc.pid));
             proc.state = .blocked;
-            current = null;
+            setCurrentInternal(null);
             scheduleNext();
         }
         proc.ipc_recv_buf_ptr = 0;
@@ -799,7 +949,7 @@ fn switchTo(proc: *Process) noreturn {
             // Still full — re-block
             pipe_mod.setWriteWaiter(fd_entry.pipe_id, @intCast(proc.pid));
             proc.state = .blocked;
-            current = null;
+            setCurrentInternal(null);
             scheduleNext();
         }
         proc.ipc_recv_buf_ptr = 0;
@@ -876,9 +1026,12 @@ pub fn allocPageForProcess(proc: *Process) ?u64 {
 /// Safe to call even if pml4 is null.
 pub fn freeUserMemory(proc: *Process) void {
     if (proc.pml4) |pml4| {
+        // Flush TLB on all cores that ran this process
+        tlbShootdown(proc);
         paging.freeAddressSpace(pml4);
         proc.pml4 = null;
         proc.pages_used = 0;
+        proc.cores_ran_on = 0;
     }
 }
 

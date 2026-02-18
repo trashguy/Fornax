@@ -1,4 +1,4 @@
-.PHONY: all x86_64 aarch64 riscv64 run run-x86_64 run-aarch64 run-riscv64 disk disk-x86_64 disk-aarch64 clean clean-disk help
+.PHONY: all x86_64 aarch64 riscv64 run run-x86_64 run-smp run-aarch64 run-riscv64 disk disk-x86_64 disk-aarch64 clean clean-disk help
 .PHONY: release release-x86_64 release-aarch64 release-riscv64 run-release disk-img disk-format
 
 all: x86_64 aarch64
@@ -28,6 +28,9 @@ run: run-x86_64
 
 run-x86_64: x86_64
 	./scripts/run-x86_64.sh
+
+run-smp: x86_64
+	./scripts/run-x86_64.sh -smp 4
 
 run-release: release-x86_64
 	./scripts/run-x86_64.sh
@@ -72,6 +75,7 @@ help:
 	@echo "  make riscv64        Build riscv64"
 	@echo "  make release        Build both architectures (ReleaseSafe everywhere)"
 	@echo "  make run             Run x86_64 in QEMU"
+	@echo "  make run-smp         Run x86_64 in QEMU with 4 cores"
 	@echo "  make run-release     Run x86_64 in QEMU (ReleaseSafe kernel)"
 	@echo "  make run-aarch64     Run aarch64 in QEMU"
 	@echo "  make run-riscv64     Run riscv64 in QEMU"

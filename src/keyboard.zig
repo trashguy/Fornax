@@ -296,7 +296,7 @@ fn wakeWaiterVt(input: *VtInput) void {
     const pid = input.waiting_pid orelse return;
     if (process.getByPid(pid)) |proc| {
         if (proc.state == .blocked) {
-            proc.state = .ready;
+            process.markReady(proc);
             proc.pending_op = .console_read;
         }
     }

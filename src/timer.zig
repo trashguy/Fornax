@@ -65,7 +65,7 @@ fn handleIrq() bool {
     for (table) |*p| {
         if (p.state == .blocked and p.pending_op == .sleep) {
             if ((ticks -% p.sleep_until) < 0x8000_0000) {
-                p.state = .ready;
+                process.markReady(p);
             }
         }
     }

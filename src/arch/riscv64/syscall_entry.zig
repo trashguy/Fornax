@@ -4,15 +4,21 @@
 /// This module handles STVEC setup and provides the Zig dispatch function
 /// called from assembly using RISC-V C ABI.
 ///
+/// Per-CPU state (kernel_stack_top, saved_user_*, saved_kernel_rsp)
+/// lives in percpu.AsmState, accessed via TP-relative in entry.S (Phase C).
+/// For now (single core), the riscv64 entry.S still uses global export vars
+/// but Zig-level code uses percpu accessors.
+///
 /// Fornax ECALL convention:
 ///   a7 = syscall number
 ///   a0, a1, a2, a3, a4 = args
 ///   a0 = return value
 const cpu = @import("cpu.zig");
 const klog = @import("../../klog.zig");
+const percpu = @import("../../percpu.zig");
 
-/// Kernel stack top — set before entering userspace.
-/// Used by the trap entry asm to switch stacks.
+/// Kernel stack top — still exported for riscv64 entry.S (uses globals).
+/// Will move to TP-relative in Phase C.
 pub export var kernel_stack_top: u64 = 0;
 
 /// Saved user stack pointer during trap.
@@ -54,8 +60,30 @@ pub fn init() void {
 /// Set the kernel stack for trap entry.
 pub fn setKernelStack(stack_top: u64) void {
     kernel_stack_top = stack_top;
+    // Also mirror into percpu AsmState for Zig-level access
+    percpu.getAsm().kernel_stack_top = stack_top;
     // Also update SSCRATCH for the next trap entry from U-mode
     cpu.csrWrite(cpu.CSR_SSCRATCH, stack_top);
+}
+
+/// Read saved user RIP from per-CPU AsmState.
+pub inline fn getSavedUserRip() u64 {
+    return saved_user_rip;
+}
+
+/// Read saved user RSP from per-CPU AsmState.
+pub inline fn getSavedUserRsp() u64 {
+    return saved_user_rsp;
+}
+
+/// Read saved user RFLAGS from per-CPU AsmState.
+pub inline fn getSavedUserRflags() u64 {
+    return saved_user_rflags;
+}
+
+/// Read saved kernel RSP from per-CPU AsmState.
+pub inline fn getSavedKernelRsp() u64 {
+    return saved_kernel_rsp;
 }
 
 /// Zig-level syscall dispatcher. Called from entry.S using C ABI.

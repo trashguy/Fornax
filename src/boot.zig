@@ -8,6 +8,8 @@ pub const BootInfo = struct {
     /// Initrd image loaded from ESP (null if not found).
     initrd_base: ?[*]const u8,
     initrd_size: usize,
+    /// ACPI RSDP physical address (null if not found).
+    rsdp: ?[*]const u8 = null,
 };
 
 pub const MemoryMap = struct {
@@ -50,6 +52,9 @@ pub fn init() InitError!BootInfo {
     // Load initrd from ESP (optional — boot proceeds without it)
     const initrd = loadInitrd(boot_services);
 
+    // Find ACPI RSDP from UEFI configuration table (must be before exitBootServices)
+    const rsdp = findRsdp();
+
     // Get memory map and exit boot services
     // Allocate a generous buffer for the memory map
     const map_buf_size: usize = 64 * 1024;
@@ -79,6 +84,7 @@ pub fn init() InitError!BootInfo {
         },
         .initrd_base = initrd.base,
         .initrd_size = initrd.size,
+        .rsdp = rsdp,
     };
 }
 
@@ -134,6 +140,20 @@ pub fn errorName(err: InitError) [*:0]const u16 {
         error.ExitBootServicesFailed => L("ExitBootServicesFailed"),
         error.PoolAllocFailed => L("PoolAllocFailed"),
     };
+}
+
+/// Find ACPI 2.0 RSDP from UEFI configuration table.
+fn findRsdp() ?[*]const u8 {
+    const config_table = uefi.system_table.configuration_table;
+    const count = uefi.system_table.number_of_table_entries;
+
+    const entries = config_table[0..count];
+    for (entries) |entry| {
+        if (entry.vendor_guid.eql(uefi.tables.ConfigurationTable.acpi_20_table_guid)) {
+            return @ptrCast(entry.vendor_table);
+        }
+    }
+    return null;
 }
 
 fn L(comptime ascii: []const u8) *const [ascii.len:0]u16 {

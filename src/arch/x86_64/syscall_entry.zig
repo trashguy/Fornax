@@ -4,29 +4,16 @@
 /// This module handles MSR setup and provides the Zig dispatch function
 /// called from assembly using System V ABI.
 ///
+/// Per-CPU state (kernel_stack_top, saved_user_*, saved_kernel_rsp)
+/// lives in percpu.AsmState, accessed via %gs segment override in entry.S.
+///
 /// Fornax syscall convention:
 ///   RAX = syscall number
 ///   RDI, RSI, RDX, R10, R8, R9 = args
 ///   RAX = return value (or -errno on error)
 const cpu = @import("cpu.zig");
 const klog = @import("../../klog.zig");
-
-/// Kernel stack top — set before entering userspace.
-/// Used by the syscall entry asm to switch stacks.
-pub export var kernel_stack_top: u64 = 0;
-
-/// Saved user stack pointer during syscall.
-pub export var saved_user_rsp: u64 = 0;
-
-/// Saved user instruction pointer (from RCX).
-pub export var saved_user_rip: u64 = 0;
-
-/// Saved user RFLAGS (from R11).
-pub export var saved_user_rflags: u64 = 0;
-
-/// Saved kernel RSP after pushing the full GPR frame.
-/// Used to resume blocked processes via their kernel stack.
-pub export var saved_kernel_rsp: u64 = 0;
+const percpu = @import("../../percpu.zig");
 
 /// Assembly entry point defined in entry.S.
 extern fn syscall_entry() callconv(.naked) void;
@@ -58,9 +45,29 @@ pub fn init() void {
     klog.info("SYSCALL: MSRs configured\n");
 }
 
-/// Set the kernel stack for syscall entry.
+/// Set the kernel stack for syscall entry (stored in per-CPU AsmState).
 pub fn setKernelStack(stack_top: u64) void {
-    kernel_stack_top = stack_top;
+    percpu.getAsm().kernel_stack_top = stack_top;
+}
+
+/// Read saved user RIP from per-CPU AsmState.
+pub inline fn getSavedUserRip() u64 {
+    return percpu.getAsm().saved_user_rip;
+}
+
+/// Read saved user RSP from per-CPU AsmState.
+pub inline fn getSavedUserRsp() u64 {
+    return percpu.getAsm().saved_user_rsp;
+}
+
+/// Read saved user RFLAGS from per-CPU AsmState.
+pub inline fn getSavedUserRflags() u64 {
+    return percpu.getAsm().saved_user_rflags;
+}
+
+/// Read saved kernel RSP from per-CPU AsmState.
+pub inline fn getSavedKernelRsp() u64 {
+    return percpu.getAsm().saved_kernel_rsp;
 }
 
 /// Zig-level syscall dispatcher. Called from entry.S using System V ABI.

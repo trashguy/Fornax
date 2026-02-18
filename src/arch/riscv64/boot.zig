@@ -104,8 +104,8 @@ export fn riscv64KernelMain(_: u64, _: u64) callconv(.c) noreturn {
         }
 
         klog.info("Initrd found at 0x84000000\n");
-        main.kernelInit(initrd_ptr, initrd_size);
+        main.kernelInit(initrd_ptr, initrd_size, null);
     } else {
-        main.kernelInit(null, 0);
+        main.kernelInit(null, 0, null);
     }
 }

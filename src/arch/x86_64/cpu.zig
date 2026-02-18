@@ -98,6 +98,17 @@ pub inline fn spinHint() void {
     asm volatile ("pause");
 }
 
+/// Flush TLB by reloading CR3.
+pub fn flushTlb() void {
+    asm volatile (
+        \\mov %%cr3, %%rax
+        \\mov %%rax, %%cr3
+        :
+        :
+        : .{ .rax = true, .memory = true }
+    );
+}
+
 /// ACPI shutdown: write S5 sleep type to QEMU PM1a control port.
 pub fn acpiShutdown() noreturn {
     outw(0x604, 0x2000);
@@ -108,6 +119,29 @@ pub fn acpiShutdown() noreturn {
 pub fn resetSystem() noreturn {
     outb(0x64, 0xFE);
     halt();
+}
+
+pub const CpuidResult = struct {
+    eax: u32,
+    ebx: u32,
+    ecx: u32,
+    edx: u32,
+};
+
+pub fn cpuid(leaf: u32, subleaf: u32) CpuidResult {
+    var eax: u32 = undefined;
+    var ebx: u32 = undefined;
+    var ecx: u32 = undefined;
+    var edx: u32 = undefined;
+    asm volatile ("cpuid"
+        : [eax] "={eax}" (eax),
+          [ebx] "={ebx}" (ebx),
+          [ecx] "={ecx}" (ecx),
+          [edx] "={edx}" (edx),
+        : [leaf] "{eax}" (leaf),
+          [subleaf] "{ecx}" (subleaf),
+    );
+    return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
 }
 
 // MSR numbers

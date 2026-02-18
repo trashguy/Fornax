@@ -15,6 +15,13 @@
 .set USER_CS, 0x23   # 0x20 | 3
 .set USER_DS, 0x1B   # 0x18 | 3
 
+# Per-CPU AsmState offsets (must match percpu.zig AsmState extern struct)
+.set PERCPU_KST, 0    # kernel_stack_top
+.set PERCPU_USR, 8    # saved_user_rsp
+.set PERCPU_UIP, 16   # saved_user_rip
+.set PERCPU_UFL, 24   # saved_user_rflags
+.set PERCPU_KSR, 32   # saved_kernel_rsp
+
 .text
 
 # =============================================================================
@@ -32,13 +39,16 @@
 .global syscall_entry
 .align 16
 syscall_entry:
-    # Save user context to globals (still on user stack, interrupts off)
-    movq %rsp, saved_user_rsp(%rip)
-    movq %rcx, saved_user_rip(%rip)
-    movq %r11, saved_user_rflags(%rip)
+    # Swap GS base: user GS ↔ kernel PerCpu AsmState pointer
+    swapgs
 
-    # Switch to kernel stack
-    movq kernel_stack_top(%rip), %rsp
+    # Save user context to per-CPU AsmState (via %gs segment override)
+    movq %rsp, %gs:PERCPU_USR
+    movq %rcx, %gs:PERCPU_UIP
+    movq %r11, %gs:PERCPU_UFL
+
+    # Switch to kernel stack (from per-CPU AsmState)
+    movq %gs:PERCPU_KST, %rsp
 
     # Push ALL user registers for perfect restoration on return.
     # Stack frame layout (16 entries, 128 bytes):
@@ -58,7 +68,7 @@ syscall_entry:
     #   [rsp +  2*8] = R13
     #   [rsp +  1*8] = R14
     #   [rsp +  0*8] = R15
-    pushq saved_user_rsp(%rip)
+    pushq %gs:PERCPU_USR
     pushq %rcx
     pushq %r11
     pushq %rax
@@ -76,7 +86,7 @@ syscall_entry:
     pushq %r15
 
     # Save kernel RSP (pointing to bottom of frame) for blocking syscall resume
-    movq %rsp, saved_kernel_rsp(%rip)
+    movq %rsp, %gs:PERCPU_KSR
 
     # Translate Fornax syscall convention → SysV calling convention
     # From: RAX=nr, RDI=a0, RSI=a1, RDX=a2, R10=a3, R8=a4
@@ -113,6 +123,8 @@ syscall_return_path:
     popq %rcx
     popq %rsp
 
+    # Swap GS back: kernel PerCpu → user GS
+    swapgs
     sysretq
 
 # =============================================================================
@@ -203,6 +215,11 @@ ISR_NOERR 45      # IRQ 13 — FPU
 ISR_NOERR 46      # IRQ 14 — Primary ATA
 ISR_NOERR 47      # IRQ 15 — Secondary ATA
 
+# IPI stubs (high vectors, used for SMP inter-processor interrupts)
+ISR_NOERR 253     # IPI: TLB shootdown (0xFD)
+ISR_NOERR 254     # IPI: Schedule (0xFE)
+ISR_NOERR 255     # Spurious APIC vector (0xFF)
+
 .align 16
 isr_common:
     # Save all GPRs to build ExceptionFrame on stack
@@ -264,6 +281,14 @@ isr_stub_table:
     .quad isr_stub_36, isr_stub_37, isr_stub_38, isr_stub_39
     .quad isr_stub_40, isr_stub_41, isr_stub_42, isr_stub_43
     .quad isr_stub_44, isr_stub_45, isr_stub_46, isr_stub_47
+
+# IPI stub addresses (for IDT initialization)
+.align 8
+.global ipi_stub_table
+ipi_stub_table:
+    .quad isr_stub_253     # IPI_TLB_SHOOTDOWN (0xFD)
+    .quad isr_stub_254     # IPI_SCHEDULE (0xFE)
+    .quad isr_stub_255     # SPURIOUS_APIC (0xFF)
 
 # =============================================================================
 # resume_user_mode — First-run return to userspace via IRETQ

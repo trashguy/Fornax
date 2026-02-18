@@ -48,21 +48,49 @@ The kernel has no POSIX. POSIX programs run in two modes:
 - **POSIX realms** — for CLI tools (gcc, python, etc.). The ELF interpreter auto-detects POSIX binaries and sets up a realm with musl/libposix. Ephemeral — lives and dies with the process.
 - **Containers** — for daemons (nginx, postgres). Managed environments with own rootfs, resource quotas, and lifecycle. Created explicitly.
 
+### SMP
+
+Fornax supports symmetric multiprocessing on x86_64 (up to 128 logical CPUs, including hyperthreads/SMT). Cores are detected dynamically via ACPI MADT at boot. Each core has its own run queue, kernel stack, and syscall save area. There is no big kernel lock — shared resources use fine-grained ticket spinlocks.
+
+```
+Core 0 (BSP)         Core 1              Core 2              Core 3
+┌──────────┐         ┌──────────┐        ┌──────────┐        ┌──────────┐
+│ RunQueue │         │ RunQueue │        │ RunQueue │        │ RunQueue │
+│ [fxfs]   │         │ [login]  │        │ [fsh]    │        │ [cat]    │
+│ [partfs] │         │          │        │          │        │          │
+├──────────┤         ├──────────┤        ├──────────┤        ├──────────┤
+│ PerCpu   │         │ PerCpu   │        │ PerCpu   │        │ PerCpu   │
+│ GS_BASE  │         │ GS_BASE  │        │ GS_BASE  │        │ GS_BASE  │
+└──────────┘         └──────────┘        └──────────┘        └──────────┘
+     ↕ IPI (schedule, TLB shootdown)  ↕
+```
+
+- **AP startup**: ACPI MADT discovery, INIT-SIPI-SIPI sequence, per-core GDT/IDT/TSS
+- **Scheduling**: Per-core run queues with work stealing. Idle cores steal half of a busy core's queue
+- **IPC wakeup**: `markReady()` pushes to the target core's run queue and sends a schedule IPI if remote
+- **TLB coherence**: `cores_ran_on` bitmap per process; page table teardown sends shootdown IPIs to affected cores
+
+See [docs/smp.md](docs/smp.md) for the full design.
+
 ## Current State
 
-Fornax boots on x86_64 UEFI, sets up 4-level paging with a higher-half kernel, and has a complete kernel infrastructure including process management, IPC, namespaces, and networking. Currently building out the userspace separation — the kernel is ready, next step is `spawn`/`exec`/`wait` syscalls and an init process.
+Fornax boots on x86_64 UEFI and riscv64 freestanding, runs a shell with users, a CoW filesystem, and a TCP/IP stack. The system includes 50+ userspace programs.
 
 | Layer | What works |
 |-------|-----------|
-| Boot | UEFI boot, GOP framebuffer, serial console |
-| Memory | PMM, kernel heap, 4-level paging, per-process address spaces |
-| Processes | ELF loader, SYSCALL/SYSRET, Ring 3 execution, cooperative scheduling |
-| IPC | Synchronous blocking channels with 9P message tags |
+| Boot | UEFI boot (x86_64), OpenSBI boot (riscv64), GOP framebuffer, serial console |
+| Memory | PMM with spinlock, kernel heap, 4-level paging, per-process address spaces |
+| SMP | Up to 128 CPUs, per-core run queues, work stealing, TLB shootdown, ticket spinlocks |
+| Processes | ELF loader, SYSCALL/SYSRET, Ring 3, per-core scheduling, sleep, getpid |
+| IPC | Synchronous blocking channels with 9P message tags, per-channel spinlocks |
 | Namespaces | Per-process mount tables, longest-prefix resolution |
-| Supervision | Fault supervisor with auto-restart from saved ELF |
-| Containers | Namespace isolation, resource quotas |
-| Networking | PCI enumeration, virtio-net, Ethernet, ARP, IPv4, ICMP, UDP |
-| **Next** | **spawn/exec/wait syscalls, initrd, init process, shell** |
+| Filesystem | fxfs (CoW B-tree), GPT partitions, virtio-blk, pread/pwrite |
+| Shell | fsh with pipes, redirects, quoting, variables, if/while, history |
+| Networking | virtio-net, ARP, IPv4, ICMP, UDP, TCP, DNS |
+| USB | xHCI driver, USB keyboard and mouse |
+| Users | Login, /etc/passwd, uid/gid, permissions, chown/chmod |
+| Virtual consoles | 4 VTs (Alt+F1-F4), per-VT ANSI terminal |
+| Utilities | cat, ls, grep, sed, awk, less, vi (fe), ps, top, and 40+ more |
 
 ## Building
 
@@ -85,16 +113,21 @@ zig build x86_64 -Ddeploy=true
 Requires QEMU with OVMF firmware.
 
 ```sh
-./scripts/run-x86_64.sh
+make run             # x86_64, single core
+make run-smp         # x86_64, 4 cores
+make run-riscv64     # riscv64 on QEMU virt
+make run-release     # ReleaseSafe kernel
 ```
 
-This builds the kernel, finds OVMF, and launches QEMU with a framebuffer, serial on stdio, and a virtio-net NIC.
+This builds the kernel and userspace, creates a disk image with fxfs, and launches QEMU with framebuffer, serial on stdio, virtio-net, virtio-blk, and USB devices.
 
 ## Documentation
 
 | Doc | Contents |
 |-----|----------|
 | [Architecture](docs/architecture.md) | Kernel subsystems, syscall table, boot sequence |
+| [SMP](docs/smp.md) | Multi-core design, scheduling, locking, work stealing |
+| [Filesystem](docs/fxfs.md) | fxfs CoW B-tree filesystem design |
 | [Networking](docs/networking.md) | Protocol stack, virtio driver, packet flow |
 | [Roadmap](docs/TODO/00-overview.md) | Phase tracking, milestones, dependency graph |
 
@@ -106,26 +139,29 @@ src/                         kernel
 ├── process.zig              process management + scheduler
 ├── syscall.zig              syscall dispatch + implementations
 ├── ipc.zig                  synchronous channels
+├── pipe.zig                 kernel pipes (ring buffer, refcounted)
 ├── namespace.zig            per-process mount tables
 ├── supervisor.zig           fault supervisor
-├── container.zig            container primitives
+├── percpu.zig               per-CPU state, run queues
+├── spinlock.zig             ticket spinlocks
 ├── elf.zig                  ELF64 loader
-├── net.zig + net/           IP stack (Ethernet, ARP, IPv4, ICMP, UDP)
-├── virtio.zig               virtio device/queue
+├── net.zig + net/           IP stack (Ethernet, ARP, IPv4, TCP, UDP, DNS)
+├── virtio_blk.zig           virtio block device driver
 ├── virtio_net.zig           virtio-net NIC driver
+├── xhci.zig                 xHCI USB 3.0 host controller
 └── arch/x86_64/
-    ├── entry.S              syscall entry, ISR stubs, resume (asm)
+    ├── entry.S              syscall entry, ISR/IPI stubs, resume (asm)
+    ├── apic.zig             LAPIC, ACPI MADT, AP trampoline, IPI
     ├── paging.zig           4-level paging
-    ├── gdt.zig              GDT + TSS
-    ├── interrupts.zig       exception handling
-    ├── syscall_entry.zig    SYSCALL/SYSRET MSR setup
+    ├── gdt.zig              GDT + per-core TSS
+    ├── interrupts.zig       exception + IRQ + IPI handling
+    ├── syscall_entry.zig    SYSCALL/SYSRET, per-CPU save area
     └── pci.zig              PCI bus enumeration
 lib/
 └── fornax.zig               userspace syscall library ("libc")
-cmd/                         userspace commands (shell, ls, cat, ...)
-srv/                         userspace servers (console, ramfs, ...)
-docs/
-└── TODO/                    phase-by-phase roadmap
+cmd/                         userspace commands (fsh, ls, cat, grep, ...)
+srv/                         userspace servers (fxfs, partfs)
+docs/                        design documentation
 ```
 
 ## License
