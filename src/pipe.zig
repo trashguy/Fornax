@@ -22,8 +22,8 @@ pub const Pipe = struct {
     count: usize = 0,
     readers: u8 = 0,
     writers: u8 = 0,
-    read_waiter: ?u16 = null,
-    write_waiter: ?u16 = null,
+    read_waiters: [4]?u16 = [_]?u16{null} ** 4,
+    write_waiters: [4]?u16 = [_]?u16{null} ** 4,
     active: bool = false,
     /// Per-pipe spinlock for SMP safety.
     lock: SpinLock = .{},
@@ -79,12 +79,14 @@ pub fn pipeRead(id: u8, dest: []u8) ?usize {
     }
     p.count -= n;
 
-    // Wake blocked writer if any — they'll retry in switchTo
-    if (p.write_waiter) |wpid| {
-        if (process.getByPid(wpid)) |wproc| {
-            if (wproc.state == .blocked) process.markReady(wproc);
+    // Wake all blocked writers — they'll retry in switchTo
+    for (&p.write_waiters) |*slot| {
+        if (slot.*) |wpid| {
+            if (process.getByPid(wpid)) |wproc| {
+                if (wproc.state == .blocked) process.markReady(wproc);
+            }
+            slot.* = null;
         }
-        p.write_waiter = null;
     }
 
     return n;
@@ -116,12 +118,14 @@ pub fn pipeWrite(id: u8, src: []const u8) ?usize {
     }
     p.count += n;
 
-    // Wake blocked reader if any — they'll get data in switchTo
-    if (p.read_waiter) |rpid| {
-        if (process.getByPid(rpid)) |rproc| {
-            if (rproc.state == .blocked) process.markReady(rproc);
+    // Wake all blocked readers — they'll get data in switchTo
+    for (&p.read_waiters) |*slot| {
+        if (slot.*) |rpid| {
+            if (process.getByPid(rpid)) |rproc| {
+                if (rproc.state == .blocked) process.markReady(rproc);
+            }
+            slot.* = null;
         }
-        p.read_waiter = null;
     }
 
     return n;
@@ -157,12 +161,14 @@ pub fn closeReadEnd(id: u8) void {
     if (!p.active) return;
     if (p.readers > 0) p.readers -= 1;
 
-    // Wake blocked writer — they'll get EPIPE on retry in switchTo
-    if (p.write_waiter) |wpid| {
-        if (process.getByPid(wpid)) |wproc| {
-            if (wproc.state == .blocked) process.markReady(wproc);
+    // Wake all blocked writers — they'll get EPIPE on retry in switchTo
+    for (&p.write_waiters) |*slot| {
+        if (slot.*) |wpid| {
+            if (process.getByPid(wpid)) |wproc| {
+                if (wproc.state == .blocked) process.markReady(wproc);
+            }
+            slot.* = null;
         }
-        p.write_waiter = null;
     }
 
     if (p.readers == 0 and p.writers == 0) free(id);
@@ -178,12 +184,14 @@ pub fn closeWriteEnd(id: u8) void {
     if (!p.active) return;
     if (p.writers > 0) p.writers -= 1;
 
-    // Wake blocked reader — they'll get EOF in switchTo
-    if (p.read_waiter) |rpid| {
-        if (process.getByPid(rpid)) |rproc| {
-            if (rproc.state == .blocked) process.markReady(rproc);
+    // Wake all blocked readers — they'll get EOF in switchTo
+    for (&p.read_waiters) |*slot| {
+        if (slot.*) |rpid| {
+            if (process.getByPid(rpid)) |rproc| {
+                if (rproc.state == .blocked) process.markReady(rproc);
+            }
+            slot.* = null;
         }
-        p.read_waiter = null;
     }
 
     if (p.readers == 0 and p.writers == 0) free(id);
@@ -212,7 +220,14 @@ pub fn setReadWaiter(id: u8, pid: u16) void {
     const p = &pipes[id];
     p.lock.lock();
     defer p.lock.unlock();
-    p.read_waiter = pid;
+    for (&p.read_waiters) |*slot| {
+        if (slot.* == null) {
+            slot.* = pid;
+            return;
+        }
+    }
+    // All slots full — overwrite the first one (best effort)
+    p.read_waiters[0] = pid;
 }
 
 pub fn setWriteWaiter(id: u8, pid: u16) void {
@@ -220,5 +235,12 @@ pub fn setWriteWaiter(id: u8, pid: u16) void {
     const p = &pipes[id];
     p.lock.lock();
     defer p.lock.unlock();
-    p.write_waiter = pid;
+    for (&p.write_waiters) |*slot| {
+        if (slot.* == null) {
+            slot.* = pid;
+            return;
+        }
+    }
+    // All slots full — overwrite the first one (best effort)
+    p.write_waiters[0] = pid;
 }

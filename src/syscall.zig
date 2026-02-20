@@ -56,6 +56,8 @@ pub const SYS = enum(u64) {
     dup = 34,
     dup2 = 35,
     arch_prctl = 36,
+    clone = 37,
+    futex = 38,
 };
 
 /// Error return values.
@@ -163,6 +165,8 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         .dup2 => sysDup2(arg0, arg1),
         .arch_prctl => sysArchPrctl(arg0, arg1),
         .rfork => sysRfork(arg0),
+        .clone => sysClone(arg0, arg1, arg2, arg3, arg4),
+        .futex => sysFutex(arg0, arg1, arg2, arg3),
         .mount, .bind, .unmount => {
             klog.warn("syscall: unimplemented nr=");
             klog.warnDec(nr);
@@ -182,7 +186,7 @@ fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
     // If not, use the default console/keyboard path.
     if (fd <= 2) {
         const proc = process.getCurrent() orelse return EBADF;
-        if (fd == 0 and proc.fds[0] == null) {
+        if (fd == 0 and proc.getFdEntry(0) == null) {
             // Default: keyboard control (Plan 9 style: write to fd 0)
             const keyboard = @import("keyboard.zig");
             if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
@@ -192,7 +196,7 @@ fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
             keyboard.handleCtl(proc.vt, buf[0..len]);
             return len;
         }
-        if ((fd == 1 or fd == 2) and proc.fds[fd] == null) {
+        if ((fd == 1 or fd == 2) and proc.getFdEntry(@intCast(fd)) == null) {
             // Default: direct framebuffer console + serial (routed to process's VT)
             if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
             if (count == 0) return 0;
@@ -323,21 +327,67 @@ fn sysExit(status: u64) noreturn {
     // Kill all children recursively (Fornax orphan policy)
     process.killChildren(proc.pid);
 
-    // Close all pipe fds (decrement refcounts, wake blocked peers)
-    {
+    // Exit group: kill all sibling threads in the same thread group
+    if (proc.thread_group) |tg| {
+        const futex_mod = @import("futex.zig");
+        const table = process.getProcessTable();
+        for (table) |*p| {
+            if (p != proc and p.thread_group == tg and p.state != .free) {
+                // Handle CLONE_CHILD_CLEARTID for the sibling
+                if (p.ctid_ptr != 0 and p.ctid_ptr < 0x0000_8000_0000_0000) {
+                    const pml4_phys: u64 = if (tg.pml4) |pm| @intFromPtr(pm) else 0;
+                    // Can't write to user memory here (wrong CR3), but wake futex
+                    futex_mod.wakeOne(pml4_phys, p.ctid_ptr);
+                    p.ctid_ptr = 0;
+                }
+                p.state = .dead;
+                p.thread_group = null;
+                // Release the group ref for this sibling
+                _ = process.thread_group.releaseGroup(tg, p);
+            }
+        }
+    }
+
+    // Close all pipe fds (decrement refcounts, wake blocked peers).
+    // For threads: only close pipes if this is the last thread in the group
+    // (otherwise sibling threads may still need the shared fds).
+    const is_last_thread = if (proc.thread_group) |tg| blk: {
+        tg.lock.lock();
+        const last = tg.ref_count <= 1;
+        tg.lock.unlock();
+        break :blk last;
+    } else true;
+
+    if (is_last_thread) {
         const pipe_mod = @import("pipe.zig");
+        const fds = process.thread_group.getFdSlice(proc);
         for (0..process.MAX_FDS) |i| {
-            if (proc.fds[i]) |entry| {
+            if (fds[i]) |entry| {
                 if (entry.fd_type == .pipe) {
                     if (entry.pipe_is_read) {
                         pipe_mod.closeReadEnd(entry.pipe_id);
                     } else {
                         pipe_mod.closeWriteEnd(entry.pipe_id);
                     }
-                    proc.closeFd(@intCast(i));
+                    fds[i] = null;
                 }
             }
         }
+    }
+
+    // CLONE_CHILD_CLEARTID: clear tid at user address and futex-wake joiners.
+    // Must happen before freeUserMemory (user address space still active).
+    if (proc.ctid_ptr != 0 and proc.ctid_ptr < 0x0000_8000_0000_0000) {
+        const futex_mod = @import("futex.zig");
+        const ptr: *volatile u32 = @ptrFromInt(proc.ctid_ptr);
+        ptr.* = 0;
+        // Get PML4 physical address for futex identity
+        const pml4_phys: u64 = if (proc.thread_group) |tg|
+            (if (tg.pml4) |p| @intFromPtr(p) else 0)
+        else
+            (if (proc.pml4) |p| @intFromPtr(p) else 0);
+        futex_mod.wakeOne(pml4_phys, proc.ctid_ptr);
+        proc.ctid_ptr = 0;
     }
 
     // Free user address space (safe: we're on the kernel stack, not user memory)
@@ -384,43 +434,54 @@ fn sysExit(status: u64) noreturn {
 fn sysBrk(new_brk: u64) u64 {
     const proc = process.getCurrent() orelse return 0;
 
+    // Lock thread group if threaded
+    if (proc.thread_group) |tg| tg.lock.lock();
+    defer if (proc.thread_group) |tg| tg.lock.unlock();
+
+    const cur_brk = if (proc.thread_group) |tg| tg.brk else proc.brk;
+
     // Query current brk
-    if (new_brk == 0) return proc.brk;
+    if (new_brk == 0) return cur_brk;
 
     // Only allow growing, not shrinking
-    if (new_brk <= proc.brk) return proc.brk;
+    if (new_brk <= cur_brk) return cur_brk;
 
     // Validate: brk must stay in user space
-    if (new_brk >= 0x0000_8000_0000_0000) return proc.brk;
+    if (new_brk >= 0x0000_8000_0000_0000) return cur_brk;
 
     const page_size = mem.PAGE_SIZE;
-    const old_brk_page = (proc.brk + page_size - 1) / page_size;
+    const old_brk_page = (cur_brk + page_size - 1) / page_size;
     const new_brk_page = (new_brk + page_size - 1) / page_size;
 
-    const proc_pml4 = proc.pml4 orelse return proc.brk;
+    const proc_pml4 = if (proc.thread_group) |tg| tg.pml4 else proc.pml4;
+    const pml4 = proc_pml4 orelse return cur_brk;
 
     // Allocate and map new pages
     var page_idx = old_brk_page;
     while (page_idx < new_brk_page) : (page_idx += 1) {
         if (proc.pages_used >= proc.quotas.max_memory_pages) {
             klog.debug("[brk: quota exceeded]\n");
-            return proc.brk; // return old brk on failure
+            return cur_brk; // return old brk on failure
         }
         const page = pmm.allocPage() orelse {
             klog.debug("[brk: out of memory]\n");
-            return proc.brk;
+            return cur_brk;
         };
         const ptr: [*]u8 = paging.physPtr(page);
         @memset(ptr[0..page_size], 0);
         const vaddr = page_idx * page_size;
-        paging.mapPage(proc_pml4, vaddr, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
+        paging.mapPage(pml4, vaddr, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
             pmm.freePage(page);
-            return proc.brk;
+            return cur_brk;
         };
         proc.pages_used += 1;
     }
 
-    proc.brk = new_brk;
+    if (proc.thread_group) |tg| {
+        tg.brk = new_brk;
+    } else {
+        proc.brk = new_brk;
+    }
     return new_brk;
 }
 
@@ -1105,7 +1166,7 @@ fn sysOpen(path_ptr: u64, path_len: u64) u64 {
         return ENOENT;
     }
 
-    const resolved = proc.ns.resolve(path_slice) orelse return ENOENT;
+    const resolved = proc.getNs().resolve(path_slice) orelse return ENOENT;
 
     const chan = ipc.getChannel(resolved.channel_id) orelse return ENOENT;
 
@@ -1146,7 +1207,7 @@ fn sysCreate(path_ptr: u64, path_len: u64, flags: u64) u64 {
     if (path_len == 0 or path_len > 256) return ENOENT;
 
     const path: [*]const u8 = @ptrFromInt(path_ptr);
-    const resolved = proc.ns.resolve(path[0..@intCast(path_len)]) orelse return ENOENT;
+    const resolved = proc.getNs().resolve(path[0..@intCast(path_len)]) orelse return ENOENT;
 
     const chan = ipc.getChannel(resolved.channel_id) orelse return ENOENT;
 
@@ -1184,7 +1245,7 @@ fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
     // If not, use the default keyboard/console read path.
     if (fd == 0) {
         const proc0 = process.getCurrent() orelse return EBADF;
-        if (proc0.fds[0] == null) {
+        if (proc0.getFdEntry(0) == null) {
             // Default: console read (stdin from keyboard)
             const keyboard = @import("keyboard.zig");
             if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
@@ -1664,7 +1725,7 @@ fn sysRemove(path_ptr: u64, path_len: u64) u64 {
     const path: [*]const u8 = @ptrFromInt(path_ptr);
     const path_slice = path[0..@intCast(path_len)];
 
-    const resolved = proc.ns.resolve(path_slice) orelse return ENOENT;
+    const resolved = proc.getNs().resolve(path_slice) orelse return ENOENT;
 
     const chan = ipc.getChannel(resolved.channel_id) orelse return ENOENT;
 
@@ -1699,8 +1760,8 @@ fn sysRename(old_ptr: u64, old_len: u64, new_ptr: u64, new_len: u64) u64 {
     const old_path: [*]const u8 = @ptrFromInt(old_ptr);
     const new_path: [*]const u8 = @ptrFromInt(new_ptr);
 
-    const old_resolved = proc.ns.resolve(old_path[0..@intCast(old_len)]) orelse return ENOENT;
-    const new_resolved = proc.ns.resolve(new_path[0..@intCast(new_len)]) orelse return ENOENT;
+    const old_resolved = proc.getNs().resolve(old_path[0..@intCast(old_len)]) orelse return ENOENT;
+    const new_resolved = proc.getNs().resolve(new_path[0..@intCast(new_len)]) orelse return ENOENT;
 
     // Both paths must be on the same server
     if (old_resolved.channel_id != new_resolved.channel_id) return ENOSYS;
@@ -1818,7 +1879,16 @@ fn sysMmap(addr_hint: u64, length: u64, prot: u64, flags: u64) u64 {
 
     // Round up to page boundary
     const page_count = (length + mem.PAGE_SIZE - 1) / mem.PAGE_SIZE;
-    const base = proc.mmap_next;
+
+    // Get shared or local mmap_next and pml4
+    const proc_pml4 = if (proc.thread_group) |tg| tg.pml4 else proc.pml4;
+    const pml4 = proc_pml4 orelse return ENOMEM;
+
+    // Lock thread group if threaded
+    if (proc.thread_group) |tg| tg.lock.lock();
+    defer if (proc.thread_group) |tg| tg.lock.unlock();
+
+    const base = if (proc.thread_group) |tg| tg.mmap_next else proc.mmap_next;
 
     var i: u64 = 0;
     while (i < page_count) : (i += 1) {
@@ -1832,11 +1902,16 @@ fn sysMmap(addr_hint: u64, length: u64, prot: u64, flags: u64) u64 {
         if (prot & PROT_EXEC != 0) {
             map_flags |= paging.Flags.EXEC;
         }
-        paging.mapPage(proc.pml4.?, base + i * mem.PAGE_SIZE, page, map_flags) orelse return ENOMEM;
+        paging.mapPage(pml4, base + i * mem.PAGE_SIZE, page, map_flags) orelse return ENOMEM;
         proc.pages_used += 1;
     }
 
-    proc.mmap_next = base + page_count * mem.PAGE_SIZE;
+    const new_next = base + page_count * mem.PAGE_SIZE;
+    if (proc.thread_group) |tg| {
+        tg.mmap_next = new_next;
+    } else {
+        proc.mmap_next = new_next;
+    }
     return base;
 }
 
@@ -1853,12 +1928,13 @@ fn sysMunmap(addr: u64, length: u64) u64 {
 fn sysDup(old_fd: u64) u64 {
     const proc = process.getCurrent() orelse return ENOSYS;
     if (old_fd >= process.MAX_FDS) return EBADF;
-    const entry = proc.fds[@intCast(old_fd)] orelse return EBADF;
+    const fds = process.thread_group.getFdSlice(proc);
+    const entry = fds[@intCast(old_fd)] orelse return EBADF;
 
     // Find lowest free fd
     for (0..process.MAX_FDS) |i| {
-        if (proc.fds[i] == null) {
-            proc.fds[i] = entry;
+        if (fds[i] == null) {
+            fds[i] = entry;
             // Increment pipe refcounts if applicable
             if (entry.fd_type == .pipe) {
                 const pipe_mod = @import("pipe.zig");
@@ -1878,13 +1954,14 @@ fn sysDup(old_fd: u64) u64 {
 fn sysDup2(old_fd: u64, new_fd: u64) u64 {
     const proc = process.getCurrent() orelse return ENOSYS;
     if (old_fd >= process.MAX_FDS or new_fd >= process.MAX_FDS) return EBADF;
-    const entry = proc.fds[@intCast(old_fd)] orelse return EBADF;
+    const fds = process.thread_group.getFdSlice(proc);
+    const entry = fds[@intCast(old_fd)] orelse return EBADF;
 
     // If same fd, just return it
     if (old_fd == new_fd) return new_fd;
 
     // Close new_fd if open
-    if (proc.fds[@intCast(new_fd)]) |existing| {
+    if (fds[@intCast(new_fd)]) |existing| {
         if (existing.fd_type == .pipe) {
             const pipe_mod = @import("pipe.zig");
             if (existing.pipe_is_read) {
@@ -1893,10 +1970,10 @@ fn sysDup2(old_fd: u64, new_fd: u64) u64 {
                 pipe_mod.closeWriteEnd(existing.pipe_id);
             }
         }
-        proc.fds[@intCast(new_fd)] = null;
+        fds[@intCast(new_fd)] = null;
     }
 
-    proc.fds[@intCast(new_fd)] = entry;
+    fds[@intCast(new_fd)] = entry;
     // Increment pipe refcounts
     if (entry.fd_type == .pipe) {
         const pipe_mod = @import("pipe.zig");
@@ -1923,6 +2000,72 @@ fn sysArchPrctl(cmd: u64, addr: u64) u64 {
         return 0;
     }
     return EINVAL;
+}
+
+/// clone(stack_top, tls, ctid_ptr, ptid_ptr, flags) → child tid (or error)
+///
+/// Creates a new thread sharing the parent's address space via ThreadGroup.
+/// The child resumes at the same RIP as the parent (the instruction after syscall),
+/// but with RAX=0, RSP=stack_top, and FS_BASE=tls.
+///
+/// musl's __clone asm pushes func+arg onto the new stack before calling clone.
+/// The child pops them off and calls func(arg) — we just set up the register state.
+fn sysClone(stack_top: u64, tls: u64, ctid_ptr: u64, ptid_ptr: u64, flags: u64) u64 {
+    _ = flags;
+    const parent = process.getCurrent() orelse return ENOSYS;
+
+    const child = process.createThread(parent) orelse return ENOMEM;
+
+    // Child resumes at same instruction as parent (after the syscall instruction)
+    child.user_rip = parent.user_rip;
+    child.user_rsp = stack_top;
+    child.user_rflags = parent.user_rflags;
+    child.syscall_ret = 0; // child sees RAX=0
+    child.saved_kernel_rsp = 0; // first-run via IRETQ
+    child.fs_base = tls; // new thread's TLS (CLONE_SETTLS)
+
+    // CLONE_CHILD_CLEARTID: store ctid_ptr for futex wake on exit
+    if (ctid_ptr != 0) {
+        child.ctid_ptr = ctid_ptr;
+    }
+
+    // CLONE_PARENT_SETTID: write child PID to parent's ptid_ptr
+    if (ptid_ptr != 0 and ptid_ptr < 0x0000_8000_0000_0000) {
+        const ptr: *u32 = @ptrFromInt(ptid_ptr);
+        ptr.* = child.pid;
+    }
+
+    klog.debug("[clone: parent=");
+    klog.debugDec(parent.pid);
+    klog.debug(" child=");
+    klog.debugDec(child.pid);
+    klog.debug(" stack=");
+    klog.debugHex(stack_top);
+    klog.debug(" tls=");
+    klog.debugHex(tls);
+    klog.debug("]\n");
+
+    return child.pid;
+}
+
+/// futex(addr, op, val, timeout) — placeholder, implemented in Phase J
+fn sysFutex(addr: u64, op: u64, val: u64, timeout: u64) u64 {
+    _ = timeout;
+    const futex_mod = @import("futex.zig");
+    const proc = process.getCurrent() orelse return ENOSYS;
+
+    const FUTEX_WAIT: u64 = 0;
+    const FUTEX_WAKE: u64 = 1;
+    const FUTEX_PRIVATE_FLAG: u64 = 128;
+
+    const raw_op = op & ~FUTEX_PRIVATE_FLAG;
+
+    if (raw_op == FUTEX_WAIT) {
+        return futex_mod.wait(proc, addr, @truncate(val));
+    } else if (raw_op == FUTEX_WAKE) {
+        return futex_mod.wake(proc, addr, @truncate(val));
+    }
+    return ENOSYS;
 }
 
 /// SYS 11: rfork — Resource fork (Plan 9 process control).
@@ -2419,18 +2562,19 @@ fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64, argv_p
     }
 
     // Copy namespace from parent (Plan 9: children inherit namespace)
-    parent.ns.cloneInto(&child.ns);
+    parent.getNs().cloneInto(&child.ns);
     child.uid = parent.uid;
     child.gid = parent.gid;
 
     // Copy fd mappings from parent to child
     if (fd_map_len > 0) {
         const pipe_mod = @import("pipe.zig");
+        const parent_fds = process.thread_group.getFdSlice(parent);
         const fd_maps: [*]const FdMapping = @ptrFromInt(fd_map_ptr);
         for (0..@intCast(fd_map_len)) |i| {
             const m = fd_maps[i];
             if (m.parent_fd < process.MAX_FDS and m.child_fd < process.MAX_FDS) {
-                if (parent.fds[m.parent_fd]) |fentry| {
+                if (parent_fds[m.parent_fd]) |fentry| {
                     child.fds[m.child_fd] = fentry;
                     // Increment pipe refcount for duplicated pipe fds
                     if (fentry.fd_type == .pipe) {

@@ -45,6 +45,8 @@ typedef unsigned long      size_t;
 #define SYS_DUP       34
 #define SYS_DUP2      35
 #define SYS_ARCH_PRCTL 36
+#define SYS_CLONE     37
+#define SYS_FUTEX     38
 
 /* Open flags */
 #define FX_O_DIR    0x01
@@ -227,6 +229,16 @@ static inline int fx_dup(int fd) {
 
 static inline int fx_dup2(int old_fd, int new_fd) {
     return (int)__fx_syscall2(SYS_DUP2, (long)old_fd, (long)new_fd);
+}
+
+static inline long fx_clone(uint64_t stack_top, uint64_t tls,
+                            uint64_t ctid_ptr, uint64_t ptid_ptr, uint64_t flags) {
+    return __fx_syscall5(SYS_CLONE, (long)stack_top, (long)tls,
+                         (long)ctid_ptr, (long)ptid_ptr, (long)flags);
+}
+
+static inline long fx_futex(volatile int *addr, int op, int val) {
+    return __fx_syscall4(SYS_FUTEX, (long)addr, (long)op, (long)val, 0);
 }
 
 /* ── Convenience helpers ─────────────────────────────────────────── */

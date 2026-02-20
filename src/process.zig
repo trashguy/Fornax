@@ -8,6 +8,7 @@ const mem = @import("mem.zig");
 const ipc = @import("ipc.zig");
 const namespace = @import("namespace.zig");
 const SpinLock = @import("spinlock.zig").SpinLock;
+pub const thread_group = @import("thread_group.zig");
 
 const paging = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/paging.zig"),
@@ -72,7 +73,7 @@ const RET_SLOT: usize = switch (@import("builtin").cpu.arch) {
     else => 12,
 };
 
-const MAX_PROCESSES = 64;
+pub const MAX_PROCESSES = 128;
 pub const MAX_FDS = 32;
 const KERNEL_STACK_PAGES = 4; // 8 KB kernel stack per process
 pub const USER_STACK_PAGES = 64; // 256 KB user stack per process
@@ -212,6 +213,10 @@ pub const Process = struct {
     mmap_next: u64 = 0x0000_4000_0000_0000,
     /// Saved FS_BASE MSR value (for TLS, used by musl libc).
     fs_base: u64 = 0,
+    /// Thread group pointer (non-null for threads sharing an address space).
+    thread_group: ?*thread_group.ThreadGroup = null,
+    /// Address to clear and futex-wake on thread exit (CLONE_CHILD_CLEARTID).
+    ctid_ptr: u64 = 0,
 
     pub fn initFds(self: *Process) void {
         for (&self.fds) |*fd| {
@@ -222,10 +227,14 @@ pub const Process = struct {
     /// Allocate a file descriptor pointing to the given channel.
     /// Returns the fd number, or null if the fd table is full.
     pub fn allocFd(self: *Process, channel_id: ipc.ChannelId, is_server: bool) ?u32 {
+        const fds = if (self.thread_group) |tg|
+            (if (tg.fd_table) |ft| &ft.fds else &self.fds)
+        else
+            &self.fds;
         // Start from fd 3 (0=stdin, 1=stdout, 2=stderr are special)
         for (3..MAX_FDS) |i| {
-            if (self.fds[i] == null) {
-                self.fds[i] = .{ .channel_id = channel_id, .is_server = is_server, .read_offset = 0, .server_handle = 0 };
+            if (fds[i] == null) {
+                fds[i] = .{ .channel_id = channel_id, .is_server = is_server, .read_offset = 0, .server_handle = 0 };
                 return @intCast(i);
             }
         }
@@ -234,9 +243,13 @@ pub const Process = struct {
 
     /// Allocate a net fd for /net/* paths.
     pub fn allocNetFd(self: *Process, kind: NetFdKind, conn: u8) ?u32 {
+        const fds = if (self.thread_group) |tg|
+            (if (tg.fd_table) |ft| &ft.fds else &self.fds)
+        else
+            &self.fds;
         for (3..MAX_FDS) |i| {
-            if (self.fds[i] == null) {
-                self.fds[i] = .{
+            if (fds[i] == null) {
+                fds[i] = .{
                     .fd_type = .net,
                     .channel_id = 0,
                     .is_server = false,
@@ -254,9 +267,13 @@ pub const Process = struct {
 
     /// Allocate a pipe fd.
     pub fn allocPipeFd(self: *Process, pipe_id: u8, is_read: bool) ?u32 {
+        const fds = if (self.thread_group) |tg|
+            (if (tg.fd_table) |ft| &ft.fds else &self.fds)
+        else
+            &self.fds;
         for (0..MAX_FDS) |i| {
-            if (self.fds[i] == null) {
-                self.fds[i] = .{
+            if (fds[i] == null) {
+                fds[i] = .{
                     .fd_type = .pipe,
                     .channel_id = 0,
                     .is_server = false,
@@ -272,9 +289,13 @@ pub const Process = struct {
     }
 
     pub fn allocBlkFd(self: *Process) ?u32 {
+        const fds = if (self.thread_group) |tg|
+            (if (tg.fd_table) |ft| &ft.fds else &self.fds)
+        else
+            &self.fds;
         for (3..MAX_FDS) |i| {
-            if (self.fds[i] == null) {
-                self.fds[i] = .{
+            if (fds[i] == null) {
+                fds[i] = .{
                     .fd_type = .blk,
                     .channel_id = 0,
                     .is_server = false,
@@ -288,9 +309,13 @@ pub const Process = struct {
     }
 
         pub fn allocProcFd(self: *Process, kind: ProcFdKind, pid: u32) ?u32 {
+            const fds = if (self.thread_group) |tg|
+                (if (tg.fd_table) |ft| &ft.fds else &self.fds)
+            else
+                &self.fds;
             for (3..MAX_FDS) |i| {
-                if (self.fds[i] == null) {
-                    self.fds[i] = .{
+                if (fds[i] == null) {
+                    fds[i] = .{
                         .fd_type = .proc,
                         .channel_id = 0,
                         .is_server = false,
@@ -306,9 +331,13 @@ pub const Process = struct {
         }
 
         pub fn allocDevFd(self: *Process, fd_type: FdType) ?u32 {
+            const fds = if (self.thread_group) |tg|
+                (if (tg.fd_table) |ft| &ft.fds else &self.fds)
+            else
+                &self.fds;
             for (3..MAX_FDS) |i| {
-                if (self.fds[i] == null) {
-                    self.fds[i] = .{
+                if (fds[i] == null) {
+                    fds[i] = .{
                         .fd_type = fd_type,
                         .channel_id = 0,
                         .is_server = false,
@@ -324,27 +353,51 @@ pub const Process = struct {
     /// Set a specific fd to a channel entry.
     pub fn setFd(self: *Process, fd: u32, channel_id: ipc.ChannelId, is_server: bool) void {
         if (fd < MAX_FDS) {
-            self.fds[fd] = .{ .channel_id = channel_id, .is_server = is_server, .read_offset = 0, .server_handle = 0 };
+            const fds = if (self.thread_group) |tg|
+                (if (tg.fd_table) |ft| &ft.fds else &self.fds)
+            else
+                &self.fds;
+            fds[fd] = .{ .channel_id = channel_id, .is_server = is_server, .read_offset = 0, .server_handle = 0 };
         }
     }
 
     /// Close a file descriptor.
     pub fn closeFd(self: *Process, fd: u32) void {
         if (fd < MAX_FDS) {
-            self.fds[fd] = null;
+            const fds = if (self.thread_group) |tg|
+                (if (tg.fd_table) |ft| &ft.fds else &self.fds)
+            else
+                &self.fds;
+            fds[fd] = null;
         }
     }
 
     /// Get the channel info for a file descriptor.
     pub fn getFdEntry(self: *const Process, fd: u32) ?FdEntry {
         if (fd >= MAX_FDS) return null;
-        return self.fds[fd];
+        const fds = if (self.thread_group) |tg|
+            (if (tg.fd_table) |ft| &ft.fds else &@constCast(self).fds)
+        else
+            &@constCast(self).fds;
+        return fds[fd];
     }
 
     /// Get a mutable pointer to an fd entry (for updating read_offset).
     pub fn getFdEntryPtr(self: *Process, fd: u32) ?*FdEntry {
         if (fd >= MAX_FDS) return null;
-        return if (self.fds[fd]) |*entry| entry else null;
+        const fds = if (self.thread_group) |tg|
+            (if (tg.fd_table) |ft| &ft.fds else &self.fds)
+        else
+            &self.fds;
+        return if (fds[fd]) |*entry| entry else null;
+    }
+
+    /// Get the namespace pointer (group-shared or inline).
+    pub fn getNs(self: *Process) *namespace.Namespace {
+        if (self.thread_group) |tg| {
+            if (tg.ns) |ns| return ns;
+        }
+        return &self.ns;
     }
 };
 
@@ -397,8 +450,11 @@ pub fn init() void {
         p.needs_stack_free = false;
         p.sleep_until = 0;
         p.vt = 0;
+        p.thread_group = null;
+        p.ctid_ptr = 0;
         p.initFds();
     }
+    thread_group.init();
     initialized = true;
     klog.info("Process: initialized (max ");
     klog.infoDec(MAX_PROCESSES);
@@ -473,6 +529,11 @@ pub fn create() ?*Process {
     proc.sleep_until = 0;
     proc.vt = if (current()) |cur| cur.vt else 0;
     proc.uid = 0;
+    proc.gid = 0;
+    proc.thread_group = null;
+    proc.ctid_ptr = 0;
+    proc.fs_base = 0;
+    proc.mmap_next = 0x0000_4000_0000_0000;
     namespace.getRootNamespace().cloneInto(&proc.ns);
     proc.ipc_msg = ipc.Message.init(.t_open);
 
@@ -484,6 +545,98 @@ pub fn create() ?*Process {
     // Enqueue on the assigned core's run queue
     markReady(proc);
 
+    return proc;
+}
+
+/// Create a new thread that shares its parent's address space via a ThreadGroup.
+/// The thread gets its own kernel stack and process table slot, but shares
+/// pml4, fds, namespace, mmap_next, and brk with the parent.
+pub fn createThread(parent: *Process) ?*Process {
+    if (!initialized) return null;
+
+    // Ensure the parent has a thread group (create one on first clone)
+    if (parent.thread_group == null) {
+        const tg = thread_group.createGroup(parent) orelse return null;
+        _ = tg;
+    }
+    const tg = parent.thread_group.?;
+
+    // Find a free slot (under table lock)
+    const proc = blk: {
+        table_lock.lock();
+        defer table_lock.unlock();
+        var slot: ?*Process = null;
+        for (&processes) |*p| {
+            if (p.state == .free) {
+                slot = p;
+                break;
+            }
+        }
+        const p = slot orelse break :blk null;
+        p.state = .blocked;
+        break :blk p;
+    } orelse return null;
+
+    // Free deferred kernel stack from previous incarnation
+    if (proc.needs_stack_free) {
+        freeKernelStack(proc);
+        proc.needs_stack_free = false;
+    }
+
+    // Allocate kernel stack for the new thread
+    var stack_base: u64 = 0;
+    for (0..KERNEL_STACK_PAGES) |i| {
+        const page = pmm.allocPage() orelse {
+            proc.state = .free;
+            return null;
+        };
+        if (i == 0) stack_base = page;
+    }
+    const stack_virt = if (paging.isInitialized()) stack_base + mem.KERNEL_VIRT_BASE else stack_base;
+
+    proc.pid = @atomicRmw(u32, &next_pid, .Add, 1, .monotonic);
+    proc.pml4 = tg.pml4; // shared address space
+    proc.kernel_stack_top = stack_virt + KERNEL_STACK_PAGES * mem.PAGE_SIZE;
+    proc.user_rip = 0;
+    proc.user_rsp = 0;
+    proc.user_rflags = switch (@import("builtin").cpu.arch) {
+        .riscv64 => @import("arch/riscv64/cpu.zig").SSTATUS_SPIE | @import("arch/riscv64/cpu.zig").SSTATUS_SUM,
+        else => 0x202,
+    };
+    proc.syscall_ret = 0;
+    proc.saved_kernel_rsp = 0;
+    proc.fds = [_]?FdEntry{null} ** MAX_FDS; // not used directly when thread_group != null
+    proc.brk = 0;
+    proc.pages_used = 0;
+    proc.quotas = .{};
+    proc.ipc_recv_buf_ptr = 0;
+    proc.ipc_pending_msg = null;
+    proc.parent_pid = parent.pid;
+    proc.exit_status = 0;
+    proc.waiting_for_pid = null;
+    proc.pending_op = .none;
+    proc.pending_fd = 0;
+    proc.needs_stack_free = false;
+    proc.sleep_until = 0;
+    proc.vt = parent.vt;
+    proc.uid = parent.uid;
+    proc.gid = parent.gid;
+    proc.ns = namespace.Namespace{ .mounts = undefined, .count = 0 };
+    proc.ipc_msg = ipc.Message.init(.t_open);
+    proc.fs_base = 0;
+    proc.ctid_ptr = 0;
+    proc.mmap_next = 0; // not used directly, group has the shared value
+
+    // Join the thread group
+    thread_group.retainGroup(tg);
+    proc.thread_group = tg;
+
+    // Assign core
+    proc.assigned_core = leastLoadedCore();
+    proc.core_affinity = -1;
+    proc.cores_ran_on = 0;
+
+    markReady(proc);
     return proc;
 }
 
@@ -582,6 +735,8 @@ pub fn killChildren(parent_pid: u32) void {
     for (&processes) |*p| {
         if (p.parent_pid) |ppid| {
             if (ppid == parent_pid and p.state != .free) {
+                // Skip threads in the same thread group — they're siblings, not children
+                if (p.thread_group != null) continue;
                 // Recurse first (kill grandchildren before child)
                 killChildren(p.pid);
                 // Free all process resources (safe — runs in parent's context)
@@ -598,7 +753,7 @@ pub fn killChildren(parent_pid: u32) void {
 }
 
 /// Get the process table for iteration (used by syscall implementations).
-pub fn getProcessTable() *[64]Process {
+pub fn getProcessTable() *[MAX_PROCESSES]Process {
     return &processes;
 }
 
@@ -730,7 +885,14 @@ fn switchTo(proc: *Process) noreturn {
     setCurrentInternal(proc);
     proc.state = .running;
     // Track which cores have run this process (for TLB shootdown)
-    proc.cores_ran_on |= @as(u128, 1) << @intCast(percpu.getCoreId());
+    const core_bit = @as(u128, 1) << @intCast(percpu.getCoreId());
+    proc.cores_ran_on |= core_bit;
+    // Also track in thread group for group-wide TLB shootdown
+    if (proc.thread_group) |tg| {
+        tg.lock.lock();
+        tg.cores_ran_on |= core_bit;
+        tg.lock.unlock();
+    }
 
     // Set up kernel stack for this process
     syscall_entry.setKernelStack(proc.kernel_stack_top);
@@ -1034,8 +1196,15 @@ pub fn allocPageForProcess(proc: *Process) ?u64 {
 /// Free the user address space (page tables and user pages).
 /// Safe to call even if pml4 is null.
 pub fn freeUserMemory(proc: *Process) void {
-    if (proc.pml4) |pml4| {
-        // Flush TLB on all cores that ran this process
+    if (proc.thread_group) |tg| {
+        // Thread: release group reference. Last thread frees the address space.
+        _ = thread_group.releaseGroup(tg, proc);
+        proc.thread_group = null;
+        proc.pml4 = null;
+        proc.pages_used = 0;
+        proc.cores_ran_on = 0;
+    } else if (proc.pml4) |pml4| {
+        // Non-threaded process: free address space directly
         tlbShootdown(proc);
         paging.freeAddressSpace(pml4);
         proc.pml4 = null;

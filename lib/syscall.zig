@@ -42,6 +42,8 @@ pub const SYS = enum(u64) {
     dup_fd = 34,
     dup2 = 35,
     arch_prctl = 36,
+    clone = 37,
+    futex = 38,
 };
 
 const ipc = @import("ipc.zig");
@@ -254,6 +256,14 @@ pub fn arch_prctl(cmd: u64, addr: u64) u64 {
 
 pub fn rfork(flags: u64) u64 {
     return syscall1(.rfork, flags);
+}
+
+pub fn clone(stack_top: u64, tls: u64, ctid_ptr: u64, ptid_ptr: u64, flags: u64) u64 {
+    return syscall5(.clone, stack_top, tls, ctid_ptr, ptid_ptr, flags);
+}
+
+pub fn futex(addr: u64, op: u64, val: u64, timeout: u64) u64 {
+    return syscall4(.futex, addr, op, val, timeout);
 }
 
 pub const RFNAMEG: u64 = 0x01;

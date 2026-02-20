@@ -28,6 +28,8 @@
 #define FX_DUP       34
 #define FX_DUP2      35
 #define FX_ARCH_PRCTL 36
+#define FX_CLONE     37
+#define FX_FUTEX     38
 
 /* Linux syscall numbers (x86_64 ABI) */
 #define LNX_READ            0
@@ -71,6 +73,9 @@
 #define LNX_UNLINKAT     263
 #define LNX_RENAMEAT     264
 #define LNX_RENAMEAT2    316
+#define LNX_CLONE           56
+#define LNX_FUTEX          202
+#define LNX_GETTID         186
 #define LNX_SET_TID_ADDRESS 218
 #define LNX_SET_ROBUST_LIST 273
 #define LNX_PRLIMIT64    302
@@ -206,6 +211,16 @@ static inline long __fx_raw4(long nr, long a0, long a1, long a2, long a3)
     long ret;
     register long r10 __asm__("r10") = a3;
     __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a0), "S"(a1), "d"(a2), "r"(r10)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long __fx_raw5(long nr, long a0, long a1, long a2, long a3, long a4)
+{
+    long ret;
+    register long r10 __asm__("r10") = a3;
+    register long r8 __asm__("r8") = a4;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a0), "S"(a1), "d"(a2), "r"(r10), "r"(r8)
         : "rcx", "r11", "memory");
     return ret;
 }
@@ -485,8 +500,28 @@ long __fornax_syscall(long n, long a, long b, long c, long d, long e, long f)
     case LNX_GETPID:
         return __fx_raw1(FX_GETPID, 0);
 
+    case LNX_GETTID:
+        return __fx_raw1(FX_GETPID, 0);
+
     case LNX_ARCH_PRCTL:
         return __fx_raw2(FX_ARCH_PRCTL, a, b);
+
+    /* ── Threading ───────────────────────────────────────────────── */
+    case LNX_CLONE: {
+        /* Linux: clone(flags, stack, ptid, ctid, tls)
+         *        a=flags b=stack c=ptid d=ctid e=tls
+         * Fornax: clone(stack, tls, ctid, ptid, flags)
+         */
+        return __fx_raw5(FX_CLONE, b/*stack*/, e/*tls*/, d/*ctid*/, c/*ptid*/, a/*flags*/);
+    }
+
+    case LNX_FUTEX: {
+        /* Linux: futex(addr, op, val, timeout, addr2, val3)
+         *        a=addr b=op c=val d=timeout
+         * Fornax: futex(addr, op, val, timeout)
+         */
+        return __fx_raw4(FX_FUTEX, a, b, c, d);
+    }
 
     /* ── Signals (stubs) ─────────────────────────────────────────── */
     case LNX_RT_SIGACTION:
@@ -611,9 +646,18 @@ unsigned long __default_stacksize = 131072;
 /* Environment pointer. Our crt0 doesn't set up envp, so it's NULL. */
 char **__environ = 0;
 
-/* Single-threaded lock stubs. musl uses these for atexit/stdio locking. */
-void __lock(volatile int *l) { (void)l; }
-void __unlock(volatile int *l) { (void)l; }
+/* Thread-safe locks for musl's atexit/stdio locking.
+ * Uses futex-assisted spinning: spin briefly, then futex wait. */
+void __lock(volatile int *l)
+{
+    while (__sync_lock_test_and_set(l, 1))
+        __fx_raw4(FX_FUTEX, (long)l, 0 /*FUTEX_WAIT*/, 1, 0);
+}
+void __unlock(volatile int *l)
+{
+    __sync_lock_release(l);
+    __fx_raw4(FX_FUTEX, (long)l, 1 /*FUTEX_WAKE*/, 1, 0);
+}
 
 /* Internal calloc alias used by atexit. Forward to regular calloc. */
 void *calloc(unsigned long, unsigned long);
