@@ -1353,7 +1353,7 @@ fn findControlKeyword(tokens: []const []const u8, start: usize, keyword: []const
         if (depth == 0 and fx.str.eql(tokens[i], keyword)) {
             return i;
         }
-        if (fx.str.eql(tokens[i], "if") or fx.str.eql(tokens[i], "while")) {
+        if (fx.str.eql(tokens[i], "if") or fx.str.eql(tokens[i], "while") or fx.str.eql(tokens[i], "for")) {
             depth += 1;
         } else if (fx.str.eql(tokens[i], "fi") or fx.str.eql(tokens[i], "done")) {
             if (depth > 0) depth -= 1;
@@ -1439,6 +1439,50 @@ fn handleWhile(tokens: []const []const u8, pos: *usize) void {
     pos.* = done_pos + 1;
 }
 
+fn handleFor(tokens: []const []const u8, pos: *usize) void {
+    const for_pos = pos.*;
+
+    // Syntax: for VAR in items...; do body; done
+    // tokens[for_pos] = "for", tokens[for_pos+1] = VAR, tokens[for_pos+2] = "in"
+    if (for_pos + 2 >= tokens.len or !fx.str.eql(tokens[for_pos + 2], "in")) {
+        out.puts("fsh: syntax error: expected 'for VAR in ...'\n");
+        last_exit_status = 2;
+        pos.* = tokens.len;
+        return;
+    }
+
+    const var_name = tokens[for_pos + 1];
+
+    const do_pos = findControlKeyword(tokens, for_pos + 3, "do") orelse {
+        out.puts("fsh: syntax error: missing 'do'\n");
+        last_exit_status = 2;
+        pos.* = tokens.len;
+        return;
+    };
+
+    const done_pos = findControlKeyword(tokens, do_pos + 1, "done") orelse {
+        out.puts("fsh: syntax error: missing 'done'\n");
+        last_exit_status = 2;
+        pos.* = tokens.len;
+        return;
+    };
+
+    // Items: tokens between "in" and "do", stripping ; before do
+    var items_end = do_pos;
+    if (items_end > for_pos + 3 and fx.str.eql(tokens[items_end - 1], ";")) items_end -= 1;
+
+    const body = tokens[do_pos + 1 .. done_pos];
+
+    // Iterate over items
+    var item_i = for_pos + 3;
+    while (item_i < items_end) : (item_i += 1) {
+        _ = envSet(var_name, tokens[item_i]);
+        executeTokens(body);
+    }
+
+    pos.* = done_pos + 1;
+}
+
 fn skipBlock(tokens: []const []const u8, pos: *usize, closer: []const u8) void {
     const end = findControlKeyword(tokens, pos.* + 1, closer);
     pos.* = if (end) |ep| ep + 1 else tokens.len;
@@ -1479,6 +1523,15 @@ fn executeTokens(tokens: []const []const u8) void {
         if (fx.str.eql(tokens[i], "while")) {
             if (should_exec) {
                 handleWhile(tokens, &i);
+            } else {
+                skipBlock(tokens, &i, "done");
+            }
+            should_exec = true;
+            continue;
+        }
+        if (fx.str.eql(tokens[i], "for")) {
+            if (should_exec) {
+                handleFor(tokens, &i);
             } else {
                 skipBlock(tokens, &i, "done");
             }

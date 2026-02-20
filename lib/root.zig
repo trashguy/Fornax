@@ -16,6 +16,12 @@ pub const crypt = @import("crypt.zig");
 pub const passwd = @import("passwd.zig");
 pub const shadow = @import("shadow.zig");
 pub const group = @import("group.zig");
+pub const crc32 = @import("crc32.zig");
+pub const deflate = @import("deflate.zig");
+pub const tar = @import("tar.zig");
+pub const json = @import("json.zig");
+pub const sha256 = @import("sha256.zig");
+pub const http = @import("http.zig");
 
 // Re-export syscall functions at top level for backward compatibility.
 pub const SYS = syscall.SYS;
