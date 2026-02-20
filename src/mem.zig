@@ -28,6 +28,10 @@ pub const USER_STACK_INIT: u64 = switch (@import("builtin").cpu.arch) {
 /// Stack pointer is set to ARGV_BASE - 8, so program stack grows down from here.
 pub const ARGV_BASE: u64 = USER_STACK_TOP - PAGE_SIZE;
 
+/// Base address for auxiliary vector (one page below ARGV_BASE).
+/// Used by POSIX programs for AT_PHDR, AT_PHNUM, etc.
+pub const AUXV_BASE: u64 = ARGV_BASE - PAGE_SIZE;
+
 /// How much physical memory to map in the kernel half (4 GB).
 pub const KERNEL_MAP_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 

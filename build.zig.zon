@@ -8,4 +8,11 @@
         "build.zig.zon",
         "src",
     },
+    .dependencies = .{
+        .musl = .{
+            .url = "https://musl.libc.org/releases/musl-1.2.5.tar.gz",
+            .hash = "N-V-__8AAB0gNQAtOCaRIfjFXtrGNrdtTXq5QfQ4TsUCOCUO",
+            .lazy = true,
+        },
+    },
 }

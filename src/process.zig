@@ -208,6 +208,10 @@ pub const Process = struct {
     core_affinity: i16 = -1,
     /// Bitmap of cores that have run this process (for TLB shootdown).
     cores_ran_on: u128 = 0,
+    /// Next virtual address for anonymous mmap allocations.
+    mmap_next: u64 = 0x0000_4000_0000_0000,
+    /// Saved FS_BASE MSR value (for TLS, used by musl libc).
+    fs_base: u64 = 0,
 
     pub fn initFds(self: *Process) void {
         for (&self.fds) |*fd| {
@@ -735,6 +739,11 @@ fn switchTo(proc: *Process) noreturn {
     // Switch address space
     if (proc.pml4) |pml4| {
         paging.switchAddressSpace(pml4);
+    }
+
+    // Restore FS_BASE MSR for TLS (used by musl libc errno, etc.)
+    if (@import("builtin").cpu.arch == .x86_64 and proc.fs_base != 0) {
+        cpu.wrmsr(0xC0000100, proc.fs_base);
     }
 
     // Sleep delivery — check if the sleep timer has elapsed

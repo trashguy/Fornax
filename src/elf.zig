@@ -36,6 +36,7 @@ const EM_EXPECTED = switch (@import("builtin").cpu.arch) {
     else => @compileError("unsupported architecture for ELF loading"),
 };
 const PT_LOAD = 1;
+const PT_INTERP = 3;
 const PF_W = 2;
 const PF_X = 1;
 
@@ -80,7 +81,11 @@ pub const LoadError = error{
 
 pub const LoadResult = struct {
     entry_point: u64,
-    brk: u64, // highest loaded address (for initial brk)
+    brk: u64,
+    interp_path: ?[]const u8 = null,
+    phdr_vaddr: u64 = 0,
+    phnum: u16 = 0,
+    phentsize: u16 = 0,
 };
 
 /// Load an ELF64 binary into the given page table.
@@ -98,6 +103,16 @@ pub fn load(page_table: *paging.PageTable, elf_data: []const u8) LoadError!LoadR
     if (header.e_phnum == 0) return error.NoSegments;
 
     var highest_addr: u64 = 0;
+    var result: LoadResult = .{
+        .entry_point = header.e_entry,
+        .brk = 0,
+        .phnum = header.e_phnum,
+        .phentsize = header.e_phentsize,
+    };
+
+    // Track first PT_LOAD vaddr for phdr_vaddr calculation
+    var first_load_vaddr: u64 = 0;
+    var found_first_load = false;
 
     // Iterate program headers
     var i: u16 = 0;
@@ -107,7 +122,23 @@ pub fn load(page_table: *paging.PageTable, elf_data: []const u8) LoadError!LoadR
 
         const phdr: *align(1) const Elf64Phdr = @ptrCast(elf_data.ptr + ph_offset);
 
+        // Detect PT_INTERP
+        if (phdr.p_type == PT_INTERP) {
+            const off: usize = @intCast(phdr.p_offset);
+            const len: usize = @intCast(phdr.p_filesz);
+            if (off + len <= elf_data.len and len > 0) {
+                const path = elf_data[off..][0..len];
+                result.interp_path = if (path[len - 1] == 0) path[0 .. len - 1] else path;
+            }
+        }
+
         if (phdr.p_type != PT_LOAD) continue;
+
+        // Track first PT_LOAD for phdr_vaddr
+        if (!found_first_load) {
+            first_load_vaddr = phdr.p_vaddr;
+            found_first_load = true;
+        }
 
         // Load this segment
         loadSegment(page_table, elf_data, phdr) orelse return error.OutOfMemory;
@@ -116,13 +147,15 @@ pub fn load(page_table: *paging.PageTable, elf_data: []const u8) LoadError!LoadR
         if (seg_end > highest_addr) highest_addr = seg_end;
     }
 
-    // Align brk to page boundary
-    const brk = (highest_addr + mem.PAGE_SIZE - 1) & ~@as(u64, mem.PAGE_SIZE - 1);
+    // phdr_vaddr = first_load_vaddr + e_phoff (program headers are in the first segment)
+    if (found_first_load) {
+        result.phdr_vaddr = first_load_vaddr + header.e_phoff;
+    }
 
-    return .{
-        .entry_point = header.e_entry,
-        .brk = brk,
-    };
+    // Align brk to page boundary
+    result.brk = (highest_addr + mem.PAGE_SIZE - 1) & ~@as(u64, mem.PAGE_SIZE - 1);
+
+    return result;
 }
 
 const std = @import("std");

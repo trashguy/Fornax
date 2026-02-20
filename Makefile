@@ -1,5 +1,6 @@
 .PHONY: all x86_64 aarch64 riscv64 run run-x86_64 run-smp run-aarch64 run-riscv64 disk disk-x86_64 disk-aarch64 clean clean-disk help
 .PHONY: release release-x86_64 release-aarch64 release-riscv64 run-release disk-img disk-format
+.PHONY: run-posix run-posix-release
 
 all: x86_64 aarch64
 
@@ -33,6 +34,14 @@ run-smp: x86_64
 	./scripts/run-x86_64.sh -smp 4
 
 run-release: release-x86_64
+	./scripts/run-x86_64.sh
+
+run-posix:
+	zig build x86_64 -Dposix=true
+	./scripts/run-x86_64.sh
+
+run-posix-release:
+	zig build x86_64 -Doptimize=ReleaseSafe -Dposix=true
 	./scripts/run-x86_64.sh
 
 run-aarch64: aarch64
@@ -79,6 +88,8 @@ help:
 	@echo "  make run-release     Run x86_64 in QEMU (ReleaseSafe kernel)"
 	@echo "  make run-aarch64     Run aarch64 in QEMU"
 	@echo "  make run-riscv64     Run riscv64 in QEMU"
+	@echo "  make run-posix       Run x86_64 with C/POSIX realm support"
+	@echo "  make run-posix-release  Run x86_64 with POSIX (ReleaseSafe kernel)"
 	@echo "  make disk            Create x86_64 bootable disk image"
 	@echo "  make clean-disk      Remove disk image (re-created and formatted on next run)"
 	@echo "  make clean           Remove build artifacts and disk images"

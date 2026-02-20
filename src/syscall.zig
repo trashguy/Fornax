@@ -51,6 +51,11 @@ pub const SYS = enum(u64) {
     wstat = 29,
     setuid = 30,
     getuid = 31,
+    mmap = 32,
+    munmap = 33,
+    dup = 34,
+    dup2 = 35,
+    arch_prctl = 36,
 };
 
 /// Error return values.
@@ -152,7 +157,13 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         .wstat => sysWstat(arg0, arg1, arg2, arg3, arg4),
         .setuid => sysSetuid(arg0, arg1),
         .getuid => sysGetuid(),
-        .mount, .bind, .unmount, .rfork => {
+        .mmap => sysMmap(arg0, arg1, arg2, arg3),
+        .munmap => sysMunmap(arg0, arg1),
+        .dup => sysDup(arg0),
+        .dup2 => sysDup2(arg0, arg1),
+        .arch_prctl => sysArchPrctl(arg0, arg1),
+        .rfork => sysRfork(arg0),
+        .mount, .bind, .unmount => {
             klog.warn("syscall: unimplemented nr=");
             klog.warnDec(nr);
             klog.warn("\n");
@@ -1791,6 +1802,143 @@ fn sysGetuid() u64 {
     return @as(u64, proc.uid) | (@as(u64, proc.gid) << 16);
 }
 
+/// SYS 32: mmap — Anonymous memory mapping.
+/// args: addr (hint, ignored), length, prot, flags
+/// Returns virtual address of mapped region, or error.
+fn sysMmap(addr_hint: u64, length: u64, prot: u64, flags: u64) u64 {
+    _ = addr_hint;
+    const proc = process.getCurrent() orelse return ENOSYS;
+
+    if (length == 0) return EINVAL;
+
+    // Only support MAP_ANONYMOUS | MAP_PRIVATE (flags bits 0x20 | 0x02)
+    // Accept any combination that includes MAP_ANONYMOUS
+    const MAP_ANONYMOUS: u64 = 0x20;
+    if (flags & MAP_ANONYMOUS == 0) return EINVAL;
+
+    // Round up to page boundary
+    const page_count = (length + mem.PAGE_SIZE - 1) / mem.PAGE_SIZE;
+    const base = proc.mmap_next;
+
+    var i: u64 = 0;
+    while (i < page_count) : (i += 1) {
+        const page = pmm.allocPage() orelse return ENOMEM;
+        // Zero the page
+        const ptr: [*]u8 = paging.physPtr(page);
+        @memset(ptr[0..mem.PAGE_SIZE], 0);
+        // Map with user + writable (+ exec based on prot)
+        var map_flags: u64 = paging.Flags.WRITABLE | paging.Flags.USER;
+        const PROT_EXEC: u64 = 0x4;
+        if (prot & PROT_EXEC != 0) {
+            map_flags |= paging.Flags.EXEC;
+        }
+        paging.mapPage(proc.pml4.?, base + i * mem.PAGE_SIZE, page, map_flags) orelse return ENOMEM;
+        proc.pages_used += 1;
+    }
+
+    proc.mmap_next = base + page_count * mem.PAGE_SIZE;
+    return base;
+}
+
+/// SYS 33: munmap — Unmap memory region.
+/// Currently a no-op (acceptable leak for Phase 1000).
+fn sysMunmap(addr: u64, length: u64) u64 {
+    _ = addr;
+    _ = length;
+    // Don't free physical pages — acceptable for single-threaded POSIX programs.
+    return 0;
+}
+
+/// SYS 34: dup — Duplicate file descriptor to lowest free slot.
+fn sysDup(old_fd: u64) u64 {
+    const proc = process.getCurrent() orelse return ENOSYS;
+    if (old_fd >= process.MAX_FDS) return EBADF;
+    const entry = proc.fds[@intCast(old_fd)] orelse return EBADF;
+
+    // Find lowest free fd
+    for (0..process.MAX_FDS) |i| {
+        if (proc.fds[i] == null) {
+            proc.fds[i] = entry;
+            // Increment pipe refcounts if applicable
+            if (entry.fd_type == .pipe) {
+                const pipe_mod = @import("pipe.zig");
+                if (entry.pipe_is_read) {
+                    pipe_mod.incrementReaders(entry.pipe_id);
+                } else {
+                    pipe_mod.incrementWriters(entry.pipe_id);
+                }
+            }
+            return @intCast(i);
+        }
+    }
+    return EMFILE;
+}
+
+/// SYS 35: dup2 — Duplicate old_fd to new_fd (closing new_fd first if open).
+fn sysDup2(old_fd: u64, new_fd: u64) u64 {
+    const proc = process.getCurrent() orelse return ENOSYS;
+    if (old_fd >= process.MAX_FDS or new_fd >= process.MAX_FDS) return EBADF;
+    const entry = proc.fds[@intCast(old_fd)] orelse return EBADF;
+
+    // If same fd, just return it
+    if (old_fd == new_fd) return new_fd;
+
+    // Close new_fd if open
+    if (proc.fds[@intCast(new_fd)]) |existing| {
+        if (existing.fd_type == .pipe) {
+            const pipe_mod = @import("pipe.zig");
+            if (existing.pipe_is_read) {
+                pipe_mod.closeReadEnd(existing.pipe_id);
+            } else {
+                pipe_mod.closeWriteEnd(existing.pipe_id);
+            }
+        }
+        proc.fds[@intCast(new_fd)] = null;
+    }
+
+    proc.fds[@intCast(new_fd)] = entry;
+    // Increment pipe refcounts
+    if (entry.fd_type == .pipe) {
+        const pipe_mod = @import("pipe.zig");
+        if (entry.pipe_is_read) {
+            pipe_mod.incrementReaders(entry.pipe_id);
+        } else {
+            pipe_mod.incrementWriters(entry.pipe_id);
+        }
+    }
+    return new_fd;
+}
+
+/// SYS 36: arch_prctl — Set/get architecture-specific thread state.
+/// cmd: ARCH_SET_FS (0x1002) to set FS base for TLS.
+fn sysArchPrctl(cmd: u64, addr: u64) u64 {
+    if (@import("builtin").cpu.arch != .x86_64) return ENOSYS;
+    const cpu = @import("arch/x86_64/cpu.zig");
+    const proc = process.getCurrent() orelse return ENOSYS;
+
+    const ARCH_SET_FS: u64 = 0x1002;
+    if (cmd == ARCH_SET_FS) {
+        proc.fs_base = addr;
+        cpu.wrmsr(0xC0000100, addr); // IA32_FS_BASE
+        return 0;
+    }
+    return EINVAL;
+}
+
+/// SYS 11: rfork — Resource fork (Plan 9 process control).
+fn sysRfork(flags: u64) u64 {
+    const RFNAMEG_FLAG: u64 = 0x01;
+    if (flags & RFNAMEG_FLAG != 0) {
+        // Namespace is already per-process (by-value clone in sysSpawn),
+        // so RFNAMEG is effectively a no-op.
+        return 0;
+    }
+    klog.warn("syscall: rfork unimplemented flags=");
+    klog.warnDec(flags);
+    klog.warn("\n");
+    return ENOSYS;
+}
+
 /// ipc_recv(fd, msg_buf_ptr) → 0 on success, negative on error.
 /// Server-side: receive the next message on a channel.
 /// Blocks if no message is pending.
@@ -2059,6 +2207,7 @@ fn writeToChildMem(child_pml4: *paging.PageTable, vaddr: u64, data: []const u8) 
 var argv_layout_buf: [4096]u8 linksection(".bss") = undefined;
 
 fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64, argv_ptr: u64) u64 {
+    const initrd = @import("initrd.zig");
     const parent = process.getCurrent() orelse return ENOSYS;
 
     // Validate ELF pointer
@@ -2081,6 +2230,51 @@ fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64, argv_p
     };
     child.user_rip = load_result.entry_point;
     child.brk = load_result.brk;
+
+    // Handle PT_INTERP: load interpreter from initrd and redirect entry
+    if (load_result.interp_path) |interp_raw| {
+        // Strip leading path components (e.g., "/lib/posix-realm" → "posix-realm")
+        var interp_name = interp_raw;
+        if (interp_name.len > 0) {
+            var last_slash: usize = 0;
+            var found_slash = false;
+            for (interp_name, 0..) |c, idx| {
+                if (c == '/') {
+                    last_slash = idx;
+                    found_slash = true;
+                }
+            }
+            if (found_slash) {
+                interp_name = interp_name[last_slash + 1 ..];
+            }
+        }
+
+        const interp_data = initrd.findFile(interp_name) orelse {
+            klog.warn("[spawn: interpreter not found: ");
+            for (interp_name) |c| {
+                const buf: [1]u8 = .{c};
+                klog.warn(&buf);
+            }
+            klog.warn("]\n");
+            child.state = .dead;
+            return ENOENT;
+        };
+
+        // Load interpreter into child's address space (at its own image_base, e.g., 0x20000000)
+        const interp_result = elf.load(child.pml4.?, interp_data) catch {
+            child.state = .dead;
+            return ENOMEM;
+        };
+
+        // Interpreter runs first; pass program entry via initial RAX (syscall_ret)
+        child.user_rip = interp_result.entry_point;
+        child.syscall_ret = load_result.entry_point;
+
+        // Use program's brk (higher address), not interpreter's
+        if (load_result.brk > interp_result.brk) {
+            child.brk = load_result.brk;
+        }
+    }
 
     // Allocate user stack
     for (0..process.USER_STACK_PAGES) |i| {
@@ -2176,6 +2370,54 @@ fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64, argv_p
         child.user_rsp = mem.ARGV_BASE - 8;
     }
 
+    // Write auxiliary vector (auxv) for all programs. POSIX/musl programs need
+    // AT_PHDR for TLS init. Cost: 1 page per process (negligible).
+    // AUXV_BASE = ARGV_BASE - PAGE_SIZE
+    {
+        const AUXV_BASE: u64 = mem.ARGV_BASE - mem.PAGE_SIZE;
+        // Allocate a page for auxv
+        const auxv_page = pmm.allocPage() orelse {
+            child.state = .dead;
+            return ENOMEM;
+        };
+        const auxv_ptr: [*]u8 = paging.physPtr(auxv_page);
+        @memset(auxv_ptr[0..mem.PAGE_SIZE], 0);
+        paging.mapPage(child_pml4, AUXV_BASE, auxv_page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
+            child.state = .dead;
+            return ENOMEM;
+        };
+
+        // Write auxv entries as [key: u64, value: u64] pairs
+        var auxv_buf: [96]u8 = @splat(0); // 6 entries * 16 bytes = 96
+        var off: usize = 0;
+
+        // AT_PHDR (3) = phdr_vaddr
+        writeU64LE(auxv_buf[off..][0..8], 3); off += 8;
+        writeU64LE(auxv_buf[off..][0..8], load_result.phdr_vaddr); off += 8;
+
+        // AT_PHNUM (5) = phnum
+        writeU64LE(auxv_buf[off..][0..8], 5); off += 8;
+        writeU64LE(auxv_buf[off..][0..8], load_result.phnum); off += 8;
+
+        // AT_PHENT (4) = phentsize
+        writeU64LE(auxv_buf[off..][0..8], 4); off += 8;
+        writeU64LE(auxv_buf[off..][0..8], load_result.phentsize); off += 8;
+
+        // AT_ENTRY (9) = program entry point
+        writeU64LE(auxv_buf[off..][0..8], 9); off += 8;
+        writeU64LE(auxv_buf[off..][0..8], load_result.entry_point); off += 8;
+
+        // AT_PAGESZ (6) = 4096
+        writeU64LE(auxv_buf[off..][0..8], 6); off += 8;
+        writeU64LE(auxv_buf[off..][0..8], mem.PAGE_SIZE); off += 8;
+
+        // AT_NULL (0) = terminator
+        writeU64LE(auxv_buf[off..][0..8], 0); off += 8;
+        writeU64LE(auxv_buf[off..][0..8], 0); off += 8;
+
+        _ = writeToChildMem(child_pml4, AUXV_BASE, auxv_buf[0..off]);
+    }
+
     // Copy namespace from parent (Plan 9: children inherit namespace)
     parent.ns.cloneInto(&child.ns);
     child.uid = parent.uid;
@@ -2208,7 +2450,11 @@ fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64, argv_p
     klog.debug(" child=");
     klog.debugDec(child.pid);
     klog.debug(" entry=");
-    klog.debugHex(load_result.entry_point);
+    klog.debugHex(child.user_rip);
+    if (load_result.interp_path != null) {
+        klog.debug(" interp=");
+        klog.debugHex(load_result.entry_point);
+    }
     klog.debug("]\n");
 
     return child.pid;

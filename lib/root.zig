@@ -56,6 +56,13 @@ pub const wstat = syscall.wstat;
 pub const WSTAT_MODE = syscall.WSTAT_MODE;
 pub const WSTAT_UID = syscall.WSTAT_UID;
 pub const WSTAT_GID = syscall.WSTAT_GID;
+pub const mmap = syscall.mmap;
+pub const munmap = syscall.munmap;
+pub const dup = syscall.dup;
+pub const dup2 = syscall.dup2;
+pub const arch_prctl = syscall.arch_prctl;
+pub const rfork = syscall.rfork;
+pub const RFNAMEG = syscall.RFNAMEG;
 
 // Re-export IPC types at top level.
 pub const IpcMessage = ipc.IpcMessage;

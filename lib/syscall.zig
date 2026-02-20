@@ -37,6 +37,11 @@ pub const SYS = enum(u64) {
     wstat = 29,
     setuid = 30,
     getuid = 31,
+    mmap = 32,
+    munmap = 33,
+    dup_fd = 34,
+    dup2 = 35,
+    arch_prctl = 36,
 };
 
 const ipc = @import("ipc.zig");
@@ -224,6 +229,34 @@ pub fn getuid() u16 {
 pub fn getgid() u16 {
     return @truncate(syscall1(.getuid, 0) >> 16);
 }
+
+pub fn mmap(addr: u64, length: u64, prot: u64, flags: u64) u64 {
+    return syscall4(.mmap, addr, length, prot, flags);
+}
+
+pub fn munmap(addr: u64, length: u64) u64 {
+    return syscall2(.munmap, addr, length);
+}
+
+pub fn dup(fd: i32) i32 {
+    const result = syscall1(.dup_fd, @bitCast(@as(i64, fd)));
+    return @bitCast(@as(i64, @bitCast(result)));
+}
+
+pub fn dup2(old_fd: i32, new_fd: i32) i32 {
+    const result = syscall2(.dup2, @bitCast(@as(i64, old_fd)), @bitCast(@as(i64, new_fd)));
+    return @bitCast(@as(i64, @bitCast(result)));
+}
+
+pub fn arch_prctl(cmd: u64, addr: u64) u64 {
+    return syscall2(.arch_prctl, cmd, addr);
+}
+
+pub fn rfork(flags: u64) u64 {
+    return syscall1(.rfork, flags);
+}
+
+pub const RFNAMEG: u64 = 0x01;
 
 /// Build a serialized argv block: [argc: u32][total_len: u32][str0\0str1\0...]
 pub fn buildArgvBlock(buf: []u8, args: []const []const u8) ?[]const u8 {
