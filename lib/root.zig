@@ -69,6 +69,11 @@ pub const dup2 = syscall.dup2;
 pub const arch_prctl = syscall.arch_prctl;
 pub const rfork = syscall.rfork;
 pub const RFNAMEG = syscall.RFNAMEG;
+pub const RFPROC = syscall.RFPROC;
+pub const RFFDG = syscall.RFFDG;
+pub const RFCFDG = syscall.RFCFDG;
+pub const RFMEM = syscall.RFMEM;
+pub const RFNOWAIT = syscall.RFNOWAIT;
 
 // Re-export IPC types at top level.
 pub const IpcMessage = ipc.IpcMessage;

@@ -28,8 +28,16 @@
 #define FX_DUP       34
 #define FX_DUP2      35
 #define FX_ARCH_PRCTL 36
+#define FX_EXEC      12
+#define FX_WAIT      13
+#define FX_PIPE      15
 #define FX_CLONE     37
 #define FX_FUTEX     38
+
+/* rfork flags (Plan 9) */
+#define RFPROC       0x01
+#define RFFDG        0x02
+#define RFNAMEG      0x08
 
 /* Linux syscall numbers (x86_64 ABI) */
 #define LNX_READ            0
@@ -86,6 +94,15 @@
 #define LNX_SIGRETURN      15
 #define LNX_RT_SIGACTION   13
 #define LNX_RT_SIGPROCMASK 14
+#define LNX_PIPE           22
+#define LNX_FORK           57
+#define LNX_VFORK          58
+#define LNX_EXECVE         59
+#define LNX_WAIT4          61
+#define LNX_GETPPID       110
+#define LNX_SETPGID       109
+#define LNX_SETSID        112
+#define LNX_PIPE2         293
 
 /* Linux open flags */
 #define O_RDONLY    0x0000
@@ -306,6 +323,98 @@ static long translate_open(const char *path, int linux_flags, int mode)
     }
 }
 
+/* ── POSIX process helpers ───────────────────────────────────────── */
+
+static long __fx_pipe(long pipefd_ptr) {
+    /* Fornax pipe() writes [read_fd:i32, write_fd:i32] — same layout as Linux */
+    return __fx_raw1(FX_PIPE, pipefd_ptr);
+}
+
+static long __fx_wait4(long pid, long status_ptr, long options) {
+    long flags = 0;
+    if (options & 1) flags |= 1;  /* WNOHANG */
+
+    /* Convert pid=-1 to Fornax convention: 0 means any child, -1 also accepted */
+    long fx_pid = pid;
+    if (pid == -1) fx_pid = 0;
+
+    long result = __fx_raw2(FX_WAIT, fx_pid, flags);
+
+    if (result > 0 && status_ptr) {
+        /* Packed result: upper 32 = child pid, lower 32 = POSIX status word */
+        int *status = (int *)status_ptr;
+        *status = (int)(result & 0xFFFFFFFF);  /* lower 32 bits = status word */
+        return (long)(result >> 32);             /* upper 32 bits = child pid */
+    }
+    return result;
+}
+
+/* Exec buffer in BSS — large enough for typical ELF binaries */
+static char __exec_buf[4 * 1024 * 1024] __attribute__((section(".bss")));
+
+static long __fx_execve(long path_ptr, long argv_ptr, long envp_ptr) {
+    (void)envp_ptr;
+    const char *path = (const char *)path_ptr;
+    unsigned long plen = __strlen(path);
+
+    /* Open the executable file */
+    long fd = __fx_raw2(FX_OPEN, (long)path, plen);
+    if (fd < 0) return fd;
+
+    /* Get file size */
+    struct fx_stat fxs;
+    long r = __fx_raw2(FX_STAT, fd, (long)&fxs);
+    if (r != 0) { __fx_raw1(FX_CLOSE, fd); return -5; /* EIO */ }
+
+    unsigned long file_size = fxs.size;
+    if (file_size > sizeof(__exec_buf)) {
+        __fx_raw1(FX_CLOSE, fd);
+        return -12; /* ENOMEM */
+    }
+
+    /* Read entire file into buffer */
+    unsigned long total = 0;
+    while (total < file_size) {
+        long n = __fx_raw3(FX_READ, fd, (long)(__exec_buf + total), (long)(file_size - total));
+        if (n <= 0) break;
+        total += (unsigned long)n;
+    }
+    __fx_raw1(FX_CLOSE, fd);
+
+    /* Build Fornax argv wire format: [argc:u32][total_str_bytes:u32][str0\0str1\0...] */
+    static char __wire_buf[4096] __attribute__((section(".bss")));
+    char **argv = (char **)argv_ptr;
+    unsigned int argc = 0;
+    if (argv) {
+        while (argv[argc]) argc++;
+    }
+
+    /* Write argc as u32 LE */
+    __wire_buf[0] = (char)(argc & 0xFF);
+    __wire_buf[1] = (char)((argc >> 8) & 0xFF);
+    __wire_buf[2] = (char)((argc >> 16) & 0xFF);
+    __wire_buf[3] = (char)((argc >> 24) & 0xFF);
+
+    unsigned int pos = 8; /* skip argc(4) + total(4) */
+    unsigned int i;
+    for (i = 0; i < argc && pos < sizeof(__wire_buf) - 1; i++) {
+        unsigned int len = (unsigned int)__strlen(argv[i]);
+        if (pos + len + 1 > sizeof(__wire_buf)) break;
+        __memcpy(__wire_buf + pos, argv[i], len + 1); /* include null */
+        pos += len + 1;
+    }
+
+    /* Write total string bytes */
+    unsigned int str_total = pos - 8;
+    __wire_buf[4] = (char)(str_total & 0xFF);
+    __wire_buf[5] = (char)((str_total >> 8) & 0xFF);
+    __wire_buf[6] = (char)((str_total >> 16) & 0xFF);
+    __wire_buf[7] = (char)((str_total >> 24) & 0xFF);
+
+    /* Call Fornax exec(elf_ptr, elf_len, argv_wire_ptr) */
+    return __fx_raw3(FX_EXEC, (long)__exec_buf, (long)total, (long)__wire_buf);
+}
+
 /* ── The main translation function ───────────────────────────────── */
 
 long __fornax_syscall(long n, long a, long b, long c, long d, long e, long f)
@@ -500,8 +609,31 @@ long __fornax_syscall(long n, long a, long b, long c, long d, long e, long f)
     case LNX_GETPID:
         return __fx_raw1(FX_GETPID, 0);
 
+    case LNX_GETPPID:
+        return __fx_raw1(FX_GETPID, 1); /* arg=1 → return parent pid */
+
     case LNX_GETTID:
         return __fx_raw1(FX_GETPID, 0);
+
+    case LNX_FORK:
+    case LNX_VFORK:
+        return __fx_raw1(FX_RFORK, RFPROC | RFFDG);
+
+    case LNX_EXECVE:
+        return __fx_execve(a, b, c);
+
+    case LNX_WAIT4:
+        return __fx_wait4(a, b, c);
+
+    case LNX_PIPE:
+        return __fx_pipe(a);
+
+    case LNX_PIPE2:
+        return __fx_pipe(a); /* ignore flags */
+
+    case LNX_SETPGID:
+    case LNX_SETSID:
+        return 0; /* no-op: no process groups */
 
     case LNX_ARCH_PRCTL:
         return __fx_raw2(FX_ARCH_PRCTL, a, b);

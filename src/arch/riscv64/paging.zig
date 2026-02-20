@@ -228,6 +228,83 @@ pub fn createAddressSpace() ?*PageTable {
     return new_root;
 }
 
+/// Deep-copy the entire user-half address space (Sv48 entries 1-255) for fork.
+/// Entry 0 (identity map) is handled by createAddressSpace(). The kernel half
+/// (entries 256-511) is shared. Each 4KB user page is fully copied (no COW).
+pub fn deepCopyAddressSpace(src_root: *PageTable) ?*PageTable {
+    // Create base address space (kernel half + identity map deep-copy)
+    const new_root = createAddressSpace() orelse return null;
+
+    // Walk L3 entries 1-255 (user half, excluding entry 0 identity map)
+    for (1..256) |l3_idx| {
+        if (src_root.entries[l3_idx] & Flags.VALID == 0) continue;
+        if (isLeaf(src_root.entries[l3_idx])) {
+            // Superpage — copy entry as-is
+            new_root.entries[l3_idx] = src_root.entries[l3_idx];
+            continue;
+        }
+        const src_l2: *PageTable = tablePtr(pteToPhys(src_root.entries[l3_idx]));
+
+        const new_l2_page = pmm.allocPage() orelse return null;
+        const new_l2: *PageTable = tablePtr(new_l2_page);
+        new_l2.zero();
+
+        for (0..512) |l2_idx| {
+            if (src_l2.entries[l2_idx] & Flags.VALID == 0) continue;
+            if (isLeaf(src_l2.entries[l2_idx])) {
+                // 1GB superpage — copy as-is
+                new_l2.entries[l2_idx] = src_l2.entries[l2_idx];
+                continue;
+            }
+            const src_l1: *PageTable = tablePtr(pteToPhys(src_l2.entries[l2_idx]));
+
+            const new_l1_page = pmm.allocPage() orelse return null;
+            const new_l1: *PageTable = tablePtr(new_l1_page);
+            new_l1.zero();
+
+            for (0..512) |l1_idx| {
+                if (src_l1.entries[l1_idx] & Flags.VALID == 0) continue;
+                if (isLeaf(src_l1.entries[l1_idx])) {
+                    // 2MB superpage — copy as-is
+                    new_l1.entries[l1_idx] = src_l1.entries[l1_idx];
+                    continue;
+                }
+                const src_l0: *PageTable = tablePtr(pteToPhys(src_l1.entries[l1_idx]));
+
+                const new_l0_page = pmm.allocPage() orelse return null;
+                const new_l0: *PageTable = tablePtr(new_l0_page);
+                new_l0.zero();
+
+                for (0..512) |l0_idx| {
+                    if (src_l0.entries[l0_idx] & Flags.VALID == 0) continue;
+                    if (src_l0.entries[l0_idx] & Flags.USER == 0) continue; // skip non-user pages
+
+                    const src_phys = pteToPhys(src_l0.entries[l0_idx]);
+                    const new_page = pmm.allocPage() orelse return null;
+
+                    // Copy 4KB page content
+                    const src_ptr: [*]const u8 = physPtr(src_phys);
+                    const dst_ptr: [*]u8 = physPtr(new_page);
+                    @memcpy(dst_ptr[0..mem.PAGE_SIZE], src_ptr[0..mem.PAGE_SIZE]);
+
+                    // Preserve flags, point to new physical page
+                    const flags_bits = src_l0.entries[l0_idx] & 0x3FF; // low 10 bits are flags
+                    new_l0.entries[l0_idx] = physToPte(new_page) | flags_bits;
+                }
+
+                // Non-leaf: only VALID bit (no U/A/D — reserved on riscv64)
+                new_l1.entries[l1_idx] = physToPte(new_l0_page) | Flags.VALID;
+            }
+
+            new_l2.entries[l2_idx] = physToPte(new_l1_page) | Flags.VALID;
+        }
+
+        new_root.entries[l3_idx] = physToPte(new_l2_page) | Flags.VALID;
+    }
+
+    return new_root;
+}
+
 /// Map a single 4KB page in the given address space.
 pub fn mapPage(root: *PageTable, virt: u64, phys: u64, flags: u64) ?void {
     const l3_idx = (virt >> 39) & 0x1FF;

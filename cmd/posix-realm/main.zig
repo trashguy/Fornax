@@ -16,12 +16,12 @@ export fn _start() callconv(.naked) noreturn {
     // On entry: RAX = program's entry point (set by kernel in syscall_ret)
     //
     // 1. Save program entry point (RAX) to R12 (callee-saved)
-    // 2. rfork(RFNAMEG=0x01): SYS 25, arg in RDI
+    // 2. rfork(RFNAMEG=0x08): SYS 11, arg in RDI
     // 3. Jump to saved program entry point
     asm volatile (
         \\  mov %%rax, %%r12           # Save program entry point
-        \\  mov $25, %%eax             # SYS_rfork = 25
-        \\  mov $0x01, %%edi           # RFNAMEG = 0x01
+        \\  mov $11, %%eax             # SYS_rfork = 11
+        \\  mov $0x08, %%edi           # RFNAMEG = 0x08
         \\  syscall
         \\  jmp *%%r12                 # Jump to POSIX program's _start
     );

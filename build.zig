@@ -1106,6 +1106,7 @@ const touch_bin = b.addExecutable(.{
                 .{ .name = "malloc-test", .src = "cmd/malloc-test/main.c" },
                 .{ .name = "thread-test", .src = "cmd/thread-test/main.c" },
                 .{ .name = "pthread-mutex", .src = "cmd/pthread-mutex/main.c" },
+                .{ .name = "fork-test", .src = "cmd/fork-test/main.c" },
             };
 
             for (posix_programs, 0..) |prog, idx| {

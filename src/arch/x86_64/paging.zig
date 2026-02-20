@@ -216,6 +216,76 @@ pub fn createAddressSpace() ?*PageTable {
     return new_pml4;
 }
 
+/// Deep-copy the entire user-half address space (PML4 entries 1-255) for fork.
+/// Entry 0 (identity map) is handled by createAddressSpace(). The kernel half
+/// (entries 256-511) is shared. Each 4KB user page is fully copied (no COW).
+pub fn deepCopyAddressSpace(src_pml4: *PageTable) ?*PageTable {
+    // Create base address space (kernel half + identity map deep-copy)
+    const new_pml4 = createAddressSpace() orelse return null;
+
+    // Walk PML4 entries 1-255 (user half, excluding entry 0 identity map)
+    for (1..256) |pml4_idx| {
+        if (src_pml4.entries[pml4_idx] & Flags.PRESENT == 0) continue;
+        const src_pdpt: *PageTable = tablePtr(src_pml4.entries[pml4_idx] & ADDR_MASK);
+
+        const new_pdpt_page = pmm.allocPage() orelse return null;
+        const new_pdpt: *PageTable = tablePtr(new_pdpt_page);
+        new_pdpt.zero();
+
+        for (0..512) |pdpt_idx| {
+            if (src_pdpt.entries[pdpt_idx] & Flags.PRESENT == 0) continue;
+            if (src_pdpt.entries[pdpt_idx] & Flags.HUGE_PAGE != 0) {
+                // 1GB huge page — copy entry as-is (shared, part of identity map)
+                new_pdpt.entries[pdpt_idx] = src_pdpt.entries[pdpt_idx];
+                continue;
+            }
+            const src_pd: *PageTable = tablePtr(src_pdpt.entries[pdpt_idx] & ADDR_MASK);
+
+            const new_pd_page = pmm.allocPage() orelse return null;
+            const new_pd: *PageTable = tablePtr(new_pd_page);
+            new_pd.zero();
+
+            for (0..512) |pd_idx| {
+                if (src_pd.entries[pd_idx] & Flags.PRESENT == 0) continue;
+                if (src_pd.entries[pd_idx] & Flags.HUGE_PAGE != 0) {
+                    // 2MB huge page — copy entry as-is (identity map region)
+                    new_pd.entries[pd_idx] = src_pd.entries[pd_idx];
+                    continue;
+                }
+                const src_pt: *PageTable = tablePtr(src_pd.entries[pd_idx] & ADDR_MASK);
+
+                const new_pt_page = pmm.allocPage() orelse return null;
+                const new_pt: *PageTable = tablePtr(new_pt_page);
+                new_pt.zero();
+
+                for (0..512) |pt_idx| {
+                    if (src_pt.entries[pt_idx] & Flags.PRESENT == 0) continue;
+                    if (src_pt.entries[pt_idx] & Flags.USER == 0) continue; // skip non-user pages
+
+                    const src_phys = src_pt.entries[pt_idx] & ADDR_MASK;
+                    const new_page = pmm.allocPage() orelse return null;
+
+                    // Copy 4KB page content
+                    const src_ptr: [*]const u8 = physPtr(src_phys);
+                    const dst_ptr: [*]u8 = physPtr(new_page);
+                    @memcpy(dst_ptr[0..mem.PAGE_SIZE], src_ptr[0..mem.PAGE_SIZE]);
+
+                    // Preserve flags, point to new physical page
+                    new_pt.entries[pt_idx] = new_page | (src_pt.entries[pt_idx] & ~ADDR_MASK);
+                }
+
+                new_pd.entries[pd_idx] = new_pt_page | (src_pd.entries[pd_idx] & ~ADDR_MASK);
+            }
+
+            new_pdpt.entries[pdpt_idx] = new_pd_page | (src_pdpt.entries[pdpt_idx] & ~ADDR_MASK);
+        }
+
+        new_pml4.entries[pml4_idx] = new_pdpt_page | (src_pml4.entries[pml4_idx] & ~ADDR_MASK);
+    }
+
+    return new_pml4;
+}
+
 /// Map a single 4KB page in the given address space.
 pub fn mapPage(pml4: *PageTable, virt: u64, phys: u64, flags: u64) ?void {
     const pml4_idx = (virt >> 39) & 0x1FF;

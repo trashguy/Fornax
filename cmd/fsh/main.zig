@@ -888,7 +888,7 @@ fn runExternal(name: []const u8, args: []const []const u8) void {
     const pid = runExternalWithFds(name, args, &.{});
     if (pid >= 0) {
         const status = fx.wait(@intCast(pid));
-        last_exit_status = @truncate(status);
+        last_exit_status = @truncate((status >> 8) & 0xFF);
     }
 }
 
@@ -1031,7 +1031,7 @@ fn runPipeline(stages: []Stage, n_stages: usize) void {
         if (pids[si] >= 0) {
             const status = fx.wait(@intCast(pids[si]));
             if (si == n_stages - 1) {
-                last_exit_status = @truncate(status);
+                last_exit_status = @truncate((status >> 8) & 0xFF);
             }
         }
     }
@@ -1272,7 +1272,7 @@ fn executeLine(tokens: []const []const u8) void {
 
         if (pid >= 0) {
             const status = fx.wait(@intCast(pid));
-            last_exit_status = @truncate(status);
+            last_exit_status = @truncate((status >> 8) & 0xFF);
         }
 
         // Close redirect fds AFTER wait — closing before wait races with

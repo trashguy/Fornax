@@ -7,7 +7,7 @@
 .set ARGV_BASE, 0x7FFFFFEFF000
 .set AUXV_BASE, 0x7FFFFFEFE000
 .set SYS_RFORK, 11
-.set RFNAMEG, 0x01
+.set RFNAMEG, 0x08
 
 .text
 .global _start

@@ -75,7 +75,7 @@ pub fn exit(status: u8) noreturn {
 }
 
 pub fn wait(pid: u32) u64 {
-    return syscall1(.wait, pid);
+    return syscall2(.wait, pid, 0);
 }
 
 pub fn open(path: []const u8) i32 {
@@ -266,7 +266,14 @@ pub fn futex(addr: u64, op: u64, val: u64, timeout: u64) u64 {
     return syscall4(.futex, addr, op, val, timeout);
 }
 
-pub const RFNAMEG: u64 = 0x01;
+pub const RFNAMEG: u64 = 0x08;
+
+// rfork flags (Plan 9)
+pub const RFPROC: u64 = 0x01; // create new process
+pub const RFFDG: u64 = 0x02; // copy fd table to child
+pub const RFCFDG: u64 = 0x04; // child gets clean fd table
+pub const RFMEM: u64 = 0x10; // share memory with parent
+pub const RFNOWAIT: u64 = 0x20; // child auto-reaps (no wait needed)
 
 /// Build a serialized argv block: [argc: u32][total_len: u32][str0\0str1\0...]
 pub fn buildArgvBlock(buf: []u8, args: []const []const u8) ?[]const u8 {

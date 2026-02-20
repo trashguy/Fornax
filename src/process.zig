@@ -75,7 +75,7 @@ const RET_SLOT: usize = switch (@import("builtin").cpu.arch) {
 
 pub const MAX_PROCESSES = 128;
 pub const MAX_FDS = 32;
-const KERNEL_STACK_PAGES = 4; // 8 KB kernel stack per process
+pub const KERNEL_STACK_PAGES = 4; // 8 KB kernel stack per process
 pub const USER_STACK_PAGES = 64; // 256 KB user stack per process
 
 pub const ProcessState = enum {
@@ -403,7 +403,7 @@ pub const Process = struct {
 
 var processes: [MAX_PROCESSES]Process = undefined;
 var initialized: bool = false;
-var next_pid: u32 = 1;
+pub var next_pid: u32 = 1;
 
 /// Spinlock guarding process table allocation (next_pid, state transitions).
 pub var table_lock: SpinLock = .{};
@@ -659,7 +659,7 @@ pub fn getByPid(pid: u32) ?*Process {
 }
 
 /// Pick the online core with the shortest run queue.
-fn leastLoadedCore() u8 {
+pub fn leastLoadedCore() u8 {
     var best: u8 = 0;
     var best_len: u32 = percpu.percpu_array[0].run_queue.len;
     var i: u8 = 1;

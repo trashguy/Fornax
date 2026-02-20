@@ -52,8 +52,13 @@ typedef unsigned long      size_t;
 #define FX_O_DIR    0x01
 #define FX_O_APPEND 0x02
 
-/* rfork flags */
-#define RFNAMEG 0x01
+/* rfork flags (Plan 9) */
+#define RFPROC   0x01
+#define RFFDG    0x02
+#define RFCFDG   0x04
+#define RFNAMEG  0x08
+#define RFMEM    0x10
+#define RFNOWAIT 0x20
 
 /* wstat masks */
 #define WSTAT_MODE 0x01

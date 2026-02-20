@@ -142,8 +142,8 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         .stat => sysStat(arg0, arg1),
         .remove => sysRemove(arg0, arg1),
         .seek => sysSeek(arg0, arg1, arg2),
-        .exec => sysExec(arg0, arg1),
-        .wait => sysWait(arg0),
+        .exec => sysExec(arg0, arg1, arg2),
+        .wait => sysWait(arg0, arg1),
         .spawn => sysSpawn(arg0, arg1, arg2, arg3, arg4),
         .brk => sysBrk(arg0),
         .pipe => sysPipe(arg0),
@@ -153,7 +153,7 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         .sysinfo => sysSysinfo(arg0),
         .sleep => sysSleep(arg0),
         .shutdown => sysShutdown(arg0),
-        .getpid => sysGetpid(),
+        .getpid => sysGetpid(arg0),
         .rename => sysRename(arg0, arg1, arg2, arg3),
         .truncate => sysTruncate(arg0, arg1),
         .wstat => sysWstat(arg0, arg1, arg2, arg3, arg4),
@@ -405,8 +405,10 @@ fn sysExit(status: u64) noreturn {
                 if (parent.waiting_for_pid) |wait_pid| {
                     // Parent is waiting for us specifically, or any child (0)
                     if (wait_pid == proc.pid or wait_pid == 0) {
-                        // Wake parent with our exit status
-                        parent.syscall_ret = status;
+                        // Wake parent with POSIX-packed status:
+                        // upper 32 bits = child pid, lower 32 bits = (exit_code << 8)
+                        const child_pid: u64 = proc.pid;
+                        parent.syscall_ret = (child_pid << 32) | ((status & 0xFF) << 8);
                         process.markReady(parent);
                         parent.waiting_for_pid = null;
                         // Reaped immediately — go to free
@@ -485,9 +487,13 @@ fn sysBrk(new_brk: u64) u64 {
     return new_brk;
 }
 
-fn sysWait(pid_arg: u64) u64 {
+fn sysWait(pid_arg: u64, flags_arg: u64) u64 {
     const proc = process.getCurrent() orelse return ENOSYS;
     const wait_pid: u32 = @truncate(pid_arg);
+    const wnohang = (flags_arg & 1) != 0;
+
+    // Treat pid==-1 (0xFFFFFFFF truncated) as "any child" like pid==0
+    const effective_pid: u32 = if (wait_pid == 0xFFFFFFFF) 0 else wait_pid;
 
     // Check for an already-exited (zombie) child first
     var found_child = false;
@@ -497,16 +503,18 @@ fn sysWait(pid_arg: u64) u64 {
             if (ppid == proc.pid) {
                 found_child = true;
                 if (p.state == .zombie) {
-                    if (wait_pid == 0 or p.pid == wait_pid) {
+                    if (effective_pid == 0 or p.pid == effective_pid) {
                         // Reap this zombie — free deferred kernel stack
-                        const status: u64 = p.exit_status;
+                        const exit_code: u64 = p.exit_status;
                         if (p.needs_stack_free) {
                             process.freeKernelStack(p);
                             p.needs_stack_free = false;
                         }
                         p.state = .free;
+                        const child_pid: u64 = p.pid;
                         p.parent_pid = null;
-                        return status;
+                        // POSIX-style packed return: upper 32 = child pid, lower 32 = status word
+                        return (child_pid << 32) | ((exit_code & 0xFF) << 8);
                     }
                 }
             }
@@ -514,8 +522,8 @@ fn sysWait(pid_arg: u64) u64 {
     }
 
     // If waiting for a specific child, verify it exists and belongs to us
-    if (wait_pid != 0) {
-        if (process.getByPid(wait_pid)) |child| {
+    if (effective_pid != 0) {
+        if (process.getByPid(effective_pid)) |child| {
             if (child.parent_pid) |ppid| {
                 if (ppid != proc.pid) return EINVAL; // not our child
             } else {
@@ -528,15 +536,18 @@ fn sysWait(pid_arg: u64) u64 {
         return EINVAL; // no children at all
     }
 
+    // WNOHANG: return 0 immediately if no zombie ready
+    if (wnohang) return 0;
+
     // No zombie found — block until a child exits
     proc.state = .blocked;
-    proc.waiting_for_pid = wait_pid;
+    proc.waiting_for_pid = effective_pid;
     klog.debug("[pid=");
     klog.debugDec(proc.pid);
     klog.debug(" blocked in wait");
-    if (wait_pid != 0) {
+    if (effective_pid != 0) {
         klog.debug(" for pid=");
-        klog.debugDec(wait_pid);
+        klog.debugDec(effective_pid);
     }
     klog.debug("]\n");
     process.scheduleNext();
@@ -1548,8 +1559,12 @@ fn sysSeek(fd: u64, offset: u64, whence: u64) u64 {
     return entry_ptr.read_offset;
 }
 
-fn sysGetpid() u64 {
+fn sysGetpid(which: u64) u64 {
     const proc = process.getCurrent() orelse return ENOSYS;
+    if (which == 1) {
+        // getppid
+        return if (proc.parent_pid) |ppid| ppid else 0;
+    }
     return proc.pid;
 }
 
@@ -2069,13 +2084,142 @@ fn sysFutex(addr: u64, op: u64, val: u64, timeout: u64) u64 {
 }
 
 /// SYS 11: rfork — Resource fork (Plan 9 process control).
+/// Copy file descriptor table from parent to child, incrementing pipe refcounts.
+fn copyFdTable(parent: *process.Process, child: *process.Process) void {
+    const pipe_mod = @import("pipe.zig");
+    const fds = process.thread_group.getFdSlice(parent);
+    for (0..process.MAX_FDS) |i| {
+        if (fds[i]) |fentry| {
+            child.fds[i] = fentry;
+            if (fentry.fd_type == .pipe) {
+                if (fentry.pipe_is_read) {
+                    pipe_mod.incrementReaders(fentry.pipe_id);
+                } else {
+                    pipe_mod.incrementWriters(fentry.pipe_id);
+                }
+            }
+        }
+    }
+}
+
 fn sysRfork(flags: u64) u64 {
-    const RFNAMEG_FLAG: u64 = 0x01;
-    if (flags & RFNAMEG_FLAG != 0) {
-        // Namespace is already per-process (by-value clone in sysSpawn),
-        // so RFNAMEG is effectively a no-op.
+    const RFPROC: u64 = 0x01;
+    const RFCFDG: u64 = 0x04;
+    const RFNAMEG: u64 = 0x08;
+    const RFMEM: u64 = 0x10;
+
+    const parent = process.getCurrent() orelse return ENOSYS;
+
+    if (flags & RFPROC != 0) {
+        // --- Create a new process (fork) ---
+
+        // Find a free process slot
+        const child = blk: {
+            process.table_lock.lock();
+            defer process.table_lock.unlock();
+            for (process.getProcessTable()) |*p| {
+                if (p.state == .free) {
+                    p.state = .blocked; // claim slot
+                    break :blk p;
+                }
+            }
+            break :blk null;
+        } orelse return ENOMEM;
+
+        // Free deferred kernel stack from previous incarnation
+        if (child.needs_stack_free) {
+            process.freeKernelStack(child);
+            child.needs_stack_free = false;
+        }
+
+        // Allocate kernel stack
+        var stack_base: u64 = 0;
+        for (0..process.KERNEL_STACK_PAGES) |i| {
+            const page = pmm.allocPage() orelse return ENOMEM;
+            if (i == 0) stack_base = page;
+        }
+        const stack_virt = if (paging.isInitialized()) stack_base + mem.KERNEL_VIRT_BASE else stack_base;
+
+        // Address space: deep-copy or share
+        if (flags & RFMEM != 0) {
+            // Share address space (vfork-like)
+            child.pml4 = parent.pml4;
+        } else {
+            // Full deep copy (fork)
+            child.pml4 = paging.deepCopyAddressSpace(parent.pml4.?) orelse return ENOMEM;
+        }
+
+        // Set up child process state
+        child.pid = @atomicRmw(u32, &process.next_pid, .Add, 1, .monotonic);
+        child.kernel_stack_top = stack_virt + process.KERNEL_STACK_PAGES * mem.PAGE_SIZE;
+        child.user_rip = parent.user_rip;
+        child.user_rsp = parent.user_rsp;
+        child.user_rflags = parent.user_rflags;
+        child.saved_kernel_rsp = 0; // Force IRETQ path (first run)
+        child.syscall_ret = 0; // Child sees 0 from fork
+        child.brk = parent.brk;
+        child.mmap_next = parent.mmap_next;
+        child.fs_base = parent.fs_base;
+        child.uid = parent.uid;
+        child.gid = parent.gid;
+        child.vt = parent.vt;
+        child.parent_pid = parent.pid;
+        child.exit_status = 0;
+        child.waiting_for_pid = null;
+        child.pending_op = .none;
+        child.pending_fd = 0;
+        child.needs_stack_free = false;
+        child.sleep_until = 0;
+        child.pages_used = 0;
+        child.quotas = .{};
+        child.ipc_recv_buf_ptr = 0;
+        child.ipc_pending_msg = null;
+        child.thread_group = null;
+        child.ctid_ptr = 0;
+        child.ipc_msg = ipc.Message.init(.t_open);
+
+        // File descriptor table
+        if (flags & RFCFDG != 0) {
+            // Clean fd table
+            child.fds = [_]?process.FdEntry{null} ** process.MAX_FDS;
+        } else {
+            // Copy fd table (default, or RFFDG explicitly)
+            copyFdTable(parent, child);
+        }
+
+        // Namespace
+        if (flags & RFNAMEG != 0) {
+            namespace.getRootNamespace().cloneInto(&child.ns);
+        } else {
+            parent.getNs().cloneInto(&child.ns);
+        }
+
+        // Assign to least-loaded core
+        child.assigned_core = process.leastLoadedCore();
+        child.core_affinity = -1;
+        child.cores_ran_on = 0;
+
+        // Mark ready — child will be scheduled
+        process.markReady(child);
+
+        klog.debug("[rfork: parent=");
+        klog.debugDec(parent.pid);
+        klog.debug(" child=");
+        klog.debugDec(child.pid);
+        klog.debug(" flags=");
+        klog.debugHex(flags);
+        klog.debug("]\n");
+
+        // Parent gets child pid
+        return child.pid;
+    }
+
+    // No RFPROC — modify current process
+    if (flags & RFNAMEG != 0) {
+        // Namespace isolation (existing behavior)
         return 0;
     }
+
     klog.warn("syscall: rfork unimplemented flags=");
     klog.warnDec(flags);
     klog.warn("\n");
@@ -2258,7 +2402,7 @@ fn deliverToUserBuf(msg: *const ipc.Message, user_buf_ptr: u64) void {
     }
 }
 
-fn sysExec(elf_ptr: u64, elf_len: u64) u64 {
+fn sysExec(elf_ptr: u64, elf_len: u64, argv_ptr: u64) u64 {
     const proc = process.getCurrent() orelse return ENOSYS;
 
     // Validate pointer not in kernel space
@@ -2294,11 +2438,110 @@ fn sysExec(elf_ptr: u64, elf_len: u64) u64 {
         };
     }
 
+    // Handle argv if provided (wire format from parent's old address space)
+    if (argv_ptr != 0 and argv_ptr < 0x0000_8000_0000_0000) {
+        const wire: [*]const u8 = @ptrFromInt(argv_ptr);
+        const wire_argc = @as(u32, wire[0]) |
+            (@as(u32, wire[1]) << 8) |
+            (@as(u32, wire[2]) << 16) |
+            (@as(u32, wire[3]) << 24);
+        const wire_total = @as(u32, wire[4]) |
+            (@as(u32, wire[5]) << 8) |
+            (@as(u32, wire[6]) << 16) |
+            (@as(u32, wire[7]) << 24);
+
+        if (wire_argc > 0 and wire_argc <= 64 and wire_total > 0 and wire_total <= 3000) {
+            const header_size: usize = 8 + @as(usize, wire_argc) * 8;
+            const total_size = header_size + wire_total;
+
+            if (total_size <= argv_layout_buf.len) {
+                @memset(argv_layout_buf[0..total_size], 0);
+
+                // Write argc as u64
+                const argc64: u64 = wire_argc;
+                argv_layout_buf[0] = @truncate(argc64);
+                argv_layout_buf[1] = @truncate(argc64 >> 8);
+                argv_layout_buf[2] = @truncate(argc64 >> 16);
+                argv_layout_buf[3] = @truncate(argc64 >> 24);
+                argv_layout_buf[4] = @truncate(argc64 >> 32);
+                argv_layout_buf[5] = @truncate(argc64 >> 40);
+                argv_layout_buf[6] = @truncate(argc64 >> 48);
+                argv_layout_buf[7] = @truncate(argc64 >> 56);
+
+                // Copy string data from wire format
+                const strings_start: usize = header_size;
+                @memcpy(argv_layout_buf[strings_start..][0..wire_total], wire[8..][0..wire_total]);
+
+                // Build pointer array
+                var str_offset: usize = 0;
+                var arg_i: usize = 0;
+                while (arg_i < wire_argc and str_offset < wire_total) {
+                    const str_vaddr: u64 = mem.ARGV_BASE + strings_start + str_offset;
+                    const ptr_offset = 8 + arg_i * 8;
+                    argv_layout_buf[ptr_offset] = @truncate(str_vaddr);
+                    argv_layout_buf[ptr_offset + 1] = @truncate(str_vaddr >> 8);
+                    argv_layout_buf[ptr_offset + 2] = @truncate(str_vaddr >> 16);
+                    argv_layout_buf[ptr_offset + 3] = @truncate(str_vaddr >> 24);
+                    argv_layout_buf[ptr_offset + 4] = @truncate(str_vaddr >> 32);
+                    argv_layout_buf[ptr_offset + 5] = @truncate(str_vaddr >> 40);
+                    argv_layout_buf[ptr_offset + 6] = @truncate(str_vaddr >> 48);
+                    argv_layout_buf[ptr_offset + 7] = @truncate(str_vaddr >> 56);
+
+                    while (str_offset < wire_total and argv_layout_buf[strings_start + str_offset] != 0) {
+                        str_offset += 1;
+                    }
+                    str_offset += 1;
+                    arg_i += 1;
+                }
+
+                _ = writeToChildMem(new_pml4, mem.ARGV_BASE, argv_layout_buf[0..total_size]);
+            }
+        }
+    } else {
+        // No argv: write argc=0 at ARGV_BASE
+        @memset(argv_layout_buf[0..8], 0);
+        _ = writeToChildMem(new_pml4, mem.ARGV_BASE, argv_layout_buf[0..8]);
+    }
+
+    // Write auxv for POSIX/musl programs
+    {
+        const AUXV_BASE: u64 = mem.ARGV_BASE - mem.PAGE_SIZE;
+        const auxv_page = pmm.allocPage() orelse {
+            proc.state = .dead;
+            process.scheduleNext();
+        };
+        const auxv_phys_ptr: [*]u8 = paging.physPtr(auxv_page);
+        @memset(auxv_phys_ptr[0..mem.PAGE_SIZE], 0);
+        paging.mapPage(new_pml4, AUXV_BASE, auxv_page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
+            proc.state = .dead;
+            process.scheduleNext();
+        };
+
+        var auxv_buf: [96]u8 = @splat(0);
+        var off: usize = 0;
+        writeU64LE(auxv_buf[off..][0..8], 3); off += 8; // AT_PHDR
+        writeU64LE(auxv_buf[off..][0..8], load_result.phdr_vaddr); off += 8;
+        writeU64LE(auxv_buf[off..][0..8], 5); off += 8; // AT_PHNUM
+        writeU64LE(auxv_buf[off..][0..8], load_result.phnum); off += 8;
+        writeU64LE(auxv_buf[off..][0..8], 4); off += 8; // AT_PHENT
+        writeU64LE(auxv_buf[off..][0..8], load_result.phentsize); off += 8;
+        writeU64LE(auxv_buf[off..][0..8], 9); off += 8; // AT_ENTRY
+        writeU64LE(auxv_buf[off..][0..8], load_result.entry_point); off += 8;
+        writeU64LE(auxv_buf[off..][0..8], 6); off += 8; // AT_PAGESZ
+        writeU64LE(auxv_buf[off..][0..8], mem.PAGE_SIZE); off += 8;
+        writeU64LE(auxv_buf[off..][0..8], 0); off += 8; // AT_NULL
+        writeU64LE(auxv_buf[off..][0..8], 0); off += 8;
+        _ = writeToChildMem(new_pml4, AUXV_BASE, auxv_buf[0..off]);
+    }
+
     // === Point of no return: swap to new address space ===
-    // Old PML4 + user pages leaked (cleanup is future work)
+    // Old PML4 + user pages freed
+    if (proc.pml4) |old_pml4| {
+        paging.freeAddressSpace(old_pml4);
+    }
     proc.pml4 = new_pml4;
     proc.user_rip = load_result.entry_point;
-    proc.user_rsp = mem.USER_STACK_INIT;
+    proc.user_rsp = mem.ARGV_BASE - 8;
     proc.user_rflags = switch (@import("builtin").cpu.arch) {
         .riscv64 => @import("arch/riscv64/cpu.zig").SSTATUS_SPIE | @import("arch/riscv64/cpu.zig").SSTATUS_SUM,
         else => 0x202, // IF=1
@@ -2307,6 +2550,7 @@ fn sysExec(elf_ptr: u64, elf_len: u64) u64 {
     proc.pages_used = 0;
     proc.saved_kernel_rsp = 0; // Force IRETQ path in switchTo
     proc.syscall_ret = 0;
+    proc.mmap_next = 0x0000_4000_0000_0000;
 
     // Clear IPC state (old user buffers are gone)
     proc.ipc_pending_msg = null;
