@@ -1,6 +1,6 @@
 .PHONY: all x86_64 aarch64 riscv64 run run-x86_64 run-smp run-aarch64 run-riscv64 disk disk-x86_64 disk-aarch64 clean clean-disk help
 .PHONY: release release-x86_64 release-aarch64 release-riscv64 run-release disk-img disk-format
-.PHONY: run-posix run-posix-release
+.PHONY: run-posix run-posix-release run-tcc
 .PHONY: run-dev run-dev-posix
 
 all: x86_64 aarch64
@@ -43,6 +43,10 @@ run-posix:
 
 run-posix-release:
 	zig build x86_64 -Doptimize=ReleaseSafe -Dposix=true
+	./scripts/run-x86_64.sh
+
+run-tcc:
+	zig build x86_64 -Dposix=true -Dtcc=true
 	./scripts/run-x86_64.sh
 
 run-dev:
@@ -97,6 +101,7 @@ help:
 	@echo "  make run-release     Run x86_64 in QEMU (ReleaseSafe kernel)"
 	@echo "  make run-aarch64     Run aarch64 in QEMU"
 	@echo "  make run-riscv64     Run riscv64 in QEMU"
+	@echo "  make run-tcc         Run x86_64 with POSIX + TCC compiler"
 	@echo "  make run-posix       Run x86_64 with C/POSIX realm support"
 	@echo "  make run-posix-release  Run x86_64 with POSIX (ReleaseSafe kernel)"
 	@echo "  make run-dev         Run x86_64 with 8 cores and 8GB RAM"

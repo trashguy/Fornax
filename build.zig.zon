@@ -14,5 +14,10 @@
             .hash = "N-V-__8AAB0gNQAtOCaRIfjFXtrGNrdtTXq5QfQ4TsUCOCUO",
             .lazy = true,
         },
+        .tcc = .{
+            .url = "https://github.com/TinyCC/tinycc/archive/4597a9621e70a337b241d424f4ab4729cb75b426.tar.gz",
+            .hash = "N-V-__8AABn_QQCbGtT3cv8EOQGM7nIyJ4swuCXLJuT_xHYB",
+            .lazy = true,
+        },
     },
 }

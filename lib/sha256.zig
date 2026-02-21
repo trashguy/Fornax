@@ -129,7 +129,7 @@ pub fn hexDigest(digest: *const [32]u8, out: *[64]u8) void {
 }
 
 fn rotr(x: u32, comptime n: u5) u32 {
-    return (x >> n) | (x << (32 - n));
+    return (x >> n) | (x << @as(u5, 32 - @as(u6, n)));
 }
 
 fn compress(state: *[8]u32, block: *const [64]u8) void {

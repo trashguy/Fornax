@@ -5,6 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const cluster = b.option(bool, "cluster", "Enable clustering support (gossip discovery, remote namespaces, scheduler)") orelse false;
     const posix = b.option(bool, "posix", "Enable C/POSIX realm support") orelse false;
+    const tcc_enabled = b.option(bool, "tcc", "Build TCC C compiler (requires -Dposix=true)") orelse false;
     const user_strip = b.option(bool, "strip", "Strip debug info from userspace binaries") orelse
         (optimize != .Debug); // strip by default on release builds
 
@@ -40,6 +41,15 @@ pub fn build(b: *std.Build) void {
         .name = "mkgpt",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/mkgpt.zig"),
+            .target = b.graph.host,
+        }),
+    });
+
+    // ── Host tool: fay-build ─────────────────────────────────────
+    const fay_build = b.addExecutable(.{
+        .name = "fay-build",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/fay-build.zig"),
             .target = b.graph.host,
         }),
     });
@@ -753,6 +763,20 @@ const touch_bin = b.addExecutable(.{
     });
     tar_bin.image_base = user_image_base;
 
+    const fay_bin = b.addExecutable(.{
+        .name = "fay",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/fay/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    fay_bin.image_base = user_image_base;
+
     const fxfs_bin = b.addExecutable(.{
         .name = "fxfs",
         .root_module = b.createModule(.{
@@ -786,6 +810,7 @@ const touch_bin = b.addExecutable(.{
     // which runs before musl's __libc_start_main. No separate loader needed.
     var hello_c_bin: ?*std.Build.Step.Compile = null;
     var posix_disk_programs: [4]?*std.Build.Step.Compile = .{ null, null, null, null };
+    var tcc_bin: ?*std.Build.Step.Compile = null;
 
     if (posix) {
 
@@ -1149,6 +1174,113 @@ const touch_bin = b.addExecutable(.{
                     posix_disk_programs[idx] = exe;
                 }
             }
+
+            // ── TCC: Tiny C Compiler (gated behind -Dtcc=true) ──────
+            if (tcc_enabled) {
+                if (b.lazyDependency("tcc", .{})) |tcc_dep| {
+                    const tcc_exe = b.addExecutable(.{
+                        .name = "tcc",
+                        .root_module = b.createModule(.{
+                            .target = x86_64_freestanding,
+                            .optimize = user_optimize,
+                            .strip = if (user_strip) true else null,
+                        }),
+                    });
+
+                    tcc_exe.addAssemblyFile(b.path("lib/posix/crt0.S"));
+                    tcc_exe.addCSourceFile(.{
+                        .file = b.path("lib/posix/shim.c"),
+                        .flags = c_flags,
+                    });
+
+                    // TCC-specific flags: uses musl public includes only (not
+                    // src/include or src/internal which define 'weak' macro
+                    // that conflicts with tcc's struct member .weak)
+                    const tcc_flags = &[_][]const u8{
+                        "-std=c99",
+                        "-ffreestanding",
+                        "-nostdinc",
+                        "-fno-sanitize=all",
+                        "-D_XOPEN_SOURCE=700",
+                        "-D_FORNAX",
+                        "-DONE_SOURCE=1",
+                        "-DTCC_TARGET_X86_64",
+                        "-DCONFIG_TCC_STATIC",
+                        "-DCONFIG_TCCDIR=\"/lib/tcc\"",
+                        "-DCONFIG_TCC_SYSINCLUDEPATHS=\"{B}/include\"",
+                        "-DCONFIG_TCC_LIBPATHS=\"{B}\"",
+                        "-DCONFIG_TCC_CRTPREFIX=\"{B}\"",
+                        "-DCONFIG_TCC_ELFINTERP=\"\"",
+                        "-DCONFIG_SYSROOT=\"\"",
+                        "-DCONFIG_USR_INCLUDE=\"\"",
+                        "-DCONFIG_LDDIR=\"lib\"",
+                        "-DTCC_VERSION=\"0.9.28rc\"",
+                        "-DCONFIG_TCC_CROSSPREFIX=\"\"",
+                        "-DCONFIG_TCC_PREDEFS=0",
+                        "-Wno-unused-function",
+                        "-Wno-unused-variable",
+                        "-Wno-sign-compare",
+                        "-Wno-implicit-function-declaration",
+                        "-Wno-int-conversion",
+                        "-Wno-incompatible-pointer-types",
+                        "-Wno-bitwise-op-parentheses",
+                        "-Wno-shift-op-parentheses",
+                        "-Wno-parentheses",
+                        "-Wno-string-plus-int",
+                        b.fmt("-I{s}", .{b.path("lib/tcc").getPath(b)}),
+                        b.fmt("-I{s}", .{tcc_dep.path("").getPath(b)}),
+                        b.fmt("-I{s}", .{b.path("lib/posix/overlay").getPath(b)}),
+                        b.fmt("-I{s}", .{musl_dep.path("arch/x86_64").getPath(b)}),
+                        b.fmt("-I{s}", .{musl_dep.path("arch/generic").getPath(b)}),
+                        b.fmt("-I{s}", .{musl_dep.path("include").getPath(b)}),
+                    };
+
+                    tcc_exe.addCSourceFile(.{
+                        .file = tcc_dep.path("tcc.c"),
+                        .flags = tcc_flags,
+                    });
+
+                    // Musl sources (same as other POSIX programs)
+                    for (musl_sources) |src| {
+                        tcc_exe.addCSourceFile(.{
+                            .file = musl_dep.path(src),
+                            .flags = c_flags,
+                        });
+                    }
+
+                    // Fornax stubs for functions TCC references but Fornax
+                    // doesn't support (sem_*, signal, tccrun, etc.)
+                    tcc_exe.addCSourceFile(.{
+                        .file = b.path("lib/tcc/fornax_stubs.c"),
+                        .flags = c_flags,
+                    });
+
+                    // Additional musl sources needed by tcc
+                    const tcc_extra_musl: []const []const u8 = &.{
+                        "src/env/getenv.c",
+                        "src/misc/realpath.c",
+                        "src/unistd/unlink.c",
+                        "src/unistd/rmdir.c",
+                        "src/string/strpbrk.c",
+                        "src/stdio/remove.c",
+                        "src/stdlib/qsort_nr.c",
+                        "src/math/ldexpl.c",
+                    };
+                    for (tcc_extra_musl) |src| {
+                        tcc_exe.addCSourceFile(.{
+                            .file = musl_dep.path(src),
+                            .flags = c_flags,
+                        });
+                    }
+
+                    // setjmp/longjmp assembly (tcc uses setjmp for error recovery)
+                    tcc_exe.addAssemblyFile(musl_dep.path("src/setjmp/x86_64/setjmp.s"));
+                    tcc_exe.addAssemblyFile(musl_dep.path("src/setjmp/x86_64/longjmp.s"));
+
+                    tcc_exe.image_base = user_image_base;
+                    tcc_bin = tcc_exe;
+                }
+            }
         }
     }
 
@@ -1204,6 +1336,7 @@ const touch_bin = b.addExecutable(.{
         login_bin, id_bin, whoami_bin, adduser_bin, su_bin,
         unzip_bin,
         tar_bin,
+        fay_bin,
     };
     for (disk_programs) |prog| {
         const install = b.addInstallArtifact(prog, .{
@@ -1226,6 +1359,44 @@ const touch_bin = b.addExecutable(.{
             });
             x86_initrd.step.dependOn(&install.step);
         }
+    }
+
+    // Install TCC binary, headers, and licenses to rootfs (if enabled)
+    if (tcc_bin) |tcc_exe| {
+        const tcc_install = b.addInstallArtifact(tcc_exe, .{
+            .dest_dir = .{ .override = .{ .custom = "rootfs/bin" } },
+        });
+        x86_initrd.step.dependOn(&tcc_install.step);
+
+        // Install tcc runtime headers to /lib/tcc/include/
+        if (b.lazyDependency("tcc", .{})) |tcc_dep| {
+            const tcc_headers: []const []const u8 = &.{
+                "include/float.h",
+                "include/stdalign.h",
+                "include/stdarg.h",
+                "include/stdatomic.h",
+                "include/stdbool.h",
+                "include/stddef.h",
+                "include/stdnoreturn.h",
+                "include/tccdefs.h",
+                "include/tgmath.h",
+                "include/varargs.h",
+            };
+            for (tcc_headers) |hdr| {
+                const hdr_install = b.addInstallFile(tcc_dep.path(hdr), b.fmt("rootfs/lib/tcc/{s}", .{hdr}));
+                x86_initrd.step.dependOn(&hdr_install.step);
+            }
+        }
+
+        // Install fornax.h for native Fornax syscall access
+        const fornax_h_install = b.addInstallFile(b.path("lib/c/fornax.h"), "rootfs/lib/tcc/include/fornax.h");
+        x86_initrd.step.dependOn(&fornax_h_install.step);
+
+        // Install license files
+        const tcc_lic = b.addInstallFile(b.path("LICENSES/tcc"), "rootfs/lib/legal/tcc/COPYING");
+        x86_initrd.step.dependOn(&tcc_lic.step);
+        const musl_lic = b.addInstallFile(b.path("LICENSES/musl"), "rootfs/lib/legal/musl/COPYING");
+        x86_initrd.step.dependOn(&musl_lic.step);
     }
 
     // ── aarch64 UEFI kernel ─────────────────────────────────────────
@@ -1340,13 +1511,14 @@ const touch_bin = b.addExecutable(.{
         .{ "su", "cmd/su/main.zig" },
         .{ "unzip", "cmd/unzip/main.zig" },
         .{ "tar", "cmd/tar/main.zig" },
+        .{ "fay", "cmd/fay/main.zig" },
         .{ "fxfs", "srv/fxfs/main.zig" },
         .{ "partfs", "srv/partfs/main.zig" },
     };
 
     // Build riscv64 initrd programs (init, partfs, fxfs)
     var rv_initrd_bins: [3]*std.Build.Step.Compile = undefined;
-    var rv_disk_bin_buf: [48]*std.Build.Step.Compile = undefined;
+    var rv_disk_bin_buf: [50]*std.Build.Step.Compile = undefined;
     var rv_disk_bin_count: usize = 0;
 
     inline for (rv_user_programs) |prog_info| {
@@ -1395,6 +1567,10 @@ const touch_bin = b.addExecutable(.{
     const mkgpt_install = b.addInstallArtifact(mkgpt, .{});
     const mkgpt_step = b.step("mkgpt", "Build mkgpt partition tool");
     mkgpt_step.dependOn(&mkgpt_install.step);
+
+    const fay_build_install = b.addInstallArtifact(fay_build, .{});
+    const fay_build_step = b.step("fay-build", "Build fay-build package builder");
+    fay_build_step.dependOn(&fay_build_install.step);
 
     const x86_step = b.step("x86_64", "Build x86_64 UEFI kernel");
     x86_step.dependOn(&x86_install.step);

@@ -190,13 +190,13 @@ Shell enhancement:
 | 1001b | JSON parser (`lib/json.zig`) | **Done** |
 | 1001c | SHA-256 (`lib/sha256.zig`) | **Done** |
 | 1001d | HTTP/1.1 client (`lib/http.zig`) | **Done** |
-| 1001e | `fay` core: local install/remove/list (from `.tar.gz` on disk) | — |
-| 1001f | `fay sync` + remote repo fetch via HTTP | — |
-| 1001g | Dependency resolution + `fay install` with auto-deps | — |
-| 1001h | `fay upgrade` + Arch-style version comparison | — |
-| 1001i | Cross-compile tcc, include in disk image | — |
-| 1001j | `fay-build` host tool (reads FAYBUILD, cross-compiles, packages .tar.gz) | — |
-| 1001k | `build-essential` package (ships Zig binary for on-device use) | — |
+| 1001e | `fay` core: local install/remove/list (from `.tar.gz` on disk) | **Done** |
+| 1001f | `fay sync` + remote repo fetch via HTTP | **Done** |
+| 1001g | Dependency resolution + `fay install` with auto-deps | **Done** |
+| 1001h | `fay upgrade` + Arch-style version comparison | **Done** |
+| 1001i | Cross-compile tcc, include in disk image | **Done** |
+| 1001j | `fay-build` host tool (reads FAYBUILD, cross-compiles, packages .tar.gz) | **Done** |
+| 1001k | `build-essential` package (ships Zig binary for on-device use) | Deferred |
 | 1001l | fsh `for` loop for build scripts | **Done** |
 
 ## Depends On
