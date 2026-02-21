@@ -73,8 +73,8 @@ disk-aarch64: aarch64
 
 disk-img:
 	@if [ ! -f fornax-disk.img ]; then \
-		echo "Creating blank 64 MB disk image..."; \
-		dd if=/dev/zero of=fornax-disk.img bs=1M count=64 status=none; \
+		echo "Creating blank 8 GB disk image..."; \
+		dd if=/dev/zero of=fornax-disk.img bs=1M count=8192 status=none; \
 	fi
 
 disk-format: disk-img x86_64

@@ -27,8 +27,8 @@ echo "==> Building mkgpt + mkfxfs..."
 
 # Always recreate disk with fresh binaries
 rm -f "$DISK_IMG"
-echo "==> Creating 64 MB disk image..."
-dd if=/dev/zero of="$DISK_IMG" bs=1M count=64 status=none
+echo "==> Creating 8 GB disk image..."
+dd if=/dev/zero of="$DISK_IMG" bs=1M count=8192 status=none
 
 # Create rootfs staging directories
 mkdir -p "$ROOTFS_DIR/etc" "$ROOTFS_DIR/tmp" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/dev" "$ROOTFS_DIR/net" "$ROOTFS_DIR/home"

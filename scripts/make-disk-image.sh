@@ -6,7 +6,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 ARCH="${1:-x86_64}"
 IMAGE_NAME="fornax-${ARCH}.img"
-IMAGE_SIZE=64 # MB
+IMAGE_SIZE=8192 # MB (8 GB)
 
 case "$ARCH" in
     x86_64)
