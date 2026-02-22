@@ -249,6 +249,10 @@ var scratch_phys: u64 = 0;
 
 var initialized = false;
 
+pub fn isInitialized() bool {
+    return initialized;
+}
+
 // ── MMIO Helpers ────────────────────────────────────────────────────
 
 fn mmioRead32(addr: u64) u32 {

@@ -108,6 +108,12 @@ pub fn handleException(frame: *idt.ExceptionFrame) void {
 
     // IRQ dispatch (vectors 32-47)
     if (frame.vector >= 32 and frame.vector < 48) {
+        // Increment per-core interrupt counter
+        {
+            const percpu = @import("../../percpu.zig");
+            const core_id = percpu.getCoreId();
+            percpu.percpu_array[core_id].interrupts += 1;
+        }
         const irq: u8 = @intCast(frame.vector - 32);
         var handled = false;
 

@@ -82,6 +82,61 @@ fn isAlive(pid: i32) bool {
     return true;
 }
 
+/// Spawn netd: userspace network server at /net.
+fn spawnNetd() void {
+    // Create IPC channel pair
+    const pair = fx.ipc_pair();
+    if (pair.err < 0) {
+        out.puts("init: failed to create IPC pair for netd\n");
+        return;
+    }
+
+    // Open /dev/ether0 for raw frame access
+    const ether_fd = fx.open("/dev/ether0");
+    if (ether_fd < 0) {
+        out.puts("init: /dev/ether0 not available, skipping netd\n");
+        _ = fx.close(pair.server_fd);
+        _ = fx.close(pair.client_fd);
+        return;
+    }
+
+    // Load netd binary
+    const netd_elf = loadBin("netd") orelse {
+        out.puts("init: failed to load /bin/netd, skipping\n");
+        _ = fx.close(pair.server_fd);
+        _ = fx.close(pair.client_fd);
+        _ = fx.close(ether_fd);
+        return;
+    };
+
+    // Spawn with fd mappings: server_fd→3, ether_fd→4
+    const mappings = [_]fx.FdMapping{
+        .{ .parent_fd = @intCast(pair.server_fd), .child_fd = 3 },
+        .{ .parent_fd = @intCast(ether_fd), .child_fd = 4 },
+    };
+    const pid = fx.spawn(netd_elf, &mappings, null);
+    if (pid < 0) {
+        out.puts("init: failed to spawn netd\n");
+        _ = fx.close(pair.server_fd);
+        _ = fx.close(pair.client_fd);
+        _ = fx.close(ether_fd);
+        return;
+    }
+
+    // Mount client end at /net
+    const rc = fx.mount(pair.client_fd, "/net/", 0);
+    if (rc < 0) {
+        out.puts("init: failed to mount netd at /net\n");
+    } else {
+        out.puts("init: netd mounted at /net\n");
+    }
+
+    // Close init's copies (channel stays alive via child + namespace mount)
+    _ = fx.close(pair.server_fd);
+    _ = fx.close(pair.client_fd);
+    _ = fx.close(ether_fd);
+}
+
 export fn _start() noreturn {
     out.puts("init: started\n");
 
@@ -97,6 +152,9 @@ export fn _start() noreturn {
         _ = fx.wstat(shadow_fd, 0o600, 0, 0, fx.WSTAT_MODE);
         _ = fx.close(shadow_fd);
     }
+
+    // Spawn netd (userspace network server)
+    spawnNetd();
 
     // Load login once
     const elf_data = loadBin("login") orelse {

@@ -3,9 +3,14 @@
 /// Minimal TCP implementation with connection state machine, retransmission,
 /// and ring buffers. Supports connect, listen, send, and receive.
 ///
-/// SMP: Global tcp_lock guards connections[], next_ephemeral_port, and
-/// seq_counter. All public API functions acquire the lock. Internal helpers
-/// are called from within locked contexts and must not re-acquire.
+/// SMP locking model:
+///   alloc_lock (global) — protects conn_hash[], in_use flags,
+///     next_ephemeral_port, seq_counter. Acquired for alloc/free/hash ops.
+///   conn.lock (per-connection) — protects all connection fields (state,
+///     buffers, waiters, sequence numbers). Acquired for send/recv/segment.
+///
+/// Lock ordering: conn.lock → alloc_lock (never reversed).
+/// handlePacket: alloc_lock (lookup) → release → conn.lock (never nested).
 const ipv4 = @import("ipv4.zig");
 const klog = @import("../klog.zig");
 const timer = @import("../timer.zig");
@@ -13,7 +18,7 @@ const process = @import("../process.zig");
 const SpinLock = @import("../spinlock.zig").SpinLock;
 
 const HEADER_SIZE = 20; // no options
-const MAX_CONNECTIONS = 16;
+pub const MAX_CONNECTIONS = 256;
 const RX_BUF_SIZE = 16384;
 const TX_BUF_SIZE = 4096;
 const DEFAULT_MSS: u16 = 1460;
@@ -45,8 +50,16 @@ pub const TcpState = enum(u8) {
 
 const MAX_WAITERS = 4;
 
+/// Hash table sentinel — 0xFF means end-of-chain. Valid indices are 0..254.
+const HASH_EMPTY: u8 = 0xFF;
+const HASH_BUCKETS = 256;
+
 pub const Connection = struct {
+    // Per-connection lock (hot field, first cache line)
+    lock: SpinLock,
+    in_use: bool,
     state: TcpState,
+    hash_next: u8, // chaining for hash table (HASH_EMPTY = end)
     local_port: u16,
     remote_port: u16,
     local_ip: [4]u8,
@@ -74,16 +87,20 @@ pub const Connection = struct {
     listen_waiters: [MAX_WAITERS]?u16,
     // Listener parent index (for connections spawned by accept)
     parent_idx: u8,
-    in_use: bool,
 };
 
-/// Connections array — must be in BSS to avoid bloating .data
+/// Connections array — must be in BSS to avoid bloating .data (~5.8 MB)
 var connections: [MAX_CONNECTIONS]Connection linksection(".bss") = undefined;
 var next_ephemeral_port: u16 = 49152;
 var seq_counter: u32 = 1000;
 
-/// Global TCP lock — protects connections[], next_ephemeral_port, seq_counter.
-var tcp_lock: SpinLock = .{};
+/// Global alloc lock — protects conn_hash[], in_use flags,
+/// next_ephemeral_port, seq_counter.
+var alloc_lock: SpinLock = .{};
+
+/// Hash table for O(1) established-connection demux (chained).
+/// Listeners are NOT in the hash table (linear scan, few listeners).
+var conn_hash: [HASH_BUCKETS]u8 = [_]u8{HASH_EMPTY} ** HASH_BUCKETS;
 
 // Forward-declare the net module for sending
 const net = @import("../net.zig");
@@ -92,50 +109,116 @@ const no_waiters = [_]?u16{null} ** MAX_WAITERS;
 
 pub fn init() void {
     for (&connections) |*c| {
-        c.* = emptyConn();
+        resetConn(c);
+    }
+    for (&conn_hash) |*h| {
+        h.* = HASH_EMPTY;
     }
 }
 
-fn emptyConn() Connection {
-    return Connection{
-        .state = .closed,
-        .local_port = 0,
-        .remote_port = 0,
-        .local_ip = .{ 0, 0, 0, 0 },
-        .remote_ip = .{ 0, 0, 0, 0 },
-        .snd_una = 0,
-        .snd_nxt = 0,
-        .rcv_nxt = 0,
-        .snd_wnd = DEFAULT_WINDOW,
-        .mss = DEFAULT_MSS,
-        .rx_buf = undefined,
-        .rx_head = 0,
-        .rx_count = 0,
-        .tx_buf = undefined,
-        .tx_len = 0,
-        .retransmit_tick = 0,
-        .retransmit_count = 0,
-        .rto = INITIAL_RTO,
-        .read_waiters = no_waiters,
-        .connect_waiters = no_waiters,
-        .listen_waiters = no_waiters,
-        .parent_idx = 0xFF,
-        .in_use = false,
-    };
+/// Reset a connection slot to empty state. Preserves lock integrity.
+fn resetConn(c: *Connection) void {
+    c.lock = .{};
+    c.in_use = false;
+    c.state = .closed;
+    c.hash_next = HASH_EMPTY;
+    c.local_port = 0;
+    c.remote_port = 0;
+    c.local_ip = .{ 0, 0, 0, 0 };
+    c.remote_ip = .{ 0, 0, 0, 0 };
+    c.snd_una = 0;
+    c.snd_nxt = 0;
+    c.rcv_nxt = 0;
+    c.snd_wnd = DEFAULT_WINDOW;
+    c.mss = DEFAULT_MSS;
+    // rx_buf/tx_buf left undefined (BSS)
+    c.rx_head = 0;
+    c.rx_count = 0;
+    c.tx_len = 0;
+    c.retransmit_tick = 0;
+    c.retransmit_count = 0;
+    c.rto = INITIAL_RTO;
+    c.read_waiters = no_waiters;
+    c.connect_waiters = no_waiters;
+    c.listen_waiters = no_waiters;
+    c.parent_idx = 0xFF;
 }
+
+// ── Hash table helpers ──────────────────────────────────────────────
+// Caller must hold alloc_lock.
+
+fn connHashFn(local_port: u16, remote_port: u16, remote_ip: [4]u8) u8 {
+    // FNV-1a 32-bit on the 8-byte key
+    var h: u32 = 2166136261;
+    h ^= local_port;
+    h *%= 16777619;
+    h ^= remote_port;
+    h *%= 16777619;
+    h ^= @as(u32, remote_ip[0]) | @as(u32, remote_ip[1]) << 8 |
+        @as(u32, remote_ip[2]) << 16 | @as(u32, remote_ip[3]) << 24;
+    h *%= 16777619;
+    return @truncate(h); // mod 256 via truncation
+}
+
+/// Prepend connection idx to its hash bucket chain. Caller holds alloc_lock.
+fn hashInsert(idx: u8) void {
+    const c = &connections[idx];
+    const bucket = connHashFn(c.local_port, c.remote_port, c.remote_ip);
+    c.hash_next = conn_hash[bucket];
+    conn_hash[bucket] = idx;
+}
+
+/// Remove connection idx from its hash bucket chain. Caller holds alloc_lock.
+fn hashRemove(idx: u8) void {
+    const c = &connections[idx];
+    const bucket = connHashFn(c.local_port, c.remote_port, c.remote_ip);
+    if (conn_hash[bucket] == idx) {
+        conn_hash[bucket] = c.hash_next;
+    } else {
+        var prev = conn_hash[bucket];
+        while (prev != HASH_EMPTY) {
+            if (connections[prev].hash_next == idx) {
+                connections[prev].hash_next = c.hash_next;
+                break;
+            }
+            prev = connections[prev].hash_next;
+        }
+    }
+    c.hash_next = HASH_EMPTY;
+}
+
+/// Look up established connection by 4-tuple. Caller holds alloc_lock.
+/// Returns connection index or null.
+fn hashLookup(local_port: u16, remote_port: u16, remote_ip: [4]u8) ?u8 {
+    const bucket = connHashFn(local_port, remote_port, remote_ip);
+    var idx = conn_hash[bucket];
+    while (idx != HASH_EMPTY) {
+        const c = &connections[idx];
+        if (c.in_use and c.local_port == local_port and
+            c.remote_port == remote_port and
+            ipv4.ipEqual(c.remote_ip, remote_ip))
+        {
+            return idx;
+        }
+        idx = c.hash_next;
+    }
+    return null;
+}
+
+// ── Public API ──────────────────────────────────────────────────────
 
 /// Allocate a new TCP connection slot.
 pub fn alloc() ?u8 {
-    tcp_lock.lock();
-    defer tcp_lock.unlock();
+    alloc_lock.lock();
+    defer alloc_lock.unlock();
     return allocLocked();
 }
 
-/// Internal alloc — caller must hold tcp_lock.
+/// Internal alloc — caller must hold alloc_lock.
 fn allocLocked() ?u8 {
     for (&connections, 0..) |*c, i| {
         if (!c.in_use) {
-            c.* = emptyConn();
+            resetConn(c);
             c.in_use = true;
             c.local_port = allocEphemeralPort();
             c.local_ip = net.getIp();
@@ -148,41 +231,45 @@ fn allocLocked() ?u8 {
 /// Get connection state for status queries.
 pub fn getState(idx: u8) ?TcpState {
     if (idx >= MAX_CONNECTIONS) return null;
-    tcp_lock.lock();
-    defer tcp_lock.unlock();
-    if (!connections[idx].in_use) return null;
-    return connections[idx].state;
+    const c = &connections[idx];
+    c.lock.lock();
+    defer c.lock.unlock();
+    if (!c.in_use) return null;
+    return c.state;
 }
 
 /// Get connection's local port and IP.
 pub fn getLocal(idx: u8) ?struct { ip: [4]u8, port: u16 } {
     if (idx >= MAX_CONNECTIONS) return null;
-    tcp_lock.lock();
-    defer tcp_lock.unlock();
-    if (!connections[idx].in_use) return null;
-    return .{ .ip = connections[idx].local_ip, .port = connections[idx].local_port };
+    const c = &connections[idx];
+    c.lock.lock();
+    defer c.lock.unlock();
+    if (!c.in_use) return null;
+    return .{ .ip = c.local_ip, .port = c.local_port };
 }
 
 /// Get connection's remote port and IP.
 pub fn getRemote(idx: u8) ?struct { ip: [4]u8, port: u16 } {
     if (idx >= MAX_CONNECTIONS) return null;
-    tcp_lock.lock();
-    defer tcp_lock.unlock();
-    if (!connections[idx].in_use) return null;
-    return .{ .ip = connections[idx].remote_ip, .port = connections[idx].remote_port };
+    const c = &connections[idx];
+    c.lock.lock();
+    defer c.lock.unlock();
+    if (!c.in_use) return null;
+    return .{ .ip = c.remote_ip, .port = c.remote_port };
 }
 
 /// Initiate a TCP connection (active open).
+/// Lock order: conn.lock → alloc_lock (for hash insert).
 pub fn connect(idx: u8, ip: [4]u8, port: u16) bool {
     if (idx >= MAX_CONNECTIONS) return false;
-    tcp_lock.lock();
-    defer tcp_lock.unlock();
     const c = &connections[idx];
+    c.lock.lock();
+    defer c.lock.unlock();
     if (!c.in_use or c.state != .closed) return false;
 
     c.remote_ip = ip;
     c.remote_port = port;
-    c.snd_una = nextSeq();
+    c.snd_una = nextSeqLocked();
     c.snd_nxt = c.snd_una;
 
     // Send SYN
@@ -191,6 +278,11 @@ pub fn connect(idx: u8, ip: [4]u8, port: u16) bool {
     c.state = .syn_sent;
     c.retransmit_tick = timer.getTicks();
     c.retransmit_count = 0;
+
+    // Insert into hash table
+    alloc_lock.lock();
+    hashInsert(idx);
+    alloc_lock.unlock();
 
     klog.debug("tcp: SYN sent to ");
     net.printIpDebug(ip);
@@ -201,11 +293,12 @@ pub fn connect(idx: u8, ip: [4]u8, port: u16) bool {
 }
 
 /// Set up a listening socket (passive open).
+/// Listeners are NOT in the hash table.
 pub fn announce(idx: u8, port: u16) bool {
     if (idx >= MAX_CONNECTIONS) return false;
-    tcp_lock.lock();
-    defer tcp_lock.unlock();
     const c = &connections[idx];
+    c.lock.lock();
+    defer c.lock.unlock();
     if (!c.in_use or c.state != .closed) return false;
 
     c.local_port = port;
@@ -220,9 +313,9 @@ pub fn announce(idx: u8, port: u16) bool {
 /// Queue data for transmission on an established connection.
 pub fn sendData(idx: u8, data: []const u8) u16 {
     if (idx >= MAX_CONNECTIONS) return 0;
-    tcp_lock.lock();
-    defer tcp_lock.unlock();
     const c = &connections[idx];
+    c.lock.lock();
+    defer c.lock.unlock();
     if (c.state != .established and c.state != .close_wait) return 0;
 
     const available = TX_BUF_SIZE - c.tx_len;
@@ -241,9 +334,9 @@ pub fn sendData(idx: u8, data: []const u8) u16 {
 /// Read received data from the connection's rx ring buffer.
 pub fn recvData(idx: u8, buf: []u8) u16 {
     if (idx >= MAX_CONNECTIONS) return 0;
-    tcp_lock.lock();
-    defer tcp_lock.unlock();
     const c = &connections[idx];
+    c.lock.lock();
+    defer c.lock.unlock();
     if (c.rx_count == 0) return 0;
 
     const old_count = c.rx_count;
@@ -272,78 +365,87 @@ pub fn recvData(idx: u8, buf: []u8) u16 {
 /// Check if connection has data available to read.
 pub fn hasData(idx: u8) bool {
     if (idx >= MAX_CONNECTIONS) return false;
-    tcp_lock.lock();
-    defer tcp_lock.unlock();
+    const c = &connections[idx];
+    c.lock.lock();
+    defer c.lock.unlock();
     return connections[idx].rx_count > 0;
 }
 
 /// Check if connection is in a state where no more data will arrive (EOF).
 pub fn isEof(idx: u8) bool {
     if (idx >= MAX_CONNECTIONS) return true;
-    tcp_lock.lock();
-    defer tcp_lock.unlock();
     const c = &connections[idx];
+    c.lock.lock();
+    defer c.lock.unlock();
     return c.state == .close_wait or c.state == .closing or
         c.state == .last_ack or c.state == .time_wait or c.state == .closed;
 }
 
 /// Initiate a graceful close (send FIN).
+/// Lock order: conn.lock → alloc_lock (for freeConn).
 pub fn startClose(idx: u8) void {
     if (idx >= MAX_CONNECTIONS) return;
-    tcp_lock.lock();
-    defer tcp_lock.unlock();
     const c = &connections[idx];
+    c.lock.lock();
 
     switch (c.state) {
         .established => {
             sendFin(c);
             c.state = .fin_wait_1;
+            c.lock.unlock();
         },
         .close_wait => {
             sendFin(c);
             c.state = .last_ack;
+            c.lock.unlock();
         },
         .syn_sent, .syn_received => {
             // Abort — wake blocked waiters before freeing
             wakeAllWaiters(&c.connect_waiters, true);
             wakeAllWaiters(&c.read_waiters, true);
             sendRst(c);
-            freeConn(c);
+            freeConn(c, idx); // releases conn.lock
         },
         .listen => {
             // Wake blocked accept waiters before freeing
             wakeAllWaiters(&c.listen_waiters, true);
-            freeConn(c);
+            freeConn(c, idx); // releases conn.lock
         },
-        else => {},
+        else => {
+            c.lock.unlock();
+        },
     }
 }
 
 /// Register a waiter for read (blocks until data arrives).
 pub fn setReadWaiter(idx: u8, pid: u16) void {
     if (idx >= MAX_CONNECTIONS) return;
-    tcp_lock.lock();
-    defer tcp_lock.unlock();
-    addWaiter(&connections[idx].read_waiters, pid);
+    const c = &connections[idx];
+    c.lock.lock();
+    defer c.lock.unlock();
+    addWaiter(&c.read_waiters, pid);
 }
 
 /// Register a waiter for connect completion.
 pub fn setConnectWaiter(idx: u8, pid: u16) void {
     if (idx >= MAX_CONNECTIONS) return;
-    tcp_lock.lock();
-    defer tcp_lock.unlock();
-    addWaiter(&connections[idx].connect_waiters, pid);
+    const c = &connections[idx];
+    c.lock.lock();
+    defer c.lock.unlock();
+    addWaiter(&c.connect_waiters, pid);
 }
 
 /// Register a waiter for listen/accept.
 pub fn setListenWaiter(idx: u8, pid: u16) void {
     if (idx >= MAX_CONNECTIONS) return;
-    tcp_lock.lock();
-    defer tcp_lock.unlock();
-    addWaiter(&connections[idx].listen_waiters, pid);
+    const c = &connections[idx];
+    c.lock.lock();
+    defer c.lock.unlock();
+    addWaiter(&c.listen_waiters, pid);
 }
 
 /// Process an incoming TCP segment.
+/// Lock order: alloc_lock (lookup) → release → conn.lock (process).
 pub fn handlePacket(payload: []const u8, ip_hdr: ipv4.Header) void {
     if (payload.len < HEADER_SIZE) return;
 
@@ -364,7 +466,7 @@ pub fn handlePacket(payload: []const u8, ip_hdr: ipv4.Header) void {
     const flags = payload[13];
     const window = be16(payload[14..16]);
 
-    // Verify TCP checksum
+    // Verify TCP checksum (no locks needed — pure computation)
     if (!verifyChecksum(payload, ip_hdr)) {
         klog.debug("tcp: bad checksum\n");
         return;
@@ -372,29 +474,49 @@ pub fn handlePacket(payload: []const u8, ip_hdr: ipv4.Header) void {
 
     const data = payload[data_offset..];
 
-    tcp_lock.lock();
-    defer tcp_lock.unlock();
+    // Step 1: Hash lookup for established/in-progress connections
+    alloc_lock.lock();
+    const matched_idx = hashLookup(dst_port, src_port, ip_hdr.src);
+    alloc_lock.unlock();
 
-    // Demux: find matching connection
-    // First try established/in-progress connections
-    for (&connections, 0..) |*c, i| {
-        if (!c.in_use) continue;
-        if (c.state == .listen) continue; // check listeners separately
-        if (c.local_port != dst_port) continue;
-        if (c.remote_port != src_port) continue;
-        if (!ipv4.ipEqual(c.remote_ip, ip_hdr.src)) continue;
-
-        handleSegment(c, @intCast(i), seq_num, ack_num, flags, window, data, ip_hdr);
+    if (matched_idx) |idx| {
+        const c = &connections[idx];
+        c.lock.lock();
+        // Verify connection still matches (race with free/reuse)
+        if (c.in_use and c.local_port == dst_port and
+            c.remote_port == src_port and
+            ipv4.ipEqual(c.remote_ip, ip_hdr.src))
+        {
+            handleSegment(c, idx, seq_num, ack_num, flags, window, data, ip_hdr);
+            // handleSegment may call freeConn which releases lock
+            if (c.lock.isLocked()) c.lock.unlock();
+        } else {
+            c.lock.unlock();
+        }
         return;
     }
 
-    // Try listeners
+    // Step 2: Linear scan for listeners (rare — SYN only)
+    alloc_lock.lock();
+    var listener_idx: ?u8 = null;
     for (&connections, 0..) |*c, i| {
-        if (!c.in_use) continue;
-        if (c.state != .listen) continue;
-        if (c.local_port != dst_port) continue;
+        if (c.in_use and c.state == .listen and c.local_port == dst_port) {
+            listener_idx = @intCast(i);
+            break;
+        }
+    }
+    alloc_lock.unlock();
 
-        handleListenSegment(c, @intCast(i), seq_num, flags, ip_hdr, src_port);
+    if (listener_idx) |lidx| {
+        const listener = &connections[lidx];
+        listener.lock.lock();
+        // Verify still a listener
+        if (listener.in_use and listener.state == .listen and
+            listener.local_port == dst_port)
+        {
+            handleListenSegment(listener, lidx, seq_num, flags, ip_hdr, src_port);
+        }
+        listener.lock.unlock();
         return;
     }
 
@@ -405,12 +527,17 @@ pub fn handlePacket(payload: []const u8, ip_hdr: ipv4.Header) void {
 }
 
 /// Timer tick — check retransmission timers and TIME_WAIT expiry.
+/// Acquires per-connection locks individually.
 pub fn tick(now: u32) void {
-    tcp_lock.lock();
-    defer tcp_lock.unlock();
+    for (&connections, 0..) |*c, i| {
+        // Quick non-locked check to skip unused slots
+        if (!@atomicLoad(bool, &c.in_use, .acquire)) continue;
 
-    for (&connections) |*c| {
-        if (!c.in_use) continue;
+        c.lock.lock();
+        if (!c.in_use) {
+            c.lock.unlock();
+            continue;
+        }
 
         switch (c.state) {
             .syn_sent => {
@@ -418,7 +545,8 @@ pub fn tick(now: u32) void {
                     if (c.retransmit_count >= MAX_RETRIES) {
                         klog.debug("tcp: connect timeout\n");
                         wakeAllWaiters(&c.connect_waiters, true);
-                        freeConn(c);
+                        freeConn(c, @intCast(i)); // releases lock
+                        continue;
                     } else {
                         // Retransmit SYN
                         klog.debug("tcp: retransmit SYN #");
@@ -439,7 +567,8 @@ pub fn tick(now: u32) void {
                             klog.debug("tcp: retransmit timeout\n");
                             wakeAllWaiters(&c.read_waiters, true);
                             sendRst(c);
-                            freeConn(c);
+                            freeConn(c, @intCast(i)); // releases lock
+                            continue;
                         } else {
                             sendDataSegment(c);
                             c.retransmit_count += 1;
@@ -451,7 +580,8 @@ pub fn tick(now: u32) void {
             .fin_wait_1, .last_ack, .closing => {
                 if (now -% c.retransmit_tick >= c.rto) {
                     if (c.retransmit_count >= MAX_RETRIES) {
-                        freeConn(c);
+                        freeConn(c, @intCast(i)); // releases lock
+                        continue;
                     } else {
                         sendFin(c);
                         c.retransmit_count += 1;
@@ -461,20 +591,21 @@ pub fn tick(now: u32) void {
             },
             .time_wait => {
                 if (now -% c.retransmit_tick >= TIME_WAIT_TICKS) {
-                    freeConn(c);
+                    freeConn(c, @intCast(i)); // releases lock
+                    continue;
                 }
             },
             else => {},
         }
+        c.lock.unlock();
     }
 }
 
 // ── Internal helpers ────────────────────────────────────────────────
-// All functions below are called with tcp_lock held.
+// handleSegment and handleEstablished: caller holds conn.lock.
 
 fn handleSegment(c: *Connection, idx: u8, seq: u32, ack: u32, flags: u8, window: u16, data: []const u8, ip_hdr: ipv4.Header) void {
     _ = ip_hdr;
-    _ = idx;
 
     // RST handling — always process
     if (flags & RST != 0) {
@@ -482,7 +613,7 @@ fn handleSegment(c: *Connection, idx: u8, seq: u32, ack: u32, flags: u8, window:
         wakeAllWaiters(&c.connect_waiters, true);
         wakeAllWaiters(&c.read_waiters, true);
         wakeAllWaiters(&c.listen_waiters, true);
-        freeConn(c);
+        freeConn(c, idx); // releases conn.lock
         return;
     }
 
@@ -512,9 +643,12 @@ fn handleSegment(c: *Connection, idx: u8, seq: u32, ack: u32, flags: u8, window:
                 c.retransmit_count = 0;
                 c.rto = INITIAL_RTO;
                 klog.debug("tcp: accept complete\n");
-                // Wake the listener's waiter
+                // Wake the listener's waiter — must lock parent briefly
                 if (c.parent_idx != 0xFF and c.parent_idx < MAX_CONNECTIONS) {
-                    wakeAllWaiters(&connections[c.parent_idx].listen_waiters, false);
+                    const parent = &connections[c.parent_idx];
+                    parent.lock.lock();
+                    wakeAllWaiters(&parent.listen_waiters, false);
+                    parent.lock.unlock();
                 }
             }
         },
@@ -558,7 +692,8 @@ fn handleSegment(c: *Connection, idx: u8, seq: u32, ack: u32, flags: u8, window:
         },
         .last_ack => {
             if (flags & ACK != 0 and ack == c.snd_nxt) {
-                freeConn(c);
+                freeConn(c, idx); // releases conn.lock
+                return;
             }
         },
         .close_wait => {
@@ -658,13 +793,17 @@ fn processAck(c: *Connection, ack: u32, window: u16) void {
     }
 }
 
+/// Handle SYN on a listener. Caller holds listener.lock.
+/// Lock order: listener.lock already held → alloc_lock (for allocLocked + hashInsert).
 fn handleListenSegment(listener: *Connection, listener_idx: u8, seq: u32, flags: u8, ip_hdr: ipv4.Header, src_port: u16) void {
     if (flags & SYN == 0) return; // Only SYN expected on listener
     if (flags & ACK != 0) return; // SYN must not have ACK
     if (flags & RST != 0) return;
 
-    // Allocate a child connection (lock already held)
+    // Allocate a child connection
+    alloc_lock.lock();
     const child_idx = allocLocked() orelse {
+        alloc_lock.unlock();
         klog.debug("tcp: listen: no free connections\n");
         return;
     };
@@ -674,13 +813,17 @@ fn handleListenSegment(listener: *Connection, listener_idx: u8, seq: u32, flags:
     child.remote_ip = ip_hdr.src;
     child.remote_port = src_port;
     child.rcv_nxt = seq +% 1;
-    child.snd_una = nextSeq();
+    child.snd_una = nextSeqLocked();
     child.snd_nxt = child.snd_una +% 1;
     child.state = .syn_received;
     child.parent_idx = listener_idx;
     child.retransmit_tick = timer.getTicks();
+    // Insert child into hash table
+    hashInsert(child_idx);
+    alloc_lock.unlock();
 
-    // Send SYN+ACK
+    // Send SYN+ACK (no lock needed on child — it's not visible to other
+    // cores yet since we just allocated it and it's in syn_received state)
     sendFlags(child, SYN | ACK, child.snd_una);
 
     klog.debug("tcp: SYN+ACK sent to ");
@@ -823,8 +966,40 @@ fn sendTcpPacket(dst_ip: [4]u8, tcp_segment: []const u8) void {
     net.sendIpPacket(dst_ip, ip_buf[0..ip_len]);
 }
 
-fn freeConn(c: *Connection) void {
-    c.* = emptyConn();
+/// Free a connection. Caller holds conn.lock. This function releases it.
+/// Lock order: conn.lock (already held) → alloc_lock (hash remove + mark free).
+fn freeConn(c: *Connection, idx: u8) void {
+    // Remove from hash table and mark free under alloc_lock
+    alloc_lock.lock();
+    hashRemove(idx);
+    c.in_use = false;
+    c.state = .closed;
+    alloc_lock.unlock();
+
+    // Reset remaining fields (safe — no one else can see this slot now)
+    c.hash_next = HASH_EMPTY;
+    c.local_port = 0;
+    c.remote_port = 0;
+    c.local_ip = .{ 0, 0, 0, 0 };
+    c.remote_ip = .{ 0, 0, 0, 0 };
+    c.snd_una = 0;
+    c.snd_nxt = 0;
+    c.rcv_nxt = 0;
+    c.snd_wnd = DEFAULT_WINDOW;
+    c.mss = DEFAULT_MSS;
+    c.rx_head = 0;
+    c.rx_count = 0;
+    c.tx_len = 0;
+    c.retransmit_tick = 0;
+    c.retransmit_count = 0;
+    c.rto = INITIAL_RTO;
+    c.read_waiters = no_waiters;
+    c.connect_waiters = no_waiters;
+    c.listen_waiters = no_waiters;
+    c.parent_idx = 0xFF;
+
+    // Release conn.lock last
+    c.lock.unlock();
 }
 
 // ── Waiter helpers ──────────────────────────────────────────────────
@@ -864,7 +1039,8 @@ fn seqDiff(a: u32, b: u32) i32 {
     return @as(i32, @bitCast(a -% b));
 }
 
-fn nextSeq() u32 {
+/// Generate next ISN. Caller must hold alloc_lock.
+fn nextSeqLocked() u32 {
     seq_counter +%= 64000; // crude ISN generation
     return seq_counter;
 }

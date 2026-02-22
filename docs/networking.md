@@ -1,47 +1,201 @@
 # Networking Stack
 
-Fornax implements networking from bare metal: PCI enumeration, virtio NIC driver, and a protocol stack covering Ethernet, ARP, IPv4, ICMP, and UDP.
+Fornax implements a two-tier networking architecture: a kernel TCP/DNS stack (legacy fallback) and a userspace `netd` server (Plan 9 model). When `netd` is mounted at `/net/`, all network operations route through userspace IPC. Without `netd`, the kernel stack handles `/net/*` paths directly.
 
-## Packet Flow
+## Architecture Overview
 
 ```
-             Incoming                          Outgoing
-                │                                 │
-       virtio_net.poll()                  virtio_net.send()
-                │                                 ^
-                v                                 │
-   ┌────────────────────────┐        ┌────────────────────────┐
-   │  net.handleFrame()     │        │  net.sendIpPacket()    │
-   │  - filter: our MAC or  │        │  - subnet check        │
-   │    broadcast            │        │  - ARP lookup/request  │
-   │  - demux by EtherType  │        │  - Ethernet framing    │
-   └────────┬───────────────┘        └────────────────────────┘
-            │                                     ^
-    ┌───────┴───────┐                             │
-    v               v                     ┌───────┴───────┐
-  0x0806          0x0800                  │               │
-   ARP             IPv4                  IPv4            IPv4
-    │               │                   build()         build()
-    v               v                     ^               ^
- arp.handle     ipv4.parse                │               │
- Packet()        + verify                 │               │
-    │            checksum             icmp.build     udp.build
-    │               │                EchoReply()     Packet()
-    v               v
- ARP reply    ┌─────┴──────┐
- (if for us)  v            v
-            proto=1      proto=17
-             ICMP          UDP
-              │             │
-              v             v
-         icmp.handle   udp.handle
-         Packet()      Packet()
-              │             │
-              v             v
-         echo reply    deliver to
-         (send back)   connection
-                       rx buffer
+ ┌─────────────────────────────────────────────────────────┐
+ │                    User Programs                         │
+ │     curl, dnstest, fsh, etc.                            │
+ │     open("/net/tcp/clone") → read/write /net/tcp/N/data │
+ └──────────────────────┬──────────────────────────────────┘
+                        │ IPC (T_OPEN, T_READ, T_WRITE, T_CLOSE)
+                        │
+ ┌──────────────────────▼──────────────────────────────────┐
+ │              netd (srv/netd/main.zig)                    │
+ │  Serves /net/tcp/*, /net/dns/*, /net/icmp/*, /net/status│
+ │  ┌──────────────┐ ┌──────────┐ ┌─────────────────────┐  │
+ │  │ 4 IPC workers│ │ frame RX │ │ timer (55ms tick)    │  │
+ │  │ (ipc_recv/   │ │ thread   │ │ tcp.tick(), dns      │  │
+ │  │  ipc_reply)  │ │ (ether0  │ │ retry, icmp timeout  │  │
+ │  │              │ │  read)   │ │                      │  │
+ │  └──────────────┘ └──────────┘ └─────────────────────┘  │
+ │                                                          │
+ │  Uses: lib/net/{tcp,arp,dns,icmp,ethernet,ipv4}.zig     │
+ │  Struct-based, no globals — each netd has own state      │
+ └──────────────────────┬──────────────────────────────────┘
+                        │ read/write fd 4
+                        │
+ ┌──────────────────────▼──────────────────────────────────┐
+ │           /dev/ether0 (src/ether.zig)                    │
+ │  Raw Ethernet frame ring buffer (64 × 1518 bytes)        │
+ │  Per-client: separate ring, read waiters, spinlock        │
+ │  Modes: shared (kernel + userspace) or exclusive          │
+ └──────────────────────┬──────────────────────────────────┘
+                        │
+ ┌──────────────────────▼──────────────────────────────────┐
+ │           virtio-net driver (src/virtio_net.zig)         │
+ │           Handles TX/RX DMA rings                        │
+ └─────────────────────────────────────────────────────────┘
 ```
+
+## Spawn Sequence
+
+Init (`cmd/init/main.zig`) spawns netd during boot:
+
+1. `fx.ipc_pair()` — creates IPC channel, returns `{server_fd, client_fd}`
+2. `fx.open("/dev/ether0")` — gets raw Ethernet fd (graceful skip if no NIC)
+3. `loadBin("netd")` — reads `/bin/netd` ELF from fxfs
+4. `fx.spawn(elf, &mappings, null)` — fd mappings: `server_fd→3`, `ether_fd→4`
+5. `fx.mount(client_fd, "/net/", 0)` — mounts netd's IPC channel at `/net/`
+6. Close init's copies of all fds
+
+After this, any process opening `/net/*` gets routed to netd via IPC.
+
+## Kernel `/net/*` Fallback
+
+The kernel (`src/syscall.zig:sysOpen`) intercepts `/net/*` paths for its built-in TCP/DNS stack. A `hasNetMount()` check skips this interception when a userspace server is mounted at `/net/`, letting namespace resolution route to netd instead.
+
+Priority order in `sysOpen`:
+1. `/dev/*` — always kernel-handled (devices)
+2. `/net/*` — kernel TCP/DNS only if no userspace mount
+3. `/proc/*` — always kernel-handled (process info)
+4. Namespace resolution — fxfs, netd, any other mounted servers
+
+## netd Server (`srv/netd/main.zig`)
+
+### Threading Model
+
+| Thread | Role |
+|--------|------|
+| Main + 3 workers | IPC recv/reply loop (`workerLoop`) |
+| Frame RX | Reads `/dev/ether0`, dispatches to TCP/ARP/ICMP/DNS |
+| Timer | 55ms tick loop: `tcp_stack.tick()`, DNS retry, ICMP timeout |
+
+All threads share a single `net_lock: Mutex` protecting the network stack state.
+
+### Handle System
+
+netd uses a handle table (64 entries) to track open files. Each handle has a `HandleKind`:
+
+| Kind | Created by opening | Read returns | Write accepts |
+|------|-------------------|--------------|---------------|
+| `tcp_clone` | `/net/tcp/clone` | connection index N | — |
+| `tcp_ctl` | `/net/tcp/N/ctl` | connection state | `connect IP!port`, `announce !port`, `hangup` |
+| `tcp_data` | `/net/tcp/N/data` | TCP stream data (blocks) | TCP stream data |
+| `tcp_listen` | `/net/tcp/N/listen` | `N` on accept | — |
+| `tcp_local` | `/net/tcp/N/local` | `IP!port` | — |
+| `tcp_remote` | `/net/tcp/N/remote` | `IP!port` | — |
+| `tcp_status` | `/net/tcp/N/status` | connection state text | — |
+| `dns_ctl` | `/net/dns/ctl` | — | `nameserver IP` |
+| `dns_query` | `/net/dns/DOMAIN` | resolved IP | — |
+| `dns_cache` | `/net/dns/cache` | cache dump | — |
+| `icmp_clone` | `/net/icmp/clone` | connection index N | — |
+| `icmp_ctl` | `/net/icmp/N/ctl` | — | `ping IP` |
+| `icmp_data` | `/net/icmp/N/data` | ping reply text (blocks) | — |
+| `net_status` | `/net/status` | MAC/IP/gateway/mask | — |
+
+### Blocking Reads
+
+When a TCP data or ICMP data read finds no data available, the IPC worker polls with `fx.sleep(10ms)` up to 3000 iterations (~30 seconds). Other worker threads continue serving new requests. If data arrives (from frame RX thread), the next poll finds it and replies.
+
+### Path Resolution
+
+netd receives path suffixes via T_OPEN (e.g., `tcp/clone`, `dns/example.com`, `icmp/0/data`). The `handleOpen` function parses these to create the appropriate handle kind.
+
+## `/dev/ether0` — Raw Ethernet Interface
+
+Kernel module: `src/ether.zig`
+
+Provides raw Ethernet frame access for userspace network servers.
+
+| Property | Value |
+|----------|-------|
+| Max clients | 8 |
+| Ring size | 64 frames per client |
+| Max frame | 1518 bytes |
+| BSS per client | ~98 KB |
+
+### Operations
+
+| Operation | Description |
+|-----------|-------------|
+| `open("/dev/ether0")` | Allocate a client slot, get an fd |
+| `read(fd, buf)` | Dequeue next frame from ring (blocks if empty) |
+| `write(fd, frame)` | Send raw Ethernet frame via virtio-net |
+| `write(fd, "exclusive")` | Disable kernel stack processing (netd owns all frames) |
+| `write(fd, "shared")` | Re-enable dual delivery (kernel + userspace) |
+
+When any ether client is active, `net.handleFrame()` copies incoming frames into all client rings. In shared mode (default), the kernel stack also processes frames. In exclusive mode, frames go only to userspace clients.
+
+## Userspace Network Libraries (`lib/net/`)
+
+Struct-based ports of kernel protocol modules. Each instance has independent state — no globals. Designed for per-realm network isolation.
+
+| Library | Struct | Key difference from kernel |
+|---------|--------|---------------------------|
+| `lib/net/tcp.zig` | `TcpStack` | Callback-based: `SendFn`, `GetIpFn`, `GetTicksFn`, `WaiterCallback` |
+| `lib/net/arp.zig` | `ArpTable` | `SendFn` callback for frame TX |
+| `lib/net/dns.zig` | `DnsResolver` | `SendUdpFn` + `GetTimeFn` callbacks, millisecond TTL |
+| `lib/net/icmp.zig` | `IcmpHandler` | `SendIpFn` + `GetTimeFn` callbacks, timeout array return |
+| `lib/net/ethernet.zig` | (pure functions) | Identical to kernel — parse/build are stateless |
+| `lib/net/ipv4.zig` | (pure functions) | Identical to kernel, explicit `ttl`/`packet_id` params |
+
+All re-exported via `lib/root.zig` as `fx.net.tcp`, `fx.net.arp`, etc.
+
+### TcpStack Highlights
+
+- 256 connections (configurable via `max_connections` runtime limit, default 32 in netd)
+- Per-connection spinlock + FNV-1a hash table for O(1) demux
+- ~23 KB per connection (16 KB RX buffer + 4 KB TX buffer + metadata)
+- BSS allocation with `linksection(".bss")` — unused slots don't cost physical memory on demand-paged systems
+
+## SMP TCP Improvements (Kernel Stack)
+
+The kernel TCP stack (`src/net/tcp.zig`) was hardened for SMP:
+
+### Per-Connection Locking
+
+| Lock | Scope | Protects |
+|------|-------|----------|
+| `alloc_lock` (global) | Connection allocation | `conn_hash[]`, `in_use` flags, ephemeral ports |
+| `conn.lock` (per-connection) | Connection state | Buffers, sequence numbers, waiters, state machine |
+
+Lock ordering: `conn.lock` → `alloc_lock` (never reversed). `handlePacket` acquires `alloc_lock` for lookup, releases it, then acquires `conn.lock` — never holds both simultaneously.
+
+### Hash Table Demux
+
+FNV-1a hash on `(local_port, remote_port, remote_ip)` → 256 buckets with chaining via `hash_next: u8` field (0xFF sentinel). Established connections found in O(1). Listeners still use linear scan (rare — SYN-only path).
+
+### Connection Pool
+
+- `MAX_CONNECTIONS = 256` (u8 natural limit)
+- `FdEntry.net_conn: u8` — no changes needed outside tcp.zig
+- BSS cost: ~5.8 MB (256 × 23 KB)
+- `freeConn` preserves lock field (doesn't zero entire struct)
+- `allocLocked` resets all fields on reuse
+
+## IPC Channel Pairs (SYS 39)
+
+`ipc_pair()` creates an IPC channel and returns two fds (server + client) to the calling process. Used by init to set up communication channels for servers like netd.
+
+```
+result = fx.ipc_pair();
+// result.server_fd → pass to server via spawn fd mappings
+// result.client_fd → mount at desired path
+```
+
+This enables userspace servers to be spawned and mounted without kernel involvement beyond the initial channel creation.
+
+## `mount` / `unmount` Syscalls
+
+| Syscall | Args | Description |
+|---------|------|-------------|
+| `SYS 8 mount` | `fd, path_ptr, path_len, flags` | Mount IPC channel fd at path in process namespace |
+| `SYS 10 unmount` | `path_ptr, path_len` | Remove mount point |
+
+Namespace resolution (`src/namespace.zig:resolve`) finds the longest matching mount prefix. A mount at `/net/` (len 5) takes priority over root `/` (len 1).
 
 ## Hardware Layer
 
@@ -53,7 +207,7 @@ Scans PCI bus 0, slots 0-31, reading config space via I/O ports `0xCF8` (address
 
 ### virtio-net Driver (`src/virtio_net.zig`)
 
-Uses the **virtio legacy I/O port interface** (virtio spec 0.9.5), which is simpler than the modern MMIO transport and well-supported by QEMU.
+Uses the **virtio legacy I/O port interface** (virtio spec 0.9.5).
 
 **Device discovery**: Finds vendor `0x1AF4` (Red Hat/Virtio), device `0x1000` (transitional net) or `0x1041` (modern net).
 
@@ -75,21 +229,7 @@ Uses the **virtio legacy I/O port interface** (virtio spec 0.9.5), which is simp
 [Used ring: 4 + 8 * queue_size + 2 bytes]
 ```
 
-The descriptor table holds buffer addresses and lengths. The available ring tells the device which descriptors are ready. The used ring tells the driver which descriptors the device has finished with.
-
-**Frame format**: Every frame is prepended with a 10-byte `VirtioNetHeader` (flags, GSO type/size, checksum offsets). All zeros for basic operation — no checksum offloading, no segmentation.
-
-### Generic virtio (`src/virtio.zig`)
-
-Shared virtio infrastructure used by any virtio device:
-- I/O port read/write helpers (byte-level via `inb`/`outb`)
-- `initDevice()`: Reset, acknowledge, read features
-- `finishInit()`: Negotiate features, set DRIVER_OK
-- `setupQueue()`: Allocate and configure a virtqueue
-- `addBuffer()`: Add a descriptor to the available ring
-- `notify()`: Write queue index to the notify register
-- `pollUsed()`: Check the used ring for completed descriptors
-- `memoryBarrier()`: Architecture-aware fence (`mfence` on x86_64, `dmb sy` on aarch64)
+**Frame format**: Every frame is prepended with a 10-byte `VirtioNetHeader` (flags, GSO type/size, checksum offsets). All zeros for basic operation.
 
 ## Protocol Layers
 
@@ -103,51 +243,13 @@ IEEE 802.3 frame handling.
 - `build()`: Writes a complete frame into a buffer. Returns total length.
 - Constants: `ETHER_ARP` (0x0806), `ETHER_IPV4` (0x0800), `BROADCAST` (FF:FF:FF:FF:FF:FF).
 
-The integration layer (`net.zig`) filters incoming frames: only those addressed to our MAC or to broadcast are processed.
-
 ### ARP (`src/net/arp.zig`)
 
-Address Resolution Protocol — resolves IPv4 addresses to MAC addresses.
-
-**Cache**: 32 entries with round-robin eviction. No TTL (entries persist until evicted). Every ARP packet we receive (request or reply) inserts the sender's IP/MAC into the cache. Existing entries for the same IP are updated in place.
-
-**Inbound flow**:
-1. Validate hardware type (Ethernet), protocol type (IPv4), lengths
-2. Learn sender's IP/MAC (always)
-3. If this is an ARP request for our IP, build and send a unicast reply
-
-**Outbound flow** (triggered by `net.sendIpPacket()`):
-1. Look up destination (or gateway) IP in cache
-2. If found, use the MAC to build the Ethernet frame
-3. If not found, broadcast an ARP request and drop the current packet. The reply will populate the cache for the next attempt.
-
-**ARP packet layout** (28 bytes for Ethernet+IPv4):
-```
-[hw_type 2][proto_type 2][hw_len 1][proto_len 1][operation 2]
-[sender_mac 6][sender_ip 4][target_mac 6][target_ip 4]
-```
+32-entry cache with round-robin eviction. No TTL. Every ARP packet inserts the sender's IP/MAC. ARP requests for our IP get unicast replies.
 
 ### IPv4 (`src/net/ipv4.zig`)
 
-Minimal IPv4: no fragmentation, no options, no routing table.
-
-**Parse**:
-- Validates version (must be 4) and IHL (must be >= 5)
-- Verifies header checksum using RFC 1071 ones-complement sum
-- Extracts payload based on total length field
-
-**Build**:
-- Version/IHL: `0x45` (20-byte header, no options)
-- TTL: 64
-- Flags: Don't Fragment (`0x4000`)
-- Identification: auto-incrementing counter
-- Computes and inserts header checksum
-
-**Routing** (handled by `net.zig`):
-- If `(dst & mask) == (our_ip & mask)`, destination is on the local subnet — use its IP for ARP lookup
-- Otherwise, use the gateway IP for ARP lookup
-
-**Checksum** (RFC 1071): Sum all 16-bit words, fold carries, ones-complement. Used by both IPv4 headers and ICMP.
+Minimal IPv4: no fragmentation, no options, no routing table. TTL 64, Don't Fragment flag. RFC 1071 ones-complement checksum.
 
 **Default config** (QEMU user-mode networking):
 | Field | Value |
@@ -156,53 +258,21 @@ Minimal IPv4: no fragmentation, no options, no routing table.
 | Gateway | 10.0.2.2 |
 | Subnet mask | 255.255.255.0 |
 
+### TCP (`src/net/tcp.zig`)
+
+Full TCP with connection tracking, retransmission, and flow control. 256 connections with per-connection locks and hash table demux (see SMP section above).
+
 ### ICMP (`src/net/icmp.zig`)
 
-Internet Control Message Protocol — echo request/reply (ping).
-
-When an echo request (type 8) arrives:
-1. Verify ICMP checksum
-2. Copy the entire ICMP payload (preserving identifier, sequence number, and data)
-3. Set type to 0 (echo reply), code to 0
-4. Recompute checksum
-5. Build a new IPv4 packet with swapped src/dst addresses
-6. Send back through the Ethernet/ARP path
-
-**Stats tracked**: `echo_requests_rx`, `echo_replies_tx`, `echo_requests_tx`, `echo_replies_rx`.
+Echo request/reply (ping). 4-slot connection pool with timeout tracking.
 
 ### UDP (`src/net/udp.zig`)
 
-User Datagram Protocol — connectionless datagrams with port multiplexing.
+16 connection slots with port multiplexing. Single-datagram receive buffer per connection.
 
-**Connection model**: 16 connection slots. Each slot has:
-- Local port (assigned from ephemeral range 49152+ on alloc, or explicitly bound)
-- Optional remote IP/port (if `connect()` was called, filters inbound datagrams)
-- Single-datagram receive buffer (1500 bytes) — new datagrams overwrite unread ones
+### DNS (`src/net/dns.zig`)
 
-**API**:
-| Function | Description |
-|----------|-------------|
-| `alloc()` | Allocate a connection slot, assign ephemeral port |
-| `bind(idx, port)` | Set a specific local port |
-| `connect(idx, ip, port)` | Filter to a specific remote |
-| `close(idx)` | Release the slot |
-| `recv(idx)` | Read the received datagram (if any) |
-
-**Inbound**: Match by destination port. If the connection is "connected", also filter by remote IP/port. Payload is copied into the connection's receive buffer.
-
-**Outbound**: `net.sendUdp()` builds the UDP header (checksum 0, valid for IPv4), wraps in IPv4, resolves ARP, frames in Ethernet, sends via virtio-net.
-
-**Max payload**: 1472 bytes (1500 MTU - 20 IP - 8 UDP).
-
-## Integration Layer (`src/net.zig`)
-
-Wires all protocol modules to the virtio-net driver:
-
-- `init()`: Reads MAC from virtio-net, sets default IP/gateway/mask, marks initialized
-- `poll()`: Calls `virtio_net.poll()`, filters by destination MAC, dispatches by EtherType
-- `sendIpPacket(dst_ip, packet)`: Determines next-hop (same subnet or gateway), resolves MAC via ARP, wraps in Ethernet, sends
-- `sendUdp(dst_ip, src_port, dst_port, data)`: Convenience function — builds UDP+IP+Ethernet and sends
-- `setIp()`, `setGateway()`, `setSubnetMask()`: Runtime configuration
+Recursive DNS resolver with 16-entry cache. Configurable nameserver. 3-second query timeout with retry.
 
 ## QEMU Setup
 
@@ -217,26 +287,41 @@ QEMU user-mode networking provides a virtual network at `10.0.2.0/24` with:
 - DNS at `10.0.2.3`
 - Fornax configured at `10.0.2.15`
 
-## Future: Plan 9 `/net/` Interface
+## Plan 9 `/net/` Interface
 
-The protocol stack currently runs kernel-side. The plan is to expose it as a userspace file server at `/net/`, following the Plan 9 convention:
+The standard interface for network operations (served by netd):
 
 ```
 /net/
-├── arp                     read = ARP table
-├── ipifc/0/
-│   ├── ctl                 write "add 10.0.0.2/24"
-│   ├── addr                read = current IP
-│   └── stats               read = interface counters
-├── udp/
-│   ├── clone               open -> returns connection number
-│   └── 0/
-│       ├── ctl             write "connect 10.0.0.1!53"
-│       ├── data            read/write datagrams
-│       ├── local           read = "10.0.0.2!12345"
-│       └── remote          read = "10.0.0.1!53"
+├── status              MAC/IP/gateway/mask
+├── tcp/
+│   ├── clone           open → allocate connection, read → N
+│   └── N/
+│       ├── ctl         write: "connect IP!port", "announce !port", "hangup"
+│       ├── data        read/write TCP stream
+│       ├── listen      open+read blocks until connection accepted
+│       ├── local       read: "IP!port"
+│       ├── remote      read: "IP!port"
+│       └── status      read: connection state
+├── dns/
+│   ├── ctl             write: "nameserver IP"
+│   ├── cache           read: cache dump
+│   └── DOMAIN          open+read → resolved IP
 └── icmp/
-    └── stats               read = echo counters
+    ├── clone           open → allocate slot, read → N
+    └── N/
+        ├── ctl         write: "ping IP"
+        └── data        read: ping reply (blocks until reply/timeout)
 ```
 
-No sockets API. To send a UDP packet: open `/net/udp/clone`, write `"connect 10.0.0.1!53"` to the ctl file, write the payload to the data file.
+No sockets API. To make an HTTP request:
+1. `open("/net/tcp/clone")` → read to get connection N
+2. `write("/net/tcp/N/ctl", "connect 93.184.216.34!80")`
+3. `write("/net/tcp/N/data", "GET / HTTP/1.1\r\n...")`
+4. `read("/net/tcp/N/data")` → response
+
+## Future Work
+
+- **Bridge server** (`srv/bridge/main.zig`): Software Ethernet switch + NAT for container networking. Requires container infrastructure.
+- **Per-realm isolation**: Each POSIX realm/container gets its own netd instance with independent state. Tested via `rfork(RFNAMEG)` + per-realm mount.
+- **ctl file expansion**: Runtime TCP tuning (keepalive, MSS, window scaling), routing tables, interface configuration.

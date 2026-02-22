@@ -100,6 +100,12 @@ pub fn poll() void {
 
 /// Process a raw Ethernet frame.
 fn handleFrame(frame: []u8) void {
+    // Deliver raw frame to /dev/ether0 clients before parsing.
+    // If any exclusive client consumed it, skip kernel stack processing.
+    const ether_mod = @import("ether.zig");
+    const exclusive = ether_mod.deliverFrame(frame);
+    if (exclusive) return;
+
     const parsed = ethernet.parse(frame) orelse return;
 
     // Check if frame is for us or broadcast

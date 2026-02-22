@@ -94,9 +94,9 @@ pub const ResourceQuotas = struct {
     cpu_priority: u8 = 128, // 0=lowest, 255=highest
 };
 
-pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, remove, rename, truncate, wstat, console_read, net_read, net_connect, net_listen, dns_query, icmp_read, pipe_read, pipe_write, sleep };
+pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, remove, rename, truncate, wstat, console_read, net_read, net_connect, net_listen, dns_query, icmp_read, pipe_read, pipe_write, sleep, ether_read };
 
-pub const FdType = enum(u8) { ipc, net, pipe, blk, proc, dev_null, dev_zero, dev_random, dev_pci, dev_usb, dev_mouse, dev_cpu };
+pub const FdType = enum(u8) { ipc, net, pipe, blk, proc, dev_null, dev_zero, dev_random, dev_pci, dev_usb, dev_mouse, dev_cpu, dev_ether, dev_sysname, dev_osversion, dev_time, dev_kmesg, dev_reboot, dev_drivers, dev_pid, dev_user, dev_consctl, dev_sysstat };
 
 pub const ProcFdKind = enum(u8) {
     dir,
@@ -146,6 +146,8 @@ pub const FdEntry = struct {
     /// Proc-specific fields (only used when fd_type == .proc)
     proc_kind: ProcFdKind = .dir,
     proc_pid: u32 = 0,
+    /// Ether-specific fields (only used when fd_type == .dev_ether)
+    ether_client: u8 = 0,
 };
 
 pub const Process = struct {
@@ -219,6 +221,8 @@ pub const Process = struct {
     ctid_ptr: u64 = 0,
     /// PID of the client this server thread is currently serving (for IPC reply).
     ipc_serving_client: u32 = 0,
+    /// Process name (basename of executable), for /proc/N/status.
+    name: [16]u8 = .{0} ** 16,
 
     pub fn initFds(self: *Process) void {
         for (&self.fds) |*fd| {
@@ -881,8 +885,11 @@ extern fn resume_user_mode(rip: u64, rsp: u64, flags: u64, ret_val: u64) callcon
 fn switchTo(proc: *Process) noreturn {
     setCurrentInternal(proc);
     proc.state = .running;
+    // Increment per-core context switch counter
+    const core_id = percpu.getCoreId();
+    percpu.percpu_array[core_id].ctx_switches += 1;
     // Track which cores have run this process (for TLB shootdown)
-    const core_bit = @as(u128, 1) << @intCast(percpu.getCoreId());
+    const core_bit = @as(u128, 1) << @intCast(core_id);
     proc.cores_ran_on |= core_bit;
     // Also track in thread group for group-wide TLB shootdown
     if (proc.thread_group) |tg| {
@@ -1116,6 +1123,44 @@ fn switchTo(proc: *Process) noreturn {
         } else {
             // Still full — re-block
             pipe_mod.setWriteWaiter(fd_entry.pipe_id, @intCast(proc.pid));
+            proc.state = .blocked;
+            setCurrentInternal(null);
+            scheduleNext();
+        }
+        proc.ipc_recv_buf_ptr = 0;
+        proc.pending_op = .none;
+        proc.pending_fd = 0;
+    }
+
+    // Ether read delivery — address space is active, so user pointers are valid
+    if (proc.pending_op == .ether_read) {
+        const ether_mod = @import("ether.zig");
+        const fd_entry = proc.getFdEntryPtr(proc.pending_fd) orelse {
+            proc.syscall_ret = 0;
+            proc.pending_op = .none;
+            proc.ipc_recv_buf_ptr = 0;
+            proc.pending_fd = 0;
+            if (proc.saved_kernel_rsp != 0) {
+                const frame: [*]u64 = @ptrFromInt(proc.saved_kernel_rsp);
+                frame[RET_SLOT] = proc.syscall_ret;
+                proc.saved_kernel_rsp = 0;
+                syscall_entry.resume_from_kernel_frame(@intFromPtr(frame));
+            } else {
+                resume_user_mode(proc.user_rip, proc.user_rsp, proc.user_rflags, proc.syscall_ret);
+            }
+        };
+
+        if (ether_mod.hasData(fd_entry.ether_client)) {
+            if (proc.ipc_recv_buf_ptr != 0 and proc.ipc_recv_buf_ptr < 0x0000_8000_0000_0000) {
+                const dest: [*]u8 = @ptrFromInt(proc.ipc_recv_buf_ptr);
+                const buf_size: u16 = @intCast(@min(proc.syscall_ret, ether_mod.MAX_FRAME));
+                proc.syscall_ret = ether_mod.readFrame(fd_entry.ether_client, dest[0..buf_size]);
+            } else {
+                proc.syscall_ret = 0;
+            }
+        } else {
+            // Still no data — re-block
+            ether_mod.setReadWaiter(fd_entry.ether_client, @intCast(proc.pid));
             proc.state = .blocked;
             setCurrentInternal(null);
             scheduleNext();

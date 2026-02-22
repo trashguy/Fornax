@@ -44,6 +44,7 @@ pub const SYS = enum(u64) {
     arch_prctl = 36,
     clone = 37,
     futex = 38,
+    ipc_pair = 39,
 };
 
 const ipc = @import("ipc.zig");
@@ -134,6 +135,33 @@ pub const WSTAT_GID: u32 = 0x4;
 pub fn wstat(fd: i32, mode: u16, uid: u16, gid: u16, mask: u32) i32 {
     const result = syscall5(.wstat, @bitCast(@as(i64, fd)), mode, uid, gid, mask);
     return @bitCast(@as(u32, @truncate(result)));
+}
+
+/// Mount an IPC channel fd at the given path in the current namespace.
+pub fn mount(fd: i32, path: []const u8, flags: u32) i32 {
+    const result = syscall4(.mount, @bitCast(@as(i64, fd)), @intFromPtr(path.ptr), path.len, flags);
+    return @bitCast(@as(u32, @truncate(result)));
+}
+
+/// Bind (same as mount in Fornax).
+pub fn bind(fd: i32, path: []const u8, flags: u32) i32 {
+    const result = syscall4(.bind, @bitCast(@as(i64, fd)), @intFromPtr(path.ptr), path.len, flags);
+    return @bitCast(@as(u32, @truncate(result)));
+}
+
+/// Unmount a path from the current namespace.
+pub fn unmount(path: []const u8) i32 {
+    const result = syscall2(.unmount, @intFromPtr(path.ptr), path.len);
+    return @bitCast(@as(u32, @truncate(result)));
+}
+
+/// Create an IPC channel pair. Returns { server_fd, client_fd, err }.
+pub fn ipc_pair() struct { server_fd: i32, client_fd: i32, err: i32 } {
+    var result: [2]i32 = undefined;
+    const rc = syscall1(.ipc_pair, @intFromPtr(&result));
+    const err: i32 = @bitCast(@as(u32, @truncate(rc)));
+    if (err < 0) return .{ .server_fd = -1, .client_fd = -1, .err = err };
+    return .{ .server_fd = result[0], .client_fd = result[1], .err = 0 };
 }
 
 pub fn brk(new_brk: u64) u64 {

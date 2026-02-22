@@ -195,6 +195,8 @@ pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize, rsdp: ?[*]const
 
     // Phase 16+100: IP stack + TCP/DNS
     net.init();
+    const ether = @import("ether.zig");
+    ether.init();
 
     // Phase 20: Initrd
     _ = initrd.init(initrd_base, initrd_size);

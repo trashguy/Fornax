@@ -806,6 +806,20 @@ const touch_bin = b.addExecutable(.{
     });
     partfs_bin.image_base = user_image_base;
 
+    const netd_bin = b.addExecutable(.{
+        .name = "netd",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("srv/netd/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    netd_bin.image_base = user_image_base;
+
     // ── POSIX realm support (gated behind -Dposix=true) ─────────────
     // POSIX realm isolation is handled by lib/posix/crt0.S (rfork(RFNAMEG))
     // which runs before musl's __libc_start_main. No separate loader needed.
@@ -1359,6 +1373,7 @@ const touch_bin = b.addExecutable(.{
         unzip_bin,
         tar_bin,
         fay_bin,
+        netd_bin,
     };
     for (disk_programs) |prog| {
         const install = b.addInstallArtifact(prog, .{
@@ -1613,6 +1628,82 @@ const touch_bin = b.addExecutable(.{
     const riscv64_step = b.step("riscv64", "Build riscv64 freestanding kernel");
     riscv64_step.dependOn(&riscv64_install.step);
     riscv64_step.dependOn(&rv_initrd.step);
+
+    // ── Unit tests (host-targeted, no OS dependencies) ──────────────
+    const test_step = b.step("test", "Run unit tests");
+
+    const host = b.graph.host;
+    const test_opt: std.builtin.OptimizeMode = .Debug;
+
+    // Library modules (host-targeted for testing)
+    const mod_fmt = b.createModule(.{ .root_source_file = b.path("lib/fmt.zig"), .target = host, .optimize = test_opt });
+    const mod_str = b.createModule(.{ .root_source_file = b.path("lib/str.zig"), .target = host, .optimize = test_opt });
+    const mod_path = b.createModule(.{ .root_source_file = b.path("lib/path.zig"), .target = host, .optimize = test_opt });
+    const mod_crc32 = b.createModule(.{ .root_source_file = b.path("lib/crc32.zig"), .target = host, .optimize = test_opt });
+    const mod_sha256 = b.createModule(.{ .root_source_file = b.path("lib/sha256.zig"), .target = host, .optimize = test_opt });
+    const mod_json = b.createModule(.{ .root_source_file = b.path("lib/json.zig"), .target = host, .optimize = test_opt });
+    const mod_ethernet = b.createModule(.{ .root_source_file = b.path("lib/net/ethernet.zig"), .target = host, .optimize = test_opt });
+    const mod_ipv4 = b.createModule(.{ .root_source_file = b.path("lib/net/ipv4.zig"), .target = host, .optimize = test_opt });
+    // arp/tcp/dns/icmp use relative @import("ethernet.zig") and @import("ipv4.zig")
+    // — remap those to the shared modules so files don't belong to multiple modules.
+    const mod_arp = b.createModule(.{
+        .root_source_file = b.path("lib/net/arp.zig"),
+        .target = host,
+        .optimize = test_opt,
+        .imports = &.{
+            .{ .name = "ethernet.zig", .module = mod_ethernet },
+            .{ .name = "ipv4.zig", .module = mod_ipv4 },
+        },
+    });
+    const mod_tcp = b.createModule(.{
+        .root_source_file = b.path("lib/net/tcp.zig"),
+        .target = host,
+        .optimize = test_opt,
+        .imports = &.{
+            .{ .name = "ipv4.zig", .module = mod_ipv4 },
+        },
+    });
+    const mod_dns = b.createModule(.{
+        .root_source_file = b.path("lib/net/dns.zig"),
+        .target = host,
+        .optimize = test_opt,
+        .imports = &.{
+            .{ .name = "ipv4.zig", .module = mod_ipv4 },
+        },
+    });
+    const mod_icmp = b.createModule(.{
+        .root_source_file = b.path("lib/net/icmp.zig"),
+        .target = host,
+        .optimize = test_opt,
+        .imports = &.{
+            .{ .name = "ipv4.zig", .module = mod_ipv4 },
+        },
+    });
+
+    const tests = b.addTest(.{
+        .name = "fornax-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/root.zig"),
+            .target = host,
+            .optimize = test_opt,
+            .imports = &.{
+                .{ .name = "fmt", .module = mod_fmt },
+                .{ .name = "str", .module = mod_str },
+                .{ .name = "path", .module = mod_path },
+                .{ .name = "crc32", .module = mod_crc32 },
+                .{ .name = "sha256", .module = mod_sha256 },
+                .{ .name = "json", .module = mod_json },
+                .{ .name = "ethernet", .module = mod_ethernet },
+                .{ .name = "ipv4", .module = mod_ipv4 },
+                .{ .name = "arp", .module = mod_arp },
+                .{ .name = "tcp", .module = mod_tcp },
+                .{ .name = "dns", .module = mod_dns },
+                .{ .name = "icmp", .module = mod_icmp },
+            },
+        }),
+    });
+    const run_tests = b.addRunArtifact(tests);
+    test_step.dependOn(&run_tests.step);
 
     // Default: build both
     b.getInstallStep().dependOn(&x86_install.step);

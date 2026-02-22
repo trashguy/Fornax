@@ -105,6 +105,12 @@ export fn handleExceptionRv(frame_ptr: u64, scause: u64, stval: u64) callconv(.c
 /// a0=scause (with bit 63 set), a1=frame_ptr
 export fn handleInterruptRv(scause: u64, frame_ptr: u64) callconv(.c) void {
     _ = frame_ptr;
+    // Increment per-core interrupt counter
+    {
+        const percpu = @import("../../percpu.zig");
+        const core_id = percpu.getCoreId();
+        percpu.percpu_array[core_id].interrupts += 1;
+    }
     const cause = scause & ~cpu.SCAUSE_INT_BIT;
 
     switch (cause) {

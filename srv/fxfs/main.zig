@@ -1732,7 +1732,13 @@ fn handleRead(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
         pos = ctlAppendDec(&ctl_buf, pos, sb_total_blocks);
         pos = ctlAppendStr(&ctl_buf, pos, "\nFREE=");
         pos = ctlAppendDec(&ctl_buf, pos, sb_free_blocks);
-        pos = ctlAppendStr(&ctl_buf, pos, "\nBSIZE=4096\n");
+        pos = ctlAppendStr(&ctl_buf, pos, "\nBSIZE=4096\nNODES=");
+        pos = ctlAppendDec(&ctl_buf, pos, sb_next_inode);
+        pos = ctlAppendStr(&ctl_buf, pos, "\nGEN=");
+        pos = ctlAppendDec(&ctl_buf, pos, sb_generation);
+        pos = ctlAppendStr(&ctl_buf, pos, "\nDIRTY=");
+        pos = ctlAppendDec(&ctl_buf, pos, if (bitmap_dirty) @as(u64, 1) else 0);
+        pos = ctlAppendStr(&ctl_buf, pos, "\n");
         if (offset >= pos) {
             resp.data_len = 0;
             return;
@@ -2093,6 +2099,28 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
         resp.* = fx.IpcMessage.init(fx.R_ERROR);
         return;
     };
+
+    // Virtual ctl file: handle control commands
+    if (h.inode_nr == 0xFFFF_FFFF_FFFF_FFFF) {
+        resp.* = fx.IpcMessage.init(fx.R_OK);
+        // Parse command from write_data
+        const cmd = if (write_data.len > 0 and write_data[write_data.len - 1] == '\n')
+            write_data[0 .. write_data.len - 1]
+        else
+            write_data;
+        if (cmd.len == 4 and cmd[0] == 's' and cmd[1] == 'y' and cmd[2] == 'n' and cmd[3] == 'c') {
+            // sync: flush bitmap + write superblock
+            if (!flushBitmap() or !writeSuperblock()) {
+                resp.* = fx.IpcMessage.init(fx.R_ERROR);
+            }
+        } else if (cmd.len == 5 and cmd[0] == 'c' and cmd[1] == 'h' and cmd[2] == 'e' and cmd[3] == 'c' and cmd[4] == 'k') {
+            // check: stub for future B-tree consistency check
+            // no-op, returns R_OK
+        } else {
+            resp.* = fx.IpcMessage.init(fx.R_ERROR);
+        }
+        return;
+    }
 
     const inode = readInode(h.inode_nr) orelse {
         resp.* = fx.IpcMessage.init(fx.R_ERROR);

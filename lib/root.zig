@@ -23,6 +23,7 @@ pub const json = @import("json.zig");
 pub const sha256 = @import("sha256.zig");
 pub const http = @import("http.zig");
 pub const thread = @import("thread.zig");
+pub const net = @import("net/root.zig");
 
 // Re-export syscall functions at top level for backward compatibility.
 pub const SYS = syscall.SYS;
@@ -75,6 +76,10 @@ pub const RFFDG = syscall.RFFDG;
 pub const RFCFDG = syscall.RFCFDG;
 pub const RFMEM = syscall.RFMEM;
 pub const RFNOWAIT = syscall.RFNOWAIT;
+pub const mount = syscall.mount;
+pub const unmount = syscall.unmount;
+pub const bind = syscall.bind;
+pub const ipc_pair = syscall.ipc_pair;
 
 // Re-export IPC types at top level.
 pub const IpcMessage = ipc.IpcMessage;

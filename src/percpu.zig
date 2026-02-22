@@ -125,6 +125,10 @@ pub const PerCpu = struct {
     tlb_flush_pending: bool = false,
     /// Set to true once this core is online.
     online: bool = false,
+    /// Per-core statistics counters.
+    ctx_switches: u64 = 0,
+    syscalls: u64 = 0,
+    interrupts: u64 = 0,
 };
 
 /// Array of per-CPU data. Index by core_id.
