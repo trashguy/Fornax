@@ -466,8 +466,8 @@ fn linuxGetrandom(buf_ptr: u64, len: u64) u64 {
     // Fill directly from kernel PRNG (same as /dev/random)
     const dest: [*]u8 = @ptrFromInt(buf_ptr);
     const n = @min(len, 4096);
-    const syscall_mod = @import("syscall.zig");
-    syscall_mod.devRandomFill(dest[0..n]);
+    const devfiles_mod = @import("devfiles.zig");
+    devfiles_mod.devRandomFill(dest[0..n]);
     return n;
 }
 
