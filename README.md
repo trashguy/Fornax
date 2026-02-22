@@ -166,4 +166,4 @@ docs/                        design documentation
 
 ## License
 
-TBD
+[MIT](LICENSE)
