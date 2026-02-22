@@ -4,21 +4,15 @@
 
 | Phase | Description | Depends On |
 |-------|-------------|------------|
-| 150 | Login / getty (Plan 9-style auth) | 24, 100 |
-| 200 | Kernel /proc file tree | 24 |
-| 201 | Implement seek + getpid syscalls | 24 |
+| 130 | VMS-style fault supervisor (backoff, dependencies, health probes, ctl) | 13, 200 |
 | 202 | File management (cp/mv/rmdir/touch) | 24 |
-| 203 | Text processing (grep/head/tail/sed/awk/less) | 24 |
-| 204 | Process & system mgmt (ps/kill/free/df/du/top) | 200 |
-| 205 | Shell enhancements (if/while/test/&&/||) | 24 |
-| 206 | Permission stubs + ip command | 24 |
-| 210 | fe — minimal vi-like text editor | 24 |
+| 207 | envfs — environment variable virtual filesystem | 24 |
 
-## Future: Language Support (1000-series)
+## Future: Package Manager (1001-series)
 
 | Phase | Description | Depends On |
 |-------|-------------|------------|
-| 1000 | C/C++/Go support — freestanding C, minimal libc, musl port, POSIX realms | 17-24 |
+| 1001e-k | fay package manager (sync, install, build, zig compiler) | 1001a-d |
 
 ## Future: Graphics Stack (2000-series)
 
@@ -69,90 +63,53 @@ Build with: `zig build x86_64 -Dviceroy=true`
 
 ```
 Phases 1-24, 100-101 (done)
-         |
-         ├──────────────────────────────────────────────────────────┐
-         v                                                          v
-  Phase 150: login/getty                                    Phase 210: fe editor
-         |
-         ├──────────────────────────────────────────────────────────┐
-         v                                                          v
-  Phase 200: /proc ──────────────────┐           Phases 202, 203, 205, 206
-         |                           v           (independent of each other)
-         |                    Phase 204: ps/kill/free/df/du/top
-         v
-  Phase 201: seek + getpid
-
-
-         Phases 1-24 (done)
-              |
-              ├──────────────┐
-              v              v
-         Ph 1000          Ph 2000    Ph 2002
-         (POSIX           (srv/gpu)  (srv/input)
-          Realms)            |          |
-              |           Ph 2001      |
-              |           (srv/draw)   |
-              |              |         |
-              |              └────┬────┘
-              |                   v
-              |                Ph 2003
-              |                (srv/wm)
-              |                   |
-              |                Ph 2004
-              |                (native GUI apps)
-              |                   |
-              └─────────┬─────────┘
-                        v
-                    Ph 2006 (Wayland bridge)
-                        |
-                    Ph 2007 (Chrome in realm)
-
-       Ph 2005 (GPU accel) is independent,
-       enhances performance but not required
-
-
-  ┌───── only with -Dcluster=true ─────────────┐
-  |                                             |
-  | Phase 3000: Cluster Discovery               |
-  |     |                                       |
-  |     v                                       |
-  | Phase 3001: 9P over TCP                     |
-  |     |                                       |
-  |     v                                       |
-  | Phase 3002: Cluster Scheduler               |
-  |     |                                       |
-  |     v  (-Dviceroy=true)                     |
-  | Ph 3003 (Service Manifests + cmd/deploy)    |
-  |     |                                       |
-  |     ├──────────────────────┐                |
-  |     v                      v                |
-  | Ph 3004 (Health Checks)  Ph 3007 (Secrets)  |
-  |     |                   Ph 3008 (Registry)  |
-  |     ├──────────┐                            |
-  |     v          v                            |
-  | Ph 3005      Ph 3006                        |
-  | (Rolling     (Service                       |
-  |  Updates)     Routing)                      |
-  |     |          |                            |
-  |     └────┬─────┘                            |
-  |          v                                  |
-  |     Ph 3009 (Observability)                 |
-  |                                             |
-  └─────────────────────────────────────────────┘
+├── 150 login/getty (done)
+├── 200 /proc (done) ── 201 seek+getpid (done) ── 204 ps/kill/top (done)
+├── 203 text processing (done)
+├── 205 shell enhancements (done)
+├── 206 permissions (done)
+├── 210 fe editor (done)
+├── 215 virtual consoles (done)
+├── 300-313 fxfs filesystem (done)
+├── 400-405 xHCI USB (done)
+├── A-G SMP (done) ── H-K threads (done)
+├── 1000 POSIX realms (done) ── 1001i TCC (done)
+├── 1001a-d foundation libs (done)
+├── 1002 containers (done)
+├── 3A-3D userspace networking (done)
+│
+├── Next:
+│   ├── 130 VMS supervisor (backoff, deps, health, ctl)
+│   ├── 202 file management
+│   ├── 207 envfs
+│   └── 1001e-k fay package manager
+│
+├── Future: Graphics
+│   ├── 2000 srv/gpu ── 2001 srv/draw ──┐
+│   ├── 2002 srv/input ─────────────────┤
+│   │                                    v
+│   │                              2003 srv/wm ── 2004 native apps
+│   │                                    |
+│   └── 1000 (done) ───────────── 2006 Wayland bridge ── 2007 Chrome
+│
+└── Future: Clustering + Deployment (-Dcluster / -Dviceroy)
+    ├── 3000 gossip discovery
+    ├── 3001 9P remote namespaces
+    ├── 3002 cluster scheduler
+    └── 3003-3009 viceroy (manifests, health, rolling updates, routing,
+                           secrets, registry, observability)
 ```
 
 ## Future Milestones
 
 | # | Goal | Phases | Status |
 |---|------|--------|--------|
-| 11 | Two Fornax nodes discover each other | 3000 | Not started (requires `-Dcluster=true`) |
-| 12 | Mount remote node's namespace | 3001 | Not started (requires `-Dcluster=true`) |
-| 13 | Schedule container across cluster | 3002 | Not started (requires `-Dcluster=true`) |
-| 14 | Compile and run a C program on Fornax | 1000 | Not started |
-| 15 | Framebuffer accessible from userspace srv/gpu | 2000 | Not started |
-| 16 | Native app draws in a window | 2004 | Not started |
-| 17 | Chrome renders in a Fornax window | 2007 | Not started |
-| 18 | `deploy apply` schedules a service across cluster | 3003 | Not started |
-| 19 | Service auto-recovers after crash | 3004 | Not started |
-| 20 | Zero-downtime rolling update | 3005 | Not started |
-| 21 | `deploy top` shows live cluster overview | 3009 | Not started |
+| 17 | Crashed server transparently restarts with client reconnection | 130 | Not started |
+| 18 | `fay install` fetches and installs a package | 1001e-k | Not started |
+| 19 | Framebuffer accessible from userspace srv/gpu | 2000 | Not started |
+| 20 | Native app draws in a window | 2004 | Not started |
+| 21 | Chrome renders in a Fornax window | 2007 | Not started |
+| 22 | Two Fornax nodes discover each other | 3000 | Not started (requires `-Dcluster=true`) |
+| 23 | Mount remote node's namespace | 3001 | Not started (requires `-Dcluster=true`) |
+| 24 | `deploy apply` schedules a service across cluster | 3003 | Not started (requires `-Dviceroy=true`) |
+| 25 | Zero-downtime rolling update | 3005 | Not started (requires `-Dviceroy=true`) |
