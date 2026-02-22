@@ -118,6 +118,21 @@ echo "==> Formatting partition 1 with fxfs (offset=$PART_OFFSET, size=$PART_SIZE
 
 echo "==> Launching QEMU..."
 
+# Check for --nvme/--ahci flags: use alternate block device instead of virtio-blk
+BLK_ARGS="-drive file=$DISK_IMG,format=raw,if=none,id=blk0 -device virtio-blk-pci,drive=blk0"
+EXTRA_ARGS=()
+for arg in "$@"; do
+    if [ "$arg" = "--nvme" ]; then
+        BLK_ARGS="-drive file=$DISK_IMG,format=raw,if=none,id=nvme0 -device nvme,drive=nvme0,serial=FORNAX001"
+        echo "==> Using NVMe block device"
+    elif [ "$arg" = "--ahci" ]; then
+        BLK_ARGS="-drive file=$DISK_IMG,format=raw,if=none,id=sata0 -device ich9-ahci,id=ahci -device ide-hd,drive=sata0,bus=ahci.0"
+        echo "==> Using AHCI/SATA block device"
+    else
+        EXTRA_ARGS+=("$arg")
+    fi
+done
+
 exec qemu-system-x86_64 \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF" \
     -drive format=raw,file=fat:rw:"$PROJECT_DIR/zig-out/esp" \
@@ -129,6 +144,5 @@ exec qemu-system-x86_64 \
     -device nec-usb-xhci,id=xhci \
     -device usb-kbd,bus=xhci.0 \
     -device usb-mouse,bus=xhci.0 \
-    -drive file="$DISK_IMG",format=raw,if=none,id=blk0 \
-    -device virtio-blk-pci,drive=blk0 \
-    "$@"
+    $BLK_ARGS \
+    "${EXTRA_ARGS[@]}"

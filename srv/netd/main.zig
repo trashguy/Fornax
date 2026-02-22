@@ -214,6 +214,10 @@ fn handleOpen(msg: *fx.IpcMessage, reply: *fx.IpcMessage) void {
         path = path[4..];
     }
 
+    // Lock protects handle table + tcp_stack/icmp_handler alloc
+    net_lock.lock();
+    defer net_lock.unlock();
+
     // Parse the path
     if (eql(path, "status")) {
         if (allocHandle(.net_status, 0)) |h| {
@@ -868,9 +872,11 @@ fn handleWrite(msg: *fx.IpcMessage, reply: *fx.IpcMessage) void {
                     if (parseIp(parts[0])) |ip| {
                         if (parseIp(parts[1])) |mask| {
                             if (parseIp(parts[2])) |gw| {
+                                net_lock.lock();
                                 our_ip = ip;
                                 subnet_mask = mask;
                                 gateway_ip = gw;
+                                net_lock.unlock();
                                 reply.* = fx.IpcMessage.init(fx.R_OK);
                                 setReplyLen(reply, @intCast(data.len));
                                 return;
@@ -892,20 +898,24 @@ fn handleWrite(msg: *fx.IpcMessage, reply: *fx.IpcMessage) void {
 
 fn handleClose(msg: *fx.IpcMessage, reply: *fx.IpcMessage) void {
     const handle_id = readU32LE(msg.data[0..4]);
+
+    net_lock.lock();
+
     const h = getHandle(handle_id) orelse {
+        net_lock.unlock();
         reply.* = fx.IpcMessage.init(fx.R_OK);
         return;
     };
 
-    net_lock.lock();
     switch (h.kind) {
         .tcp_data => tcp_stack.startClose(h.conn),
         .icmp_data => icmp_handler.close(h.conn),
         else => {},
     }
-    net_lock.unlock();
 
     freeHandle(handle_id);
+    net_lock.unlock();
+
     reply.* = fx.IpcMessage.init(fx.R_OK);
 }
 
@@ -1068,7 +1078,9 @@ fn timerLoop() noreturn {
 
         net_lock.lock();
 
-        // TCP retransmission and TIME_WAIT expiry
+        // NOTE: tick/checkRetry may trigger sendTcpIpPacket → fx.write() while
+        // holding net_lock. This blocks IPC workers during I/O. A deferred-send
+        // queue would fix this but requires refactoring the TCP stack callback.
         const now = getTicks();
         tcp_stack.tick(now);
 

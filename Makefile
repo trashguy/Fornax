@@ -2,7 +2,7 @@
 .PHONY: release release-x86_64 release-aarch64 release-riscv64 run-release disk-img disk-format
 .PHONY: run-posix run-posix-release run-tcc
 .PHONY: run-containers run-containers-dev
-.PHONY: run-dev run-dev-posix test unit-test integration-test
+.PHONY: run-dev run-dev-posix run-nvme run-ahci test unit-test integration-test
 
 all: x86_64 aarch64
 
@@ -34,6 +34,12 @@ run-x86_64: x86_64
 
 run-smp: x86_64
 	./scripts/run-x86_64.sh -smp 4
+
+run-nvme: x86_64
+	./scripts/run-x86_64.sh --nvme
+
+run-ahci: x86_64
+	./scripts/run-x86_64.sh --ahci
 
 run-release: release-x86_64
 	./scripts/run-x86_64.sh
@@ -115,6 +121,8 @@ help:
 	@echo "  make release        Build both architectures (ReleaseSafe everywhere)"
 	@echo "  make run             Run x86_64 in QEMU"
 	@echo "  make run-smp         Run x86_64 in QEMU with 4 cores"
+	@echo "  make run-nvme        Run x86_64 in QEMU with NVMe block device"
+	@echo "  make run-ahci        Run x86_64 in QEMU with AHCI/SATA block device"
 	@echo "  make run-release     Run x86_64 in QEMU (ReleaseSafe kernel)"
 	@echo "  make run-aarch64     Run aarch64 in QEMU"
 	@echo "  make run-riscv64     Run riscv64 in QEMU"

@@ -1,6 +1,6 @@
 # Fornax SMP Design
 
-Symmetric multiprocessing support for x86_64, targeting up to 128 logical CPUs. The design uses per-core run queues with work stealing, fine-grained spinlocks, and IPI-based cross-core wakeup. There is no big kernel lock. The kernel detects cores dynamically via ACPI MADT at boot — no configuration required. Hyperthreaded/SMT threads are treated as independent logical CPUs.
+Symmetric multiprocessing support for x86_64, targeting up to 128 logical CPUs. The design uses per-core run queues with work stealing, fine-grained spinlocks, and IPI-based cross-core wakeup. There is no big kernel lock (though the fxfs filesystem server uses a coarse `fs_lock` mutex serializing all filesystem operations). The kernel detects cores dynamically via ACPI MADT at boot — no configuration required. Hyperthreaded/SMT threads are treated as independent logical CPUs.
 
 ## Architecture Overview
 
@@ -120,8 +120,8 @@ pub const RunQueue = struct {
 };
 ```
 
-- **push/pop** — used by the owning core; no lock needed (single producer/consumer)
-- **stealHalf** — used by idle cores to steal from busy cores; acquires victim's lock
+- **push/pop** — lock-protected; `push` can be called from any core (via `markReady`), not single-producer
+- **stealHalf** — uses `tryLock` on victim's queue to avoid ABBA deadlock with concurrent push/pop
 
 Process table indices are computed from pointers: `(@intFromPtr(proc) - @intFromPtr(&processes[0])) / @sizeOf(Process)`. This avoids the PID-to-index mismatch (PIDs start at 1, array indices at 0).
 

@@ -1081,8 +1081,13 @@ fn driversRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
     pos = appendStr(&text_buf, pos, "timer\n");
 
     // Check optional subsystems
-    const virtio_blk = @import("virtio_blk.zig");
-    if (virtio_blk.isInitialized()) {
+    if (@import("nvme.zig").isInitialized()) {
+        pos = appendStr(&text_buf, pos, "nvme\n");
+    }
+    if (@import("ahci.zig").isInitialized()) {
+        pos = appendStr(&text_buf, pos, "ahci\n");
+    }
+    if (@import("virtio_blk.zig").isInitialized()) {
         pos = appendStr(&text_buf, pos, "virtio_blk\n");
     }
     const virtio_net = @import("virtio_net.zig");
@@ -1913,8 +1918,8 @@ pub fn sysOpen(path_ptr: u64, path_len: u64) u64 {
         path_slice[5] == 'b' and path_slice[6] == 'l' and path_slice[7] == 'k' and
         path_slice[8] == '0')
     {
-        const virtio_blk = @import("virtio_blk.zig");
-        if (!virtio_blk.isInitialized()) return ENOENT;
+        const blk_dev = @import("blk.zig");
+        if (!blk_dev.isInitialized()) return ENOENT;
         return proc.allocBlkFd() orelse return EMFILE;
     }
 
@@ -2416,7 +2421,7 @@ pub fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
 }
 
 fn sysPread(fd: u64, buf_ptr: u64, count: u64, offset: u64) u64 {
-    const virtio_blk = @import("virtio_blk.zig");
+    const blk = @import("blk.zig");
 
     const proc = process.getCurrent() orelse return EBADF;
     const entry_ptr = proc.getFdEntryPtr(@intCast(fd)) orelse return EBADF;
@@ -2447,7 +2452,7 @@ fn sysPread(fd: u64, buf_ptr: u64, count: u64, offset: u64) u64 {
     while (i < block_count) : (i += 1) {
         const dest: [*]u8 = @ptrFromInt(buf_ptr + i * 4096);
         const buf: *[4096]u8 = @ptrCast(dest);
-        if (!virtio_blk.readBlock(block_start + i, buf)) {
+        if (!blk.readBlock(block_start + i, buf)) {
             if (bytes_read > 0) return bytes_read;
             return EIO;
         }
@@ -2458,7 +2463,7 @@ fn sysPread(fd: u64, buf_ptr: u64, count: u64, offset: u64) u64 {
 }
 
 fn sysPwrite(fd: u64, buf_ptr: u64, count: u64, offset: u64) u64 {
-    const virtio_blk = @import("virtio_blk.zig");
+    const blk = @import("blk.zig");
 
     const proc = process.getCurrent() orelse return EBADF;
     const entry_ptr = proc.getFdEntryPtr(@intCast(fd)) orelse return EBADF;
@@ -2489,7 +2494,7 @@ fn sysPwrite(fd: u64, buf_ptr: u64, count: u64, offset: u64) u64 {
     while (i < block_count) : (i += 1) {
         const src: [*]const u8 = @ptrFromInt(buf_ptr + i * 4096);
         const buf: *const [4096]u8 = @ptrCast(src);
-        if (!virtio_blk.writeBlock(block_start + i, buf)) {
+        if (!blk.writeBlock(block_start + i, buf)) {
             if (bytes_written > 0) return bytes_written;
             return EIO;
         }

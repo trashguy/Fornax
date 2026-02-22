@@ -113,7 +113,11 @@ Some translations are non-trivial:
 - **stat**: Linux stat is 144 bytes with different field layout. The shim opens
   the file, calls Fornax's 32-byte stat, translates fields, then closes.
 - **open flags**: `O_CREAT` routes to `FX_CREATE`, `O_TRUNC` does open + truncate.
-- **Unsupported**: `fork`, `signal`, `socket` return `-ENOSYS`. Signals are
+- **fork**: Implemented via `rfork(RFPROC|RFFDG)`. `vfork` uses the same path.
+- **getdents64**: Reads Fornax `DirEntry` structs and converts to Linux `dirent64`.
+- **chdir**: Validates path, updates internal `__cwd` buffer for `getcwd`.
+- **clock_gettime**: `CLOCK_REALTIME` reads `/dev/time`; `CLOCK_MONOTONIC` uses uptime.
+- **Unsupported**: `signal`, `socket` return `-ENOSYS`. Signals are
   stubbed as no-ops.
 
 **`lib/posix/crt0.S`** — The realm entry point and musl bootstrap. Does three

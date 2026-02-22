@@ -163,11 +163,21 @@ pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize, rsdp: ?[*]const
             klog.info("Network ready.\n");
         }
 
-        // Phase 300: Virtio-blk
+        // Phase 300: Block devices (virtio-blk or NVMe)
         if (virtio_blk.init()) {
-            klog.info("Block device ready.\n");
+            klog.info("Block device ready (virtio-blk).\n");
+        }
+        const nvme = @import("nvme.zig");
+        if (nvme.init()) {
+            klog.info("Block device ready (NVMe).\n");
+        }
+        const ahci = @import("ahci.zig");
+        if (ahci.init()) {
+            klog.info("Block device ready (AHCI).\n");
+        }
 
-            // Phase 305: GPT partition table
+        // Phase 305: GPT partition table (if any block device available)
+        if (@import("blk.zig").isInitialized()) {
             const gpt = @import("gpt.zig");
             if (gpt.init()) {
                 klog.info("GPT partition table loaded.\n");
@@ -229,8 +239,8 @@ pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize, rsdp: ?[*]const
 }
 
 fn spawnPartfs() void {
-    // Only spawn partfs if virtio-blk is available
-    if (!virtio_blk.isInitialized()) return;
+    // Only spawn partfs if a block device is available
+    if (!@import("blk.zig").isInitialized()) return;
 
     const partfs_elf = initrd.findFile("partfs") orelse {
         klog.warn("No partfs in initrd — running without /dev/.\n");
@@ -314,8 +324,8 @@ fn spawnPartfs() void {
 }
 
 fn spawnFxfs() void {
-    // Only spawn fxfs if virtio-blk is available
-    if (!virtio_blk.isInitialized()) return;
+    // Only spawn fxfs if a block device is available
+    if (!@import("blk.zig").isInitialized()) return;
 
     const fxfs_elf = initrd.findFile("fxfs") orelse {
         klog.warn("No fxfs in initrd — running without persistent filesystem.\n");

@@ -61,6 +61,8 @@
 #define LNX_GETPID         39
 #define LNX_FCNTL          72
 #define LNX_GETCWD         79
+#define LNX_CHDIR          80
+#define LNX_FCHDIR         81
 #define LNX_RENAME         82
 #define LNX_MKDIR          83
 #define LNX_RMDIR          84
@@ -681,15 +683,33 @@ long __fornax_syscall(long n, long a, long b, long c, long d, long e, long f)
         /* clock_gettime(clk_id, tp) */
         struct { long tv_sec; long tv_nsec; } *tp = (void *)b;
         if (tp) {
+            tp->tv_nsec = 0;
+            if (a == 0 /* CLOCK_REALTIME */) {
+                /* Read wall clock from /dev/time (format: "<epoch> <uptime>\n") */
+                long fd = __fx_raw2(FX_OPEN, (long)"/dev/time", 9);
+                if (fd >= 0) {
+                    char tbuf[64];
+                    long n = __fx_raw3(FX_READ, fd, (long)tbuf, 63);
+                    __fx_raw1(FX_CLOSE, fd);
+                    if (n > 0) {
+                        /* Parse epoch (first number before space) */
+                        unsigned long long epoch = 0;
+                        for (long i = 0; i < n && tbuf[i] >= '0' && tbuf[i] <= '9'; i++)
+                            epoch = epoch * 10 + (tbuf[i] - '0');
+                        tp->tv_sec = (long)epoch;
+                        return 0;
+                    }
+                }
+            }
+            /* CLOCK_MONOTONIC or fallback: use uptime */
             struct fx_sysinfo info;
             __fx_raw1(FX_SYSINFO, (long)&info);
             tp->tv_sec = (long)info.uptime_secs;
-            tp->tv_nsec = 0;
         }
         return 0;
     }
 
-    /* ── getcwd ──────────────────────────────────────────────────── */
+    /* ── getcwd / chdir ──────────────────────────────────────────── */
     case LNX_GETCWD: {
         char *buf = (char *)a;
         long size = b;
@@ -698,6 +718,49 @@ long __fornax_syscall(long n, long a, long b, long c, long d, long e, long f)
         buf[__cwd_len] = '\0';
         return (long)buf;
     }
+
+    case LNX_CHDIR: {
+        const char *path = (const char *)a;
+        int plen = __strlen(path);
+        if (plen == 0) return -2; /* ENOENT */
+        /* Verify directory exists by opening it */
+        long fd = __fx_raw2(FX_OPEN, (long)path, plen);
+        if (fd < 0) return -2; /* ENOENT */
+        struct fx_stat fxs;
+        long r = __fx_raw2(FX_STAT, fd, (long)&fxs);
+        __fx_raw1(FX_CLOSE, fd);
+        if (r != 0) return -2;
+        if ((fxs.mode & 0170000) != 0040000) return -20; /* ENOTDIR */
+        /* Update __cwd */
+        if (path[0] == '/') {
+            /* Absolute path */
+            if (plen >= 256) return -36; /* ENAMETOOLONG */
+            __memcpy(__cwd, path, plen);
+            __cwd_len = plen;
+        } else {
+            /* Relative path — append to __cwd */
+            int need = __cwd_len + 1 + plen;
+            if (__cwd_len > 1) need = __cwd_len + 1 + plen; /* cwd + "/" + path */
+            else need = 1 + plen; /* "/" + path */
+            if (need >= 256) return -36;
+            if (__cwd_len > 1) {
+                __cwd[__cwd_len] = '/';
+                __memcpy(__cwd + __cwd_len + 1, path, plen);
+                __cwd_len = __cwd_len + 1 + plen;
+            } else {
+                __memcpy(__cwd + 1, path, plen);
+                __cwd_len = 1 + plen;
+            }
+        }
+        /* Strip trailing slash */
+        while (__cwd_len > 1 && __cwd[__cwd_len - 1] == '/')
+            __cwd_len--;
+        __cwd[__cwd_len] = '\0';
+        return 0;
+    }
+
+    case LNX_FCHDIR:
+        return -38; /* ENOSYS: would need fd-to-path mapping */
 
     /* ── uname ───────────────────────────────────────────────────── */
     case LNX_UNAME: {
@@ -728,8 +791,17 @@ long __fornax_syscall(long n, long a, long b, long c, long d, long e, long f)
         /* Read from /dev/random */
         long fd = __fx_raw2(FX_OPEN, (long)"/dev/random", 11);
         if (fd < 0) {
-            /* Fallback: fill with something */
-            __memset((void *)a, 0x42, (unsigned long)b);
+            /* Fallback: xorshift64 seeded from uptime */
+            struct fx_sysinfo si;
+            __fx_raw1(FX_SYSINFO, (long)&si);
+            unsigned long long xs = si.uptime_secs * 1000000ULL + 7;
+            unsigned char *p = (unsigned char *)a;
+            for (long i = 0; i < b; i++) {
+                xs ^= xs << 13;
+                xs ^= xs >> 7;
+                xs ^= xs << 17;
+                p[i] = (unsigned char)(xs >> 8);
+            }
             return b;
         }
         long r = __fx_raw3(FX_READ, fd, a, b);
@@ -737,8 +809,59 @@ long __fornax_syscall(long n, long a, long b, long c, long d, long e, long f)
         return r > 0 ? r : b;
     }
 
-    case LNX_GETDENTS64:
-        return -38; /* ENOSYS: not yet supported */
+    case LNX_GETDENTS64: {
+        /* getdents64(fd, buf, bufsize)
+         * Fornax read() on dir fd returns packed DirEntry structs:
+         *   name[64] + file_type(u32) + size(u32) = 72 bytes each
+         * Convert to Linux dirent64:
+         *   d_ino(u64) + d_off(i64) + d_reclen(u16) + d_type(u8) + d_name[]
+         */
+        unsigned char *out = (unsigned char *)b;
+        long bufsize = c;
+        long total = 0;
+
+        /* Read Fornax dir entries (up to 4096 bytes at a time) */
+        unsigned char fxbuf[4096];
+        long n = __fx_raw3(FX_READ, a, (long)fxbuf, 4096);
+        if (n <= 0) return total > 0 ? total : 0;
+
+        int idx = 0;
+        while (idx + 72 <= n) {
+            /* Parse Fornax DirEntry */
+            const char *name = (const char *)&fxbuf[idx];
+            int nlen = 0;
+            while (nlen < 64 && name[nlen] != '\0') nlen++;
+            unsigned int ftype = *(unsigned int *)&fxbuf[idx + 64];
+
+            /* Compute Linux dirent64 reclen (must be 8-byte aligned) */
+            int reclen = 8 + 8 + 2 + 1 + nlen + 1; /* ino + off + reclen + type + name + NUL */
+            reclen = (reclen + 7) & ~7;
+
+            if (total + reclen > bufsize) break;
+
+            /* Write Linux dirent64 */
+            unsigned char *p = out + total;
+            __memset(p, 0, reclen);
+            /* d_ino = synthetic inode (use position as unique id) */
+            unsigned long long ino = (unsigned long long)(idx / 72 + 1);
+            __memcpy(p, &ino, 8);
+            /* d_off = offset to next entry */
+            long long doff = total + reclen;
+            __memcpy(p + 8, &doff, 8);
+            /* d_reclen */
+            p[16] = (unsigned char)(reclen & 0xFF);
+            p[17] = (unsigned char)((reclen >> 8) & 0xFF);
+            /* d_type: DT_DIR=4, DT_REG=8 */
+            p[18] = (ftype == 1) ? 4 : 8;
+            /* d_name */
+            __memcpy(p + 19, name, nlen);
+            p[19 + nlen] = '\0';
+
+            total += reclen;
+            idx += 72;
+        }
+        return total;
+    }
 
     default:
         return -38; /* ENOSYS */

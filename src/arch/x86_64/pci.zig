@@ -51,6 +51,14 @@ pub const PciDevice = struct {
         return self.class_code == 0x0C and self.subclass == 0x03 and self.prog_if == 0x30;
     }
 
+    pub fn isNvme(self: *const PciDevice) bool {
+        return self.class_code == 0x01 and self.subclass == 0x08 and self.prog_if == 0x02;
+    }
+
+        pub fn isAhci(self: *const PciDevice) bool {
+            return self.class_code == 0x01 and self.subclass == 0x06 and self.prog_if == 0x01;
+        }
+
     /// Get the I/O port base from BAR0 (for legacy virtio devices).
     pub fn ioBase(self: *const PciDevice) ?u16 {
         const bar0 = self.bar[0];
@@ -222,6 +230,20 @@ pub fn findVirtioBlk() ?*PciDevice {
 pub fn findXhci() ?*PciDevice {
     for (0..device_count) |i| {
         if (devices[i].isXhci()) return &devices[i];
+    }
+    return null;
+}
+
+pub fn findNvme() ?*PciDevice {
+    for (0..device_count) |i| {
+        if (devices[i].isNvme()) return &devices[i];
+    }
+    return null;
+}
+
+pub fn findAhci() ?*PciDevice {
+    for (0..device_count) |i| {
+        if (devices[i].isAhci()) return &devices[i];
     }
     return null;
 }

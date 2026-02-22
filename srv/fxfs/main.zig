@@ -141,23 +141,25 @@ fn getHandle(handle: u32) ?*Handle {
 const CacheEntry = struct {
     block_nr: u64,
     valid: bool,
-    use_count: u32,
+    last_access: u32,
 };
 
 var cache_blocks: [CACHE_SIZE][BLOCK_SIZE]u8 linksection(".bss") = undefined;
 var cache_entries: [CACHE_SIZE]CacheEntry linksection(".bss") = undefined;
+var cache_generation: u32 = 0;
 
 fn cacheInit() void {
     for (0..CACHE_SIZE) |i| {
-        cache_entries[i] = .{ .block_nr = 0, .valid = false, .use_count = 0 };
+        cache_entries[i] = .{ .block_nr = 0, .valid = false, .last_access = 0 };
     }
+    cache_generation = 0;
 }
 
 fn cacheRead(block_nr: u64) ?*[BLOCK_SIZE]u8 {
-    // Check if already cached
     for (0..CACHE_SIZE) |i| {
         if (cache_entries[i].valid and cache_entries[i].block_nr == block_nr) {
-            cache_entries[i].use_count +%= 1;
+            cache_generation +%= 1;
+            cache_entries[i].last_access = cache_generation;
             return &cache_blocks[i];
         }
     }
@@ -169,27 +171,29 @@ fn cacheInsert(block_nr: u64, data: *const [BLOCK_SIZE]u8) *[BLOCK_SIZE]u8 {
     for (0..CACHE_SIZE) |i| {
         if (cache_entries[i].valid and cache_entries[i].block_nr == block_nr) {
             @memcpy(&cache_blocks[i], data);
-            cache_entries[i].use_count = 1;
+            cache_generation +%= 1;
+            cache_entries[i].last_access = cache_generation;
             return &cache_blocks[i];
         }
     }
 
-    // Find free slot or evict LRU
-    var min_use: u32 = 0xFFFFFFFF;
+    // Find free slot or evict least recently used
+    var min_access: u32 = 0xFFFFFFFF;
     var evict_idx: usize = 0;
     for (0..CACHE_SIZE) |i| {
         if (!cache_entries[i].valid) {
             evict_idx = i;
             break;
         }
-        if (cache_entries[i].use_count < min_use) {
-            min_use = cache_entries[i].use_count;
+        if (cache_entries[i].last_access < min_access) {
+            min_access = cache_entries[i].last_access;
             evict_idx = i;
         }
     }
 
+    cache_generation +%= 1;
     @memcpy(&cache_blocks[evict_idx], data);
-    cache_entries[evict_idx] = .{ .block_nr = block_nr, .valid = true, .use_count = 1 };
+    cache_entries[evict_idx] = .{ .block_nr = block_nr, .valid = true, .last_access = cache_generation };
     return &cache_blocks[evict_idx];
 }
 
@@ -817,6 +821,12 @@ fn readFileData(inode_nr: u64, file_offset: u64, dest: []u8) u32 {
         }
     }.cb);
 
+    // No extent covers this offset — file hole, return zeros
+    if (ctx.result == 0) {
+        @memset(dest[0..want], 0);
+        return want;
+    }
+
     return ctx.result;
 }
 
@@ -824,62 +834,139 @@ fn readFileData(inode_nr: u64, file_offset: u64, dest: []u8) u32 {
 //
 // One bitmap block covers BLOCK_SIZE*8 = 32768 blocks = 128 MB.
 // For larger filesystems, the bitmap spans multiple consecutive blocks
-// starting at sb_bitmap_start. We cache one bitmap block at a time.
+// starting at sb_bitmap_start.
+//
+// Transaction safety: dirty bitmap blocks are NEVER flushed to disk until
+// commitTransaction() calls flushBitmap(). This prevents the bitmap from
+// being partially committed before the superblock, which would cause block
+// leaks or double-use on crash. The cache holds up to BITMAP_CACHE_SLOTS
+// blocks; dirty blocks cannot be evicted. A single transaction typically
+// touches 1-3 bitmap blocks, so 16 slots covers all practical cases.
 
 const BITS_PER_BITMAP_BLOCK: u64 = BLOCK_SIZE * 8;
 
-var bitmap_buf: [BLOCK_SIZE]u8 linksection(".bss") = undefined;
-var bitmap_loaded: bool = false;
-var bitmap_cached_idx: u64 = 0; // which bitmap block is cached (0-based)
-var bitmap_dirty: bool = false;
+const BITMAP_CACHE_SLOTS = 16; // 64 KB BSS, covers transactions touching up to 16 bitmap regions
 
-/// Ensure the bitmap block covering `block_nr` is loaded into bitmap_buf.
-fn ensureBitmapBlock(block_nr: u64) bool {
-    const idx = block_nr / BITS_PER_BITMAP_BLOCK;
-    if (bitmap_loaded and bitmap_cached_idx == idx) return true;
-    // Flush current block if dirty
-    if (bitmap_loaded and bitmap_dirty) {
-        if (!writeBlock(sb_bitmap_start + bitmap_cached_idx, &bitmap_buf)) return false;
-        bitmap_dirty = false;
+const BitmapSlot = struct {
+    buf: [BLOCK_SIZE]u8,
+    idx: u64, // which bitmap block (0-based offset from sb_bitmap_start)
+    loaded: bool,
+    dirty: bool,
+};
+
+var bitmap_slots: [BITMAP_CACHE_SLOTS]BitmapSlot linksection(".bss") = undefined;
+var bitmap_slots_inited: bool = false;
+
+fn bitmapInit() void {
+    for (&bitmap_slots) |*s| {
+        s.loaded = false;
+        s.dirty = false;
+        s.idx = 0;
     }
-    // Load the needed bitmap block
-    if (!readBlock(sb_bitmap_start + idx, &bitmap_buf)) return false;
-    bitmap_cached_idx = idx;
-    bitmap_loaded = true;
-    return true;
+    bitmap_slots_inited = true;
+}
+
+/// Return a pointer to the cached bitmap block covering `block_nr`.
+/// Loads from disk if not cached. Never evicts dirty blocks.
+fn ensureBitmapBlock(block_nr: u64) ?*[BLOCK_SIZE]u8 {
+    if (!bitmap_slots_inited) bitmapInit();
+    const idx = block_nr / BITS_PER_BITMAP_BLOCK;
+
+    // Check if already cached
+    for (&bitmap_slots) |*s| {
+        if (s.loaded and s.idx == idx) return &s.buf;
+    }
+
+    // Find a free or evictable slot (prefer free, then clean)
+    var target: ?*BitmapSlot = null;
+    for (&bitmap_slots) |*s| {
+        if (!s.loaded) {
+            target = s;
+            break;
+        }
+    }
+    if (target == null) {
+        // Evict a clean (non-dirty) slot
+        for (&bitmap_slots) |*s| {
+            if (s.loaded and !s.dirty) {
+                target = s;
+                break;
+            }
+        }
+    }
+    if (target == null) {
+        // All slots are dirty — this means the transaction touches more
+        // bitmap regions than we have cache slots. This shouldn't happen
+        // in practice (would need writes spanning 16 * 128MB = 2TB of
+        // block space in a single transaction).
+        return null;
+    }
+
+    const slot = target.?;
+    // Load from disk
+    if (!readBlock(sb_bitmap_start + idx, &slot.buf)) return null;
+    slot.idx = idx;
+    slot.loaded = true;
+    slot.dirty = false;
+    return &slot.buf;
 }
 
 fn isBitSet(block: u64) bool {
-    if (!ensureBitmapBlock(block)) return true; // assume allocated on failure
+    const buf = ensureBitmapBlock(block) orelse return true; // assume allocated on failure
     const local_bit = block % BITS_PER_BITMAP_BLOCK;
     const byte_idx = local_bit / 8;
     const bit_idx: u3 = @intCast(local_bit % 8);
-    return (bitmap_buf[byte_idx] & (@as(u8, 1) << bit_idx)) != 0;
+    return (buf[byte_idx] & (@as(u8, 1) << bit_idx)) != 0;
 }
 
 fn setBit(block: u64) void {
-    if (!ensureBitmapBlock(block)) return;
+    const buf = ensureBitmapBlock(block) orelse return;
     const local_bit = block % BITS_PER_BITMAP_BLOCK;
     const byte_idx = local_bit / 8;
     const bit_idx: u3 = @intCast(local_bit % 8);
-    bitmap_buf[byte_idx] |= @as(u8, 1) << bit_idx;
-    bitmap_dirty = true;
+    buf[byte_idx] |= @as(u8, 1) << bit_idx;
+    // Mark the slot dirty
+    for (&bitmap_slots) |*s| {
+        if (s.loaded and s.idx == block / BITS_PER_BITMAP_BLOCK) {
+            s.dirty = true;
+            break;
+        }
+    }
 }
 
 fn clearBit(block: u64) void {
-    if (!ensureBitmapBlock(block)) return;
+    const buf = ensureBitmapBlock(block) orelse return;
     const local_bit = block % BITS_PER_BITMAP_BLOCK;
     const byte_idx = local_bit / 8;
     const bit_idx: u3 = @intCast(local_bit % 8);
-    bitmap_buf[byte_idx] &= ~(@as(u8, 1) << bit_idx);
-    bitmap_dirty = true;
+    buf[byte_idx] &= ~(@as(u8, 1) << bit_idx);
+    // Mark the slot dirty
+    for (&bitmap_slots) |*s| {
+        if (s.loaded and s.idx == block / BITS_PER_BITMAP_BLOCK) {
+            s.dirty = true;
+            break;
+        }
+    }
 }
 
+/// Flush all dirty bitmap blocks to disk. Called only during commitTransaction().
 fn flushBitmap() bool {
-    if (!bitmap_loaded or !bitmap_dirty) return true;
-    if (!writeBlock(sb_bitmap_start + bitmap_cached_idx, &bitmap_buf)) return false;
-    bitmap_dirty = false;
+    if (!bitmap_slots_inited) return true;
+    for (&bitmap_slots) |*s| {
+        if (s.loaded and s.dirty) {
+            if (!writeBlock(sb_bitmap_start + s.idx, &s.buf)) return false;
+            s.dirty = false;
+        }
+    }
     return true;
+}
+
+fn bitmapHasDirty() bool {
+    if (!bitmap_slots_inited) return false;
+    for (&bitmap_slots) |*s| {
+        if (s.loaded and s.dirty) return true;
+    }
+    return false;
 }
 
 fn allocBlock() ?u64 {
@@ -1757,7 +1844,7 @@ fn handleRead(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
         pos = ctlAppendStr(&ctl_buf, pos, "\nGEN=");
         pos = ctlAppendDec(&ctl_buf, pos, sb_generation);
         pos = ctlAppendStr(&ctl_buf, pos, "\nDIRTY=");
-        pos = ctlAppendDec(&ctl_buf, pos, if (bitmap_dirty) @as(u64, 1) else 0);
+        pos = ctlAppendDec(&ctl_buf, pos, if (bitmapHasDirty()) @as(u64, 1) else 0);
         pos = ctlAppendStr(&ctl_buf, pos, "\n");
         if (offset >= pos) {
             resp.data_len = 0;

@@ -1,10 +1,10 @@
 /// GPT partition table parser for boot-time partition detection.
 ///
-/// Reads GPT header + partition entries from the virtio-blk device.
+/// Reads GPT header + partition entries from the block device.
 /// Used by main.zig to set partition offsets for fxfs and to provide
 /// partition info for partfs.
 const klog = @import("klog.zig");
-const virtio_blk = @import("virtio_blk.zig");
+const blk = @import("blk.zig");
 
 pub const MAX_PARTITIONS = 8;
 
@@ -33,13 +33,13 @@ const BLOCK_SIZE = 4096;
 /// Read blocks needed for GPT parsing and detect partitions.
 /// Returns true if a valid GPT was found.
 pub fn init() bool {
-    if (!virtio_blk.isInitialized()) return false;
+    if (!blk.isInitialized()) return false;
 
-    disk_sectors = virtio_blk.getCapacitySectors();
+    disk_sectors = blk.getCapacitySectors();
 
     // Read block 0: contains protective MBR (LBA 0) + GPT header (LBA 1)
     var block0: [BLOCK_SIZE]u8 = undefined;
-    if (!virtio_blk.readBlock(0, &block0)) {
+    if (!blk.readBlock(0, &block0)) {
         klog.debug("gpt: failed to read block 0\n");
         return false;
     }
@@ -98,7 +98,7 @@ pub fn init() bool {
     var block_nr = first_entry_block;
     while (block_nr <= last_entry_block and block_nr < 8) : (block_nr += 1) {
         var block_buf: [BLOCK_SIZE]u8 = undefined;
-        if (!virtio_blk.readBlock(block_nr, &block_buf)) {
+        if (!blk.readBlock(block_nr, &block_buf)) {
             klog.debug("gpt: failed to read entry block\n");
             break;
         }

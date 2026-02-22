@@ -19,6 +19,8 @@ _start:
     movl $SYS_RFORK, %eax
     movl $RFNAMEG, %edi
     syscall
+    testq %rax, %rax
+    js .Lrfork_fail
 
     # Load argc and argv info from ARGV_BASE
     movabs $ARGV_BASE, %r12
@@ -74,4 +76,10 @@ _start:
     xorl %r9d, %r9d               # R9  = ldso = 0 (6th arg)
     andq $-16, %rsp                # 16-byte align
     call __libc_start_main
+    ud2
+
+.Lrfork_fail:
+    movl $25, %eax                 # SYS_SHUTDOWN (exit)
+    movl $1, %edi                  # exit code 1
+    syscall
     ud2

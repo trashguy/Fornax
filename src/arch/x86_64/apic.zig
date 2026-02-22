@@ -10,6 +10,7 @@ const idt = @import("idt.zig");
 const percpu = @import("../../percpu.zig");
 const mem = @import("../../mem.zig");
 const pmm = @import("../../pmm.zig");
+const process = @import("../../process.zig");
 
 // ── ACPI table structures ────────────────────────────────────────────
 
@@ -375,12 +376,8 @@ export fn apEntry() callconv(.{ .x86_64_sysv = .{} }) noreturn {
     // Signal BSP that this AP is up
     @atomicStore(bool, &ap_boot_done, true, .release);
 
-    // AP idle loop — Phase D will add run queue checking
-    while (true) {
-        asm volatile ("sti");
-        asm volatile ("hlt");
-        asm volatile ("cli");
-    }
+    // Enter scheduler — checks run queue, steals work, idles when empty
+    process.scheduleNext();
 }
 
 // ── INIT-SIPI-SIPI Sequence ────────────────────────────────────────
