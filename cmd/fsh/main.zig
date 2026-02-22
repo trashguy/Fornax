@@ -1578,10 +1578,21 @@ fn buildPrompt() []const u8 {
 }
 
 export fn _start() noreturn {
-    builtinClear();
-    out.puts("fsh: Fornax shell\n");
     envInit();
     aliasInit();
+
+    // fsh -c "command" — non-interactive mode
+    const args = fx.getArgs();
+    if (args.len >= 3) {
+        const flag = span(args[1]);
+        if (flag.len == 2 and flag[0] == '-' and flag[1] == 'c') {
+            processLine(span(args[2]));
+            fx.exit(@truncate(last_exit_status));
+        }
+    }
+
+    builtinClear();
+    out.puts("fsh: Fornax shell\n");
 
     while (true) {
         const line = editLine(buildPrompt()) orelse break;
@@ -1590,4 +1601,10 @@ export fn _start() noreturn {
     }
 
     fx.exit(0);
+}
+
+fn span(ptr: [*:0]const u8) []const u8 {
+    var len: usize = 0;
+    while (ptr[len] != 0) len += 1;
+    return ptr[0..len];
 }

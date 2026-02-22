@@ -137,6 +137,44 @@ fn spawnNetd() void {
     _ = fx.close(ether_fd);
 }
 
+/// Spawn crond: cron daemon at /sched.
+fn spawnCrond() void {
+    const pair = fx.ipc_pair();
+    if (pair.err < 0) {
+        out.puts("init: failed to create IPC pair for crond\n");
+        return;
+    }
+
+    const crond_elf = loadBin("crond") orelse {
+        out.puts("init: /bin/crond not found, skipping\n");
+        _ = fx.close(pair.server_fd);
+        _ = fx.close(pair.client_fd);
+        return;
+    };
+
+    // Spawn with fd mapping: server_fd→3
+    const mappings = [_]fx.FdMapping{
+        .{ .parent_fd = @intCast(pair.server_fd), .child_fd = 3 },
+    };
+    const pid = fx.spawn(crond_elf, &mappings, null);
+    if (pid < 0) {
+        out.puts("init: failed to spawn crond\n");
+        _ = fx.close(pair.server_fd);
+        _ = fx.close(pair.client_fd);
+        return;
+    }
+
+    const rc = fx.mount(pair.client_fd, "/sched/", 0);
+    if (rc < 0) {
+        out.puts("init: failed to mount crond at /sched\n");
+    } else {
+        out.puts("init: crond mounted at /sched\n");
+    }
+
+    _ = fx.close(pair.server_fd);
+    _ = fx.close(pair.client_fd);
+}
+
 export fn _start() noreturn {
     out.puts("init: started\n");
 
@@ -155,6 +193,9 @@ export fn _start() noreturn {
 
     // Spawn netd (userspace network server)
     spawnNetd();
+
+    // Spawn crond (cron daemon)
+    spawnCrond();
 
     // Load login once
     const elf_data = loadBin("login") orelse {

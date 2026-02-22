@@ -355,8 +355,28 @@ fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
         return len;
     }
 
+    // /dev/time: write epoch seconds to adjust clock (root only)
+    if (entry.fd_type == .dev_time) {
+        const caller = process.getCurrent() orelse return EBADF;
+        if (caller.uid != 0) return EBADF; // permission denied
+        const src: [*]const u8 = @ptrFromInt(buf_ptr);
+        const len: usize = @intCast(@min(count, 64));
+        // Strip trailing whitespace
+        var end = len;
+        while (end > 0 and (src[end - 1] == '\n' or src[end - 1] == ' ')) {
+            end -= 1;
+        }
+        if (end == 0) return EINVAL;
+        const time_mod = @import("time.zig");
+        const new_epoch = parseDecimal(src[0..end]) orelse return EINVAL;
+        const current = time_mod.wallClock();
+        const delta: i64 = @as(i64, @intCast(new_epoch)) - @as(i64, @intCast(current));
+        time_mod.setOffset(delta);
+        return len;
+    }
+
     // Read-only /dev/ files: reject writes
-    if (entry.fd_type == .dev_osversion or entry.fd_type == .dev_time or
+    if (entry.fd_type == .dev_osversion or
         entry.fd_type == .dev_kmesg or entry.fd_type == .dev_drivers or
         entry.fd_type == .dev_pid or entry.fd_type == .dev_user or
         entry.fd_type == .dev_sysstat)
@@ -715,6 +735,18 @@ fn fmtDecimal(val: u64, buf: *[20]u8) []const u8 {
     return buf[0..i];
 }
 
+fn parseDecimal(s: []const u8) ?u64 {
+    if (s.len == 0) return null;
+    var result: u64 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') return null;
+        const old = result;
+        result = result *% 10 +% (c - '0');
+        if (result < old) return null;
+    }
+    return result;
+}
+
 /// Append a "key value\n" line to buf, return new position.
 fn appendKV(buf: []u8, pos: usize, key: []const u8, val: u64) usize {
     var p = pos;
@@ -939,20 +971,30 @@ fn osversionRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
 }
 
 fn timeRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
-    const t = @import("timer.zig");
-    const uptime_secs = t.getTicks() / 100; // PIT ticks at ~100 Hz
-    var text_buf: [24]u8 = undefined;
-    var dec_buf: [20]u8 = undefined;
-    const dec = fmtDecimal(uptime_secs, &dec_buf);
-    @memcpy(text_buf[0..dec.len], dec);
-    text_buf[dec.len] = '\n';
-    const total = dec.len + 1;
+    const time_mod = @import("time.zig");
+    const epoch = time_mod.wallClock();
+    const up = time_mod.uptime();
+
+    var text_buf: [48]u8 = undefined;
+    var dec1: [20]u8 = undefined;
+    var dec2: [20]u8 = undefined;
+    const epoch_str = fmtDecimal(epoch, &dec1);
+    const up_str = fmtDecimal(up, &dec2);
+    var pos: usize = 0;
+    @memcpy(text_buf[pos..][0..epoch_str.len], epoch_str);
+    pos += epoch_str.len;
+    text_buf[pos] = ' ';
+    pos += 1;
+    @memcpy(text_buf[pos..][0..up_str.len], up_str);
+    pos += up_str.len;
+    text_buf[pos] = '\n';
+    pos += 1;
 
     const dest: [*]u8 = @ptrFromInt(buf_ptr);
     const max_bytes: usize = @intCast(@min(count, 4096));
     const offset: usize = entry_ptr.read_offset;
-    if (offset >= total) return 0;
-    const available = total - offset;
+    if (offset >= pos) return 0;
+    const available = pos - offset;
     const to_copy = @min(available, max_bytes);
     @memcpy(dest[0..to_copy], text_buf[offset..][0..to_copy]);
     entry_ptr.read_offset += @intCast(to_copy);

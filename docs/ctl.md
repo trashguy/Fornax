@@ -12,7 +12,7 @@ These files are intercepted by the kernel in `sysOpen` and handled directly in `
 |------|-----|-------------|
 | `/dev/sysname` | RW | Hostname. Read returns name + `\n`. Write sets (max 63 chars). Default: `fornax`. |
 | `/dev/osversion` | R | OS version string. Returns `Fornax 0.1\n`. |
-| `/dev/time` | R | Uptime in seconds (decimal) + `\n`. |
+| `/dev/time` | RW | Read: `<epoch_secs> <uptime_secs>\n`. Write (root): set epoch seconds. |
 | `/dev/pid` | R | Current process PID (decimal) + `\n`. |
 | `/dev/user` | R | Current process UID (decimal) + `\n`. |
 | `/dev/kmesg` | R | Kernel log ring buffer (64 KB). Supports offset-based reads. |

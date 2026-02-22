@@ -394,6 +394,60 @@ def test_basic_commands(qemu):
         return False
 
 
+def test_time_subsystem(qemu):
+    """Verify wall-clock time, date command, uptime, and cron daemon."""
+    try:
+        # 1. /dev/time format: "<epoch> <uptime>\n"
+        #    Epoch should be >1700000000 (2023+) if RTC works.
+        qemu.send_line("cat /dev/time; echo __TIME_DONE__")
+        m = qemu.expect(r"(\d+) (\d+)", timeout=10)
+        epoch = int(m.group(1))
+        uptime = int(m.group(2))
+        qemu.expect(r"__TIME_DONE__", timeout=5)
+
+        if epoch < 1700000000:
+            log_fail("test_time_subsystem", f"epoch too low: {epoch}")
+            return False
+        if uptime < 1:
+            log_fail("test_time_subsystem", f"uptime too low: {uptime}")
+            return False
+
+        # 2. date command: should output day-of-week + month + year
+        qemu.send_line("date; echo __DATE_DONE__")
+        m = qemu.expect(r"(Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)", timeout=10)
+        qemu.expect(r"__DATE_DONE__", timeout=5)
+
+        # 3. date +%s: should match /dev/time epoch (within a few seconds)
+        qemu.send_line("date +%s; echo __EPOCH_DONE__")
+        m = qemu.expect(r"(\d+)", timeout=10)
+        cmd_epoch = int(m.group(1))
+        qemu.expect(r"__EPOCH_DONE__", timeout=5)
+        if abs(cmd_epoch - epoch) > 30:
+            log_fail("test_time_subsystem", f"date +%s ({cmd_epoch}) too far from /dev/time ({epoch})")
+            return False
+
+        # 4. date -I: ISO 8601 format YYYY-MM-DD
+        qemu.send_line("date -I; echo __ISO_DONE__")
+        qemu.expect(r"\d{4}-\d{2}-\d{2}", timeout=10)
+        qemu.expect(r"__ISO_DONE__", timeout=5)
+
+        # 5. uptime command
+        qemu.send_line("uptime; echo __UP_DONE__")
+        qemu.expect(r"\d+[hm]", timeout=10)
+        qemu.expect(r"__UP_DONE__", timeout=5)
+
+        # 6. crontab -l (crond should be running)
+        qemu.send_line("crontab -l; echo __CRON_DONE__")
+        # Should succeed (either "no jobs" or list of jobs)
+        qemu.expect(r"__CRON_DONE__", timeout=10)
+
+        log_pass("test_time_subsystem")
+        return True
+    except (TimeoutError, RuntimeError) as e:
+        log_fail("test_time_subsystem", str(e))
+        return False
+
+
 def test_fay_install_xxd(qemu):
     """Sync repo, install xxd, verify it works."""
     try:
@@ -592,6 +646,12 @@ def main():
 
             if failed == 0:
                 if test_basic_commands(qemu):
+                    passed += 1
+                else:
+                    failed += 1
+
+            if failed == 0:
+                if test_time_subsystem(qemu):
                     passed += 1
                 else:
                     failed += 1

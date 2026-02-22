@@ -24,6 +24,7 @@ pub const sha256 = @import("sha256.zig");
 pub const http = @import("http.zig");
 pub const thread = @import("thread.zig");
 pub const net = @import("net/root.zig");
+pub const time_lib = @import("time.zig");
 
 // Re-export syscall functions at top level for backward compatibility.
 pub const SYS = syscall.SYS;
@@ -80,6 +81,8 @@ pub const mount = syscall.mount;
 pub const unmount = syscall.unmount;
 pub const bind = syscall.bind;
 pub const ipc_pair = syscall.ipc_pair;
+pub const time = syscall.time;
+pub const getUptime = syscall.getUptime;
 
 // Re-export IPC types at top level.
 pub const IpcMessage = ipc.IpcMessage;

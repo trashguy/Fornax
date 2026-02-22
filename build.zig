@@ -820,6 +820,62 @@ const touch_bin = b.addExecutable(.{
     });
     netd_bin.image_base = user_image_base;
 
+    const crond_bin = b.addExecutable(.{
+        .name = "crond",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("srv/crond/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    crond_bin.image_base = user_image_base;
+
+    const crontab_bin = b.addExecutable(.{
+        .name = "crontab",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/crontab/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    crontab_bin.image_base = user_image_base;
+
+    const date_bin = b.addExecutable(.{
+        .name = "date",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/date/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    date_bin.image_base = user_image_base;
+
+    const uptime_bin = b.addExecutable(.{
+        .name = "uptime",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/uptime/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    uptime_bin.image_base = user_image_base;
+
     // ── POSIX realm support (gated behind -Dposix=true) ─────────────
     // POSIX realm isolation is handled by lib/posix/crt0.S (rfork(RFNAMEG))
     // which runs before musl's __libc_start_main. No separate loader needed.
@@ -1374,6 +1430,10 @@ const touch_bin = b.addExecutable(.{
         tar_bin,
         fay_bin,
         netd_bin,
+        crond_bin,
+        crontab_bin,
+        date_bin,
+        uptime_bin,
     };
     for (disk_programs) |prog| {
         const install = b.addInstallArtifact(prog, .{
@@ -1642,6 +1702,7 @@ const touch_bin = b.addExecutable(.{
     const mod_crc32 = b.createModule(.{ .root_source_file = b.path("lib/crc32.zig"), .target = host, .optimize = test_opt });
     const mod_sha256 = b.createModule(.{ .root_source_file = b.path("lib/sha256.zig"), .target = host, .optimize = test_opt });
     const mod_json = b.createModule(.{ .root_source_file = b.path("lib/json.zig"), .target = host, .optimize = test_opt });
+    const mod_time = b.createModule(.{ .root_source_file = b.path("lib/time.zig"), .target = host, .optimize = test_opt });
     const mod_ethernet = b.createModule(.{ .root_source_file = b.path("lib/net/ethernet.zig"), .target = host, .optimize = test_opt });
     const mod_ipv4 = b.createModule(.{ .root_source_file = b.path("lib/net/ipv4.zig"), .target = host, .optimize = test_opt });
     // arp/tcp/dns/icmp use relative @import("ethernet.zig") and @import("ipv4.zig")
@@ -1699,6 +1760,7 @@ const touch_bin = b.addExecutable(.{
                 .{ .name = "tcp", .module = mod_tcp },
                 .{ .name = "dns", .module = mod_dns },
                 .{ .name = "icmp", .module = mod_icmp },
+                .{ .name = "time", .module = mod_time },
             },
         }),
     });

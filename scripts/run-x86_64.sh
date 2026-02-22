@@ -92,6 +92,19 @@ root:x:0:root
 users:x:100:
 GROUP
 
+# Create default /etc/crontab
+cat > "$ROOTFS_DIR/etc/crontab" << 'CRONTAB'
+# /etc/crontab - Fornax cron table
+# Format: minute hour day month weekday command
+# Special: @boot, @every Ns/Nm/Nh, @hourly, @daily
+#
+# Examples:
+# */5 * * * * echo tick
+# @every 5m echo five-minutes
+# @boot echo system booted
+# @hourly echo hourly-check
+CRONTAB
+
 # GPT partition table
 echo "==> Creating GPT partition table..."
 "$MKGPT" "$DISK_IMG"

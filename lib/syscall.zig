@@ -348,6 +348,52 @@ pub fn getArgs() []const [*:0]const u8 {
     return argv_ptr[0..argc];
 }
 
+/// Read wall-clock epoch seconds from /dev/time.
+pub fn time() u64 {
+    return readTimeField(0);
+}
+
+/// Read uptime seconds from /dev/time.
+pub fn getUptime() u64 {
+    return readTimeField(1);
+}
+
+fn readTimeField(field: usize) u64 {
+    const fd_raw = open("/dev/time");
+    if (fd_raw < 0) return 0;
+    const fd: i32 = @intCast(fd_raw);
+    var buf: [64]u8 = undefined;
+    const n = read(fd, &buf);
+    _ = close(fd);
+    if (n <= 0) return 0;
+    const text = buf[0..@as(usize, @intCast(n))];
+    // Parse space-separated fields: "<epoch> <uptime>\n"
+    var start: usize = 0;
+    var idx: usize = 0;
+    for (text, 0..) |c, i| {
+        if (c == ' ' or c == '\n') {
+            if (idx == field) {
+                return parseU64(text[start..i]);
+            }
+            idx += 1;
+            start = i + 1;
+        }
+    }
+    if (idx == field and start < text.len) {
+        return parseU64(text[start..]);
+    }
+    return 0;
+}
+
+fn parseU64(s: []const u8) u64 {
+    var result: u64 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') break;
+        result = result *% 10 +% (c - '0');
+    }
+    return result;
+}
+
 fn syscall1(nr: SYS, a0: u64) u64 {
     return switch (arch) {
         .x86_64 => asm volatile ("syscall"

@@ -189,6 +189,20 @@ pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize, rsdp: ?[*]const
         }
     }
 
+    // RTC wall-clock time (read before timer starts)
+    const time = @import("time.zig");
+    if (builtin.cpu.arch == .x86_64) {
+        const rtc = @import("arch/x86_64/rtc.zig");
+        rtc.init();
+        time.init(rtc.boot_epoch);
+    } else if (builtin.cpu.arch == .riscv64) {
+        const rtc = @import("arch/riscv64/rtc.zig");
+        rtc.init();
+        time.init(rtc.boot_epoch);
+    } else {
+        time.init(0);
+    }
+
     // Phase 100: Timer tick counter (for TCP retransmission)
     const timer = @import("timer.zig");
     timer.init();
