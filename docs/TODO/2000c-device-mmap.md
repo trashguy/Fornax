@@ -1,4 +1,4 @@
-# Phase G2: Device-Backed mmap + Write-Combining
+# Phase 2000c: Device-Backed mmap + Write-Combining
 
 ## Status: Planning
 
@@ -88,7 +88,7 @@ Add `mapMmioRegionHuge(phys, virt, size)` that uses 2MB pages when alignment all
 
 ## Dependencies
 
-- Phase G0 (BAR size probing — need to know how much to map)
+- Phase 2000a (BAR size probing — need to know how much to map)
 
 ## Estimated Size
 

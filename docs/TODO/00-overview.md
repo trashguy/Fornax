@@ -14,6 +14,14 @@
 |-------|-------------|------------|
 | 1001e-k | fay package manager (sync, install, build, zig compiler) | 1001a-d |
 
+## Future: NIC Drivers (2100-series)
+
+Userspace NIC drivers via shared 2000-series device-driver primitives (PCI enhancement, device mmap, DMA alloc).
+
+| Phase | Description | Depends On |
+|-------|-------------|------------|
+| 2100 | RTL8125 NIC driver (r8169) — PCI cfg syscall, mmap_device, DMA alloc, ether driver mode | 2000a, 2000c |
+
 ## Future: Graphics Stack (2000-series)
 
 From bare GPU hardware to Chrome rendering in a Fornax window.
@@ -84,6 +92,9 @@ Phases 1-24, 100-101 (done)
 │   ├── 207 envfs
 │   └── 1001e-k fay package manager
 │
+├── Future: NIC Drivers
+│   └── 2000a + 2000c ── 2100 RTL8125 r8169 driver
+│
 ├── Future: Graphics
 │   ├── 2000 srv/gpu ── 2001 srv/draw ──┐
 │   ├── 2002 srv/input ─────────────────┤
@@ -106,6 +117,7 @@ Phases 1-24, 100-101 (done)
 |---|------|--------|--------|
 | 17 | Crashed server transparently restarts with client reconnection | 130 | Not started |
 | 18 | `fay install` fetches and installs a package | 1001e-k | Not started |
+| 19a | RTL8125 NIC driver serves /dev/ether0 on real hardware | 2100 | Not started |
 | 19 | Framebuffer accessible from userspace srv/gpu | 2000 | Not started |
 | 20 | Native app draws in a window | 2004 | Not started |
 | 21 | Chrome renders in a Fornax window | 2007 | Not started |

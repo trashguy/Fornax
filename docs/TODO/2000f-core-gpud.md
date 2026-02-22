@@ -1,4 +1,4 @@
-# Phase G5: Core GPU Server
+# Phase 2000f: Core GPU Server
 
 ## Status: Planning
 
@@ -117,13 +117,13 @@ mount at /dev/gpu/
 
 ## Dependencies
 
-- Phase G0 (PCI enhancement — device detection)
-- Phase G1 (IOAPIC + MSI-X — virtio-gpu interrupts)
-- Phase G2 (Device mmap — framebuffer/MMIO access)
-- Phase G3 (Shared memory — framebuffer resource backing for virtio-gpu)
-- Phase G4 (IRQ forwarding — virtio-gpu completion notifications)
+- Phase 2000a (PCI enhancement — device detection)
+- Phase 2000b (IOAPIC + MSI-X — virtio-gpu interrupts)
+- Phase 2000c (Device mmap — framebuffer/MMIO access)
+- Phase 2000d (Shared memory — framebuffer resource backing for virtio-gpu)
+- Phase 2000e (IRQ forwarding — virtio-gpu completion notifications)
 
-GOP and Bochs backends can work with just G0 + G2 (no MSI-X or shared memory needed).
+GOP and Bochs backends can work with just 2000a + 2000c (no MSI-X or shared memory needed).
 
 ## Estimated Size
 

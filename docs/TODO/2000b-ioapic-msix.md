@@ -1,4 +1,4 @@
-# Phase G1: IOAPIC + MSI-X
+# Phase 2000b: IOAPIC + MSI-X
 
 ## Status: Planning
 
@@ -71,7 +71,7 @@ Modify `interrupts.zig`:
 
 ## Dependencies
 
-- Phase G0 (PCI capabilities list — needed to find MSI-X capability)
+- Phase 2000a (PCI capabilities list — needed to find MSI-X capability)
 
 ## Estimated Size
 

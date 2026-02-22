@@ -1,4 +1,4 @@
-# Phase G3: Shared Memory
+# Phase 2000d: Shared Memory
 
 ## Status: Planning
 
@@ -105,7 +105,7 @@ const MAX_SEG_ATTACH = 8;  // max segments per process
 
 ## Dependencies
 
-None — standalone, though GPU server (Phase G5) is the primary consumer.
+None — standalone, though GPU server (Phase 2000f) is the primary consumer.
 
 ## Estimated Size
 

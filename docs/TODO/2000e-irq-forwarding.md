@@ -1,4 +1,4 @@
-# Phase G4: IRQ Forwarding to Userspace
+# Phase 2000e: IRQ Forwarding to Userspace
 
 ## Status: Planning
 
@@ -94,7 +94,7 @@ Cleanup on fd close / process exit: mask the interrupt, free the forward slot.
 
 ## Dependencies
 
-- Phase G1 (IOAPIC + MSI-X — need MSI-X configuration)
+- Phase 2000b (IOAPIC + MSI-X — need MSI-X configuration)
 
 ## Estimated Size
 

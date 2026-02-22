@@ -4,18 +4,18 @@
 
 ## Summary
 
-Three-tier GPU support architecture: kernel primitives (Phases G0-G4), core GPU server with generic backends (Phase G5), and vendor-specific AMD backends in a separate `fornax-amdgpu` repo (Phases G6-G7).
+Three-tier GPU support architecture: kernel primitives (Phases 2000a-2000e), core GPU server with generic backends (Phase 2000f), and vendor-specific AMD backends in a separate `fornax-amdgpu` repo (Phases G6-G7).
 
 ## Architecture
 
 ### Tier 1: Kernel — Minimal Primitives (Microkernel Philosophy)
 
 General-purpose additions to Fornax core (not GPU-specific):
-- Enhanced PCI: BAR probing, capabilities, MSI-X (Phase G0)
-- IOAPIC + MSI-X interrupt delivery (Phase G1)
-- Device-backed mmap + write-combining (Phase G2)
-- Plan 9 shared memory segments (Phase G3)
-- IRQ forwarding to userspace (Phase G4)
+- Enhanced PCI: BAR probing, capabilities, MSI-X (Phase 2000a)
+- IOAPIC + MSI-X interrupt delivery (Phase 2000b)
+- Device-backed mmap + write-combining (Phase 2000c)
+- Plan 9 shared memory segments (Phase 2000d)
+- IRQ forwarding to userspace (Phase 2000e)
 
 ### Tier 2: Core GPU Server — `lib/gpu/` + `srv/gpud/`
 
@@ -116,14 +116,14 @@ Total IPC per submission: 1 message, ~32 bytes. All bulk data in shared memory.
 ## Phase Ordering
 
 ### Kernel Prerequisites (Fornax core)
-1. **G0**: PCI Enhancement — BAR probing, multi-bus, capabilities, MSI-X parsing
-2. **G1**: IOAPIC + MSI-X — interrupt delivery infrastructure
-3. **G2**: Device-Backed mmap — userspace MMIO access + write-combining
-4. **G3**: Shared Memory — Plan 9 segments for zero-copy buffers
-5. **G4**: IRQ Forwarding — userspace interrupt notification
+1. **2000a**: PCI Enhancement — BAR probing, multi-bus, capabilities, MSI-X parsing
+2. **2000b**: IOAPIC + MSI-X — interrupt delivery infrastructure
+3. **2000c**: Device-Backed mmap — userspace MMIO access + write-combining
+4. **2000d**: Shared Memory — Plan 9 segments for zero-copy buffers
+5. **2000e**: IRQ Forwarding — userspace interrupt notification
 
 ### Core GPU Server (Fornax core)
-6. **G5**: Core gpud — GOP/Bochs/virtio-gpu backends, Plan 9 `/dev/gpu/*` interface
+6. **2000f**: Core gpud — GOP/Bochs/virtio-gpu backends, Plan 9 `/dev/gpu/*` interface
 
 ### AMD Hardware (`fornax-amdgpu` repo)
 7. **G6a**: IP Discovery + PSP Bootstrap (RDNA 2 iGPU)
@@ -153,9 +153,9 @@ Total IPC per submission: 1 message, ~32 bytes. All bulk data in shared memory.
 
 | Risk | Severity | Mitigation |
 |------|----------|------------|
-| No MSI-X in kernel | Showstopper | Must implement (Phase G1) |
-| No device-backed mmap | Showstopper | Must implement (Phase G2) |
-| No shared memory | Showstopper for Mesa | Must implement (Phase G3) |
+| No MSI-X in kernel | Showstopper | Must implement (Phase 2000b) |
+| No device-backed mmap | Showstopper | Must implement (Phase 2000c) |
+| No shared memory | Showstopper for Mesa | Must implement (Phase 2000d) |
 | PSP firmware loading | High | Careful port from Linux psp_v13_0.c / psp_v14_0.c |
 | RDNA 4 firmware blobs | High | Need latest linux-firmware; Navi 48 is very new |
 | MES initialization (RDNA 4) | High | Required for GFX 12; no legacy fallback |
