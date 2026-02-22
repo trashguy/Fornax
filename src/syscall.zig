@@ -59,6 +59,7 @@ pub const SYS = enum(u64) {
     clone = 37,
     futex = 38,
     ipc_pair = 39,
+    cntr_op = 40,
 };
 
 /// Error return values.
@@ -107,6 +108,9 @@ fn sendToServer(chan: *ipc.Channel, proc: *process.Process) void {
     if (!chan.client.enqueue(proc.pid, &proc.ipc_msg)) {
         // Queue full — leave process blocked, it will be retried
         // when a slot opens (on next sysIpcReply)
+        klog.debug("[sendToServer: QUEUE FULL for pid=");
+        klog.debugDec(proc.pid);
+        klog.debug("]\n");
         return;
     }
 
@@ -114,6 +118,12 @@ fn sendToServer(chan: *ipc.Channel, proc: *process.Process) void {
     if (chan.client.server_waiter_count > 0) {
         if (chan.client.popServerWaiter()) |server_pid_u16| {
             const server_pid: u32 = server_pid_u16;
+            // Clear legacy fields if they point to this server — prevents
+            // a subsequent sendToServer from double-waking via legacy path.
+            if (chan.client.blocked_pid == server_pid) {
+                chan.client.recv_waiting = false;
+                chan.client.blocked_pid = 0;
+            }
             if (process.getByPid(server_pid)) |server_proc| {
                 // Dequeue the entry we just enqueued and deliver it
                 if (chan.client.dequeue()) |entry| {
@@ -122,12 +132,14 @@ fn sendToServer(chan: *ipc.Channel, proc: *process.Process) void {
                     }
                     server_proc.ipc_serving_client = entry.pid;
                 }
-                process.markReady(server_proc);
+                // Set return value BEFORE markReady — another core could
+                // schedule this process immediately after markReady/IPI.
                 server_proc.syscall_ret = 0;
+                process.markReady(server_proc);
             }
         }
     } else if (chan.client.recv_waiting and chan.client.blocked_pid != 0) {
-        // Legacy single-server fast path
+        // Legacy single-server fast path (fallback when server_waiters is full)
         if (process.getByPid(chan.client.blocked_pid)) |server_proc| {
             if (chan.client.dequeue()) |entry| {
                 if (entry.msg_ptr) |msg_ptr| {
@@ -135,8 +147,8 @@ fn sendToServer(chan: *ipc.Channel, proc: *process.Process) void {
                 }
                 server_proc.ipc_serving_client = entry.pid;
             }
-            process.markReady(server_proc);
             server_proc.syscall_ret = 0;
+            process.markReady(server_proc);
             chan.client.recv_waiting = false;
             chan.client.blocked_pid = 0;
         }
@@ -154,6 +166,15 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         const percpu = @import("percpu.zig");
         const core_id = percpu.getCoreId();
         percpu.percpu_array[core_id].syscalls += 1;
+    }
+
+    // Linux compat: if process has compat=1, route to Linux syscall translation
+    {
+        const proc = process.getCurrent() orelse return ENOSYS;
+        if (proc.compat == 1) {
+            const linux_compat = @import("linux_compat.zig");
+            return linux_compat.linuxDispatch(nr, arg0, arg1, arg2, arg3, arg4);
+        }
     }
 
     const sys = std.meta.intToEnum(SYS, nr) catch {
@@ -204,13 +225,14 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         .bind => sysBind(arg0, arg1, arg2, arg3),
         .unmount => sysUnmount(arg0, arg1),
         .ipc_pair => sysIpcPair(arg0),
+        .cntr_op => sysCntrOp(arg0, arg1, arg2, arg3, arg4),
     };
 }
 
 /// write(fd, buf, count) → bytes_written
 /// fd 1/2 → direct framebuffer console + serial (bootstrap path).
 /// Other fds → IPC to file server via channel.
-fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
+pub fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
     const pipe_mod = @import("pipe.zig");
 
     // For fd 0/1/2, check if process has an explicit FdEntry override.
@@ -302,6 +324,11 @@ fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
     // Proc fd: write "kill" to /proc/N/ctl
     if (entry.fd_type == .proc) {
         return procWrite(entry, buf_ptr, count);
+    }
+
+    // Container fd: write to /cntr/N/ctl
+    if (entry.fd_type == .cntr) {
+        return cntrWrite(entry, buf_ptr, count);
     }
 
     // Virtual device fds: discard writes, return count
@@ -421,8 +448,8 @@ fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
         proc.pending_op = .write;
         proc.pending_fd = @intCast(fd);
 
-        sendToServer(chan, proc);
         proc.state = .blocked;
+        sendToServer(chan, proc);
         process.scheduleNext();
     }
 
@@ -434,13 +461,13 @@ fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
     proc.ipc_msg.data_len = len;
 
     proc.pending_op = .none;
-    sendToServer(chan, proc);
     proc.state = .blocked;
+    sendToServer(chan, proc);
     process.scheduleNext();
 }
 
 /// exit(status) — terminate the current process and schedule next.
-fn sysExit(status: u64) noreturn {
+pub fn sysExit(status: u64) noreturn {
     const proc = process.getCurrent() orelse process.scheduleNext();
 
     klog.debug("[Process ");
@@ -450,6 +477,19 @@ fn sysExit(status: u64) noreturn {
     klog.debug("]\n");
 
     proc.exit_status = @truncate(status);
+
+    // Decrement container process count + update state if init exits
+    if (proc.container_id != 0xFF) {
+        const container = @import("container.zig");
+        if (container.getById(proc.container_id)) |ct| {
+            container.removeProcess(ct);
+            // If this is the container's init process, mark container stopped/failed
+            if (ct.init_pid != null and ct.init_pid.? == proc.pid) {
+                ct.state = if (status == 0) .stopped else .failed;
+                ct.init_pid = null;
+            }
+        }
+    }
 
     // Kill all children recursively (Fornax orphan policy)
     process.killChildren(proc.pid);
@@ -501,6 +541,27 @@ fn sysExit(status: u64) noreturn {
                 }
                 if (entry.fd_type == .dev_ether) {
                     ether_mod.freeClient(entry.ether_client);
+                    fds[i] = null;
+                }
+                // IPC (server-backed) fd: send fire-and-forget T_CLOSE so
+                // the server frees its handle.  Only send if a server
+                // worker is waiting (fast-path delivery), which avoids
+                // pointer aliasing when multiple fds reuse proc.ipc_msg.
+                // The server's reply targets a dead process — sysIpcReply
+                // handles this gracefully (getByPid returns null → returns 0).
+                if (entry.server_handle > 0) {
+                    if (ipc.getChannel(entry.channel_id)) |chan| {
+                        chan.lock.lock();
+                        const has_waiter = chan.client.server_waiter_count > 0 or
+                            (chan.client.recv_waiting and chan.client.blocked_pid != 0);
+                        chan.lock.unlock();
+                        if (has_waiter) {
+                            proc.ipc_msg = ipc.Message.init(.t_close);
+                            writeU32LE(proc.ipc_msg.data_buf[0..4], entry.server_handle);
+                            proc.ipc_msg.data_len = 4;
+                            sendToServer(chan, proc);
+                        }
+                    }
                     fds[i] = null;
                 }
             }
@@ -565,7 +626,7 @@ fn sysExit(status: u64) noreturn {
 /// brk(new_brk) — adjust program break (heap top).
 /// If new_brk == 0, return current brk. Otherwise, expand heap by allocating
 /// and mapping pages for the new region, checking quotas.
-fn sysBrk(new_brk: u64) u64 {
+pub fn sysBrk(new_brk: u64) u64 {
     const proc = process.getCurrent() orelse return 0;
 
     // Lock thread group if threaded
@@ -619,7 +680,7 @@ fn sysBrk(new_brk: u64) u64 {
     return new_brk;
 }
 
-fn sysWait(pid_arg: u64, flags_arg: u64) u64 {
+pub fn sysWait(pid_arg: u64, flags_arg: u64) u64 {
     const proc = process.getCurrent() orelse return ENOSYS;
     const wait_pid: u32 = @truncate(pid_arg);
     const wnohang = (flags_arg & 1) != 0;
@@ -1136,7 +1197,7 @@ fn sysstatRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
     return to_copy;
 }
 
-fn devRandomFill(buf: []u8) void {
+pub fn devRandomFill(buf: []u8) void {
     var state = dev_random_state;
     // Seed from timer ticks on first call for some entropy
     if (state == 0x853c49e6748fea9b) {
@@ -1520,11 +1581,325 @@ fn procWrite(entry: process.FdEntry, buf_ptr: u64, count: u64) u64 {
     return EINVAL;
 }
 
+/// Read from /cntr/ virtual files.
+fn cntrRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
+    const container = @import("container.zig");
+    const dest: [*]u8 = @ptrFromInt(buf_ptr);
+    const max: usize = @intCast(@min(count, 4096));
+
+    switch (entry_ptr.cntr_kind) {
+        .dir => {
+            // List active containers as DirEntry structs (72 bytes each)
+            const entry_size = 72;
+            const all = container.getAll();
+            var total: usize = 0;
+            var offset: usize = entry_ptr.read_offset;
+
+            for (all) |*ct| {
+                if (!ct.active) continue;
+                if (total + entry_size > max) break;
+
+                if (offset > 0) {
+                    offset -= 1;
+                    continue;
+                }
+
+                // Build DirEntry: name[64], file_type u32, size u32
+                var ent_buf: [entry_size]u8 = @splat(0);
+                // Format ID as name
+                var dec_buf: [20]u8 = undefined;
+                const id_str = fmtDecimal(ct.id, &dec_buf);
+                @memcpy(ent_buf[0..id_str.len], id_str);
+                // file_type = 1 (directory)
+                ent_buf[64] = 1;
+                @memcpy(dest[total..][0..entry_size], &ent_buf);
+                total += entry_size;
+            }
+            entry_ptr.read_offset += @intCast(total / entry_size);
+            return total;
+        },
+        .clone => {
+            // Allocate a new container on first read
+            if (entry_ptr.read_offset > 0) return 0; // Already read
+
+            const ct = container.allocSlot() orelse return 0;
+            entry_ptr.read_offset = 1;
+            entry_ptr.cntr_id = ct.id;
+
+            // Return decimal ID string
+            var dec_buf: [20]u8 = undefined;
+            const id_str = fmtDecimal(ct.id, &dec_buf);
+            if (id_str.len <= max) {
+                @memcpy(dest[0..id_str.len], id_str);
+                return id_str.len;
+            }
+            return 0;
+        },
+        .status => {
+            if (entry_ptr.read_offset > 0) return 0; // One-shot read
+            const ct = container.getById(entry_ptr.cntr_id) orelse return 0;
+
+            // Build key-value status text using appendStr/appendKV helpers
+            var buf: [512]u8 = undefined;
+            var pos: usize = 0;
+
+            // "id N\n"
+            pos = appendKV(&buf, pos, "id", ct.id);
+
+            // "name <name>\n"
+            pos = appendStr(&buf, pos, "name ");
+            pos = appendStr(&buf, pos, ct.name[0..ct.name_len]);
+            if (pos < buf.len) {
+                buf[pos] = '\n';
+                pos += 1;
+            }
+
+            // "state <state>\n"
+            const state_str = switch (ct.state) {
+                .free => "free",
+                .created => "created",
+                .running => "running",
+                .stopped => "stopped",
+                .failed => "failed",
+            };
+            pos = appendStr(&buf, pos, "state ");
+            pos = appendStr(&buf, pos, state_str);
+            if (pos < buf.len) {
+                buf[pos] = '\n';
+                pos += 1;
+            }
+
+            // "compat <mode>\n"
+            pos = appendStr(&buf, pos, "compat ");
+            pos = appendStr(&buf, pos, if (ct.compat == .linux) "linux" else "fornax");
+            if (pos < buf.len) {
+                buf[pos] = '\n';
+                pos += 1;
+            }
+
+            // "init_pid N|none\n"
+            if (ct.init_pid) |pid| {
+                pos = appendKV(&buf, pos, "init_pid", pid);
+            } else {
+                pos = appendStr(&buf, pos, "init_pid none\n");
+            }
+
+            // Numeric KV fields
+            pos = appendKV(&buf, pos, "procs", ct.process_count);
+            pos = appendKV(&buf, pos, "pages", ct.pages_used_total);
+            pos = appendKV(&buf, pos, "quota_pages", ct.quotas.max_memory_pages);
+            pos = appendKV(&buf, pos, "quota_children", ct.quotas.max_children);
+
+            // "rootfs <path>\n"
+            pos = appendStr(&buf, pos, "rootfs ");
+            pos = appendStr(&buf, pos, ct.rootfs_path[0..ct.rootfs_path_len]);
+            if (pos < buf.len) {
+                buf[pos] = '\n';
+                pos += 1;
+            }
+
+            // "ip <a.b.c.d>\n" (if assigned)
+            if (ct.net_ip != 0) {
+                pos = appendStr(&buf, pos, "ip ");
+                const ip: u64 = ct.net_ip;
+                var dec_buf2: [20]u8 = undefined;
+                pos = appendStr(&buf, pos, fmtDecimal(ip & 0xFF, &dec_buf2));
+                if (pos < buf.len) { buf[pos] = '.'; pos += 1; }
+                pos = appendStr(&buf, pos, fmtDecimal((ip >> 8) & 0xFF, &dec_buf2));
+                if (pos < buf.len) { buf[pos] = '.'; pos += 1; }
+                pos = appendStr(&buf, pos, fmtDecimal((ip >> 16) & 0xFF, &dec_buf2));
+                if (pos < buf.len) { buf[pos] = '.'; pos += 1; }
+                pos = appendStr(&buf, pos, fmtDecimal((ip >> 24) & 0xFF, &dec_buf2));
+                if (pos < buf.len) { buf[pos] = '\n'; pos += 1; }
+            }
+
+            // "cmd <command>\n"
+            if (ct.cmd_len > 0) {
+                pos = appendStr(&buf, pos, "cmd ");
+                pos = appendStr(&buf, pos, ct.cmd[0..ct.cmd_len]);
+                if (pos < buf.len) { buf[pos] = '\n'; pos += 1; }
+            }
+
+            const to_copy = @min(pos, max);
+            @memcpy(dest[0..to_copy], buf[0..to_copy]);
+            entry_ptr.read_offset = 1;
+            return to_copy;
+        },
+        .procs => {
+            if (entry_ptr.read_offset > 0) return 0;
+            const ct = container.getById(entry_ptr.cntr_id) orelse return 0;
+
+            // List PIDs of processes in this container
+            var buf: [512]u8 = undefined;
+            var pos: usize = 0;
+            const table = process.getProcessTable();
+            for (table) |*p| {
+                if (p.state != .free and p.container_id == ct.id) {
+                    var dec_buf: [20]u8 = undefined;
+                    const pid_str = fmtDecimal(p.pid, &dec_buf);
+                    pos = appendStr(&buf, pos, pid_str);
+                    if (pos < buf.len) {
+                        buf[pos] = '\n';
+                        pos += 1;
+                    }
+                    if (pos >= buf.len - 16) break;
+                }
+            }
+
+            const to_copy = @min(pos, max);
+            @memcpy(dest[0..to_copy], buf[0..to_copy]);
+            entry_ptr.read_offset = 1;
+            return to_copy;
+        },
+        .ctl => return 0, // write-only
+    }
+}
+
+/// Write to /cntr/N/ctl.
+fn cntrWrite(entry: process.FdEntry, buf_ptr: u64, count: u64) u64 {
+    const container = @import("container.zig");
+
+    // Container processes cannot manage containers
+    if (process.getCurrent()) |caller| {
+        if (caller.container_id != container.HOST_CONTAINER) return @bitCast(@as(i64, -1));
+    }
+
+    if (entry.cntr_kind != .ctl) return EBADF;
+
+    const ct = container.getById(entry.cntr_id) orelse return ENOENT;
+    const buf: [*]const u8 = @ptrFromInt(buf_ptr);
+    const len: usize = @intCast(@min(count, 256));
+
+    // Strip trailing whitespace
+    var cmd_len = len;
+    while (cmd_len > 0 and (buf[cmd_len - 1] == '\n' or buf[cmd_len - 1] == ' ')) {
+        cmd_len -= 1;
+    }
+    if (cmd_len == 0) return EINVAL;
+
+    const cmd = buf[0..cmd_len];
+
+    // "stop" — kill all container processes
+    if (cmd_len == 4 and cmd[0] == 's' and cmd[1] == 't' and cmd[2] == 'o' and cmd[3] == 'p') {
+        container.stop(ct);
+        return len;
+    }
+
+    // "destroy" — stop + free slot
+    if (cmd_len == 7 and cmd[0] == 'd' and cmd[1] == 'e' and cmd[2] == 's' and
+        cmd[3] == 't' and cmd[4] == 'r' and cmd[5] == 'o' and cmd[6] == 'y')
+    {
+        container.destroy(ct);
+        return len;
+    }
+
+    // "name <name>" — set container name (created state only)
+    if (cmd_len > 5 and cmd[0] == 'n' and cmd[1] == 'a' and cmd[2] == 'm' and
+        cmd[3] == 'e' and cmd[4] == ' ')
+    {
+        if (ct.state != .created) return EINVAL;
+        const name = cmd[5..];
+        if (name.len > container.MAX_NAME) return EINVAL;
+        @memcpy(ct.name[0..name.len], name);
+        ct.name_len = @intCast(name.len);
+        return len;
+    }
+
+    // "rootfs <path>" — set rootfs path (created state only)
+    if (cmd_len > 7 and cmd[0] == 'r' and cmd[1] == 'o' and cmd[2] == 'o' and
+        cmd[3] == 't' and cmd[4] == 'f' and cmd[5] == 's' and cmd[6] == ' ')
+    {
+        if (ct.state != .created) return EINVAL;
+        const path = cmd[7..];
+        if (path.len > container.MAX_PATH) return EINVAL;
+        @memcpy(ct.rootfs_path[0..path.len], path);
+        ct.rootfs_path_len = @intCast(path.len);
+        return len;
+    }
+
+    // "compat linux" or "compat fornax"
+    if (cmd_len >= 12 and cmd[0] == 'c' and cmd[1] == 'o' and cmd[2] == 'm' and
+        cmd[3] == 'p' and cmd[4] == 'a' and cmd[5] == 't' and cmd[6] == ' ')
+    {
+        const arg = cmd[7..];
+        if (arg.len == 5 and arg[0] == 'l' and arg[1] == 'i' and arg[2] == 'n' and
+            arg[3] == 'u' and arg[4] == 'x')
+        {
+            ct.compat = .linux;
+            return len;
+        }
+        if (arg.len == 6 and arg[0] == 'f' and arg[1] == 'o' and arg[2] == 'r' and
+            arg[3] == 'n' and arg[4] == 'a' and arg[5] == 'x')
+        {
+            ct.compat = .fornax;
+            return len;
+        }
+        return EINVAL;
+    }
+
+    // "cmd <command>"
+    if (cmd_len > 4 and cmd[0] == 'c' and cmd[1] == 'm' and cmd[2] == 'd' and cmd[3] == ' ') {
+        const command = cmd[4..];
+        if (command.len > container.MAX_PATH) return EINVAL;
+        @memcpy(ct.cmd[0..command.len], command);
+        ct.cmd_len = @intCast(command.len);
+        return len;
+    }
+
+    // "quota pages N" or "quota children N"
+    if (cmd_len > 6 and cmd[0] == 'q' and cmd[1] == 'u' and cmd[2] == 'o' and
+        cmd[3] == 't' and cmd[4] == 'a' and cmd[5] == ' ')
+    {
+        const arg = cmd[6..];
+        if (arg.len > 6 and arg[0] == 'p' and arg[1] == 'a' and arg[2] == 'g' and
+            arg[3] == 'e' and arg[4] == 's' and arg[5] == ' ')
+        {
+            const val = parseDecimal(arg[6..]) orelse return EINVAL;
+            ct.quotas.max_memory_pages = @intCast(val);
+            return len;
+        }
+        if (arg.len > 9 and arg[0] == 'c' and arg[1] == 'h' and arg[2] == 'i' and
+            arg[3] == 'l' and arg[4] == 'd' and arg[5] == 'r' and arg[6] == 'e' and
+            arg[7] == 'n' and arg[8] == ' ')
+        {
+            const val = parseDecimal(arg[9..]) orelse return EINVAL;
+            ct.quotas.max_children = @intCast(val);
+            return len;
+        }
+        return EINVAL;
+    }
+
+    return EINVAL;
+}
+
+/// Format a decimal number into buffer, return bytes written.
+fn appendDec(buf: []u8, val: anytype) usize {
+    var v: u64 = @intCast(val);
+    if (v == 0) {
+        if (buf.len > 0) {
+            buf[0] = '0';
+            return 1;
+        }
+        return 0;
+    }
+    var tmp: [20]u8 = undefined;
+    var i: usize = 0;
+    while (v > 0) : (i += 1) {
+        tmp[i] = @intCast('0' + v % 10);
+        v /= 10;
+    }
+    if (i > buf.len) return 0;
+    for (0..i) |j| {
+        buf[j] = tmp[i - 1 - j];
+    }
+    return i;
+}
+
 /// open(path_ptr, path_len) → fd
 /// Resolves path in the process's namespace. For kernel-backed channels (initrd),
 /// allocates fd directly. For server channels, sends T_OPEN and blocks for reply.
 /// Paths starting with /net/ are intercepted for kernel TCP/DNS.
-fn sysOpen(path_ptr: u64, path_len: u64) u64 {
+pub fn sysOpen(path_ptr: u64, path_len: u64) u64 {
     const proc = process.getCurrent() orelse return ENOSYS;
     if (path_ptr >= 0x0000_8000_0000_0000) return EFAULT;
     if (path_len == 0 or path_len > 256) return ENOENT;
@@ -1593,6 +1968,8 @@ fn sysOpen(path_ptr: u64, path_len: u64) u64 {
             return proc.allocDevFd(.dev_kmesg) orelse return EMFILE;
         }
         if (strEql(path_slice, "/dev/reboot")) {
+            // Container processes cannot reboot the host
+            if (proc.container_id != 0xFF) return @bitCast(@as(i64, -1));
             return proc.allocDevFd(.dev_reboot) orelse return EMFILE;
         }
         if (strEql(path_slice, "/dev/drivers")) {
@@ -1636,6 +2013,68 @@ fn sysOpen(path_ptr: u64, path_len: u64) u64 {
         }
 
         return fd;
+    }
+
+    // Intercept /cntr/* paths for container management
+    if (path_len >= 5 and path_slice[0] == '/' and path_slice[1] == 'c' and
+        path_slice[2] == 'n' and path_slice[3] == 't' and path_slice[4] == 'r')
+    {
+        const container = @import("container.zig");
+
+        // "/cntr" or "/cntr/" — directory listing
+        if (path_len == 5 or (path_len == 6 and path_slice[5] == '/')) {
+            return proc.allocCntrFd(.dir, 0) orelse return EMFILE;
+        }
+
+        if (path_slice[5] != '/') return ENOENT;
+        const cntr_suffix = path_slice[6..];
+
+        // "/cntr/clone" — allocate new container
+        if (cntr_suffix.len == 5 and cntr_suffix[0] == 'c' and cntr_suffix[1] == 'l' and
+            cntr_suffix[2] == 'o' and cntr_suffix[3] == 'n' and cntr_suffix[4] == 'e')
+        {
+            return proc.allocCntrFd(.clone, 0) orelse return EMFILE;
+        }
+
+        // Parse container ID: digits until '/' or end
+        var cntr_id: u32 = 0;
+        var ci: usize = 0;
+        while (ci < cntr_suffix.len and cntr_suffix[ci] >= '0' and cntr_suffix[ci] <= '9') : (ci += 1) {
+            cntr_id = cntr_id * 10 + (cntr_suffix[ci] - '0');
+        }
+        if (ci == 0 or cntr_id >= container.MAX_CONTAINERS) return ENOENT;
+
+        // Verify container exists
+        if (container.getById(@intCast(cntr_id)) == null) return ENOENT;
+
+        // "/cntr/N" — per-container directory
+        if (ci == cntr_suffix.len) {
+            return proc.allocCntrFd(.status, @intCast(cntr_id)) orelse return EMFILE;
+        }
+
+        if (cntr_suffix[ci] != '/') return ENOENT;
+        const file = cntr_suffix[ci + 1 ..];
+
+        // "/cntr/N/status"
+        if (file.len == 6 and file[0] == 's' and file[1] == 't' and
+            file[2] == 'a' and file[3] == 't' and file[4] == 'u' and file[5] == 's')
+        {
+            return proc.allocCntrFd(.status, @intCast(cntr_id)) orelse return EMFILE;
+        }
+
+        // "/cntr/N/ctl"
+        if (file.len == 3 and file[0] == 'c' and file[1] == 't' and file[2] == 'l') {
+            return proc.allocCntrFd(.ctl, @intCast(cntr_id)) orelse return EMFILE;
+        }
+
+        // "/cntr/N/procs"
+        if (file.len == 5 and file[0] == 'p' and file[1] == 'r' and
+            file[2] == 'o' and file[3] == 'c' and file[4] == 's')
+        {
+            return proc.allocCntrFd(.procs, @intCast(cntr_id)) orelse return EMFILE;
+        }
+
+        return ENOENT;
     }
 
     // Intercept /proc/* paths for kernel process info
@@ -1707,30 +2146,36 @@ fn sysOpen(path_ptr: u64, path_len: u64) u64 {
     // Server channel: send T_OPEN with path suffix
     const fd = proc.allocFd(resolved.channel_id, false) orelse return EMFILE;
 
-    proc.pending_op = .open;
+    // Linux compat: if linux_stat_buf is set, this open is phase 1 of a path stat
+    proc.pending_op = if (proc.linux_stat_buf != 0) .linux_stat_open else .open;
     proc.pending_fd = fd;
 
-    // Build T_OPEN: data = [suffix bytes]
+    // Build T_OPEN: data = [prefix][suffix]
     proc.ipc_msg = ipc.Message.init(.t_open);
+    const prefix = resolved.prefix;
     const suffix = resolved.suffix;
+    const prefix_len: u32 = @intCast(prefix.len);
     const suffix_len: u32 = @intCast(suffix.len);
-    if (suffix_len > 0) {
-        @memcpy(proc.ipc_msg.data_buf[0..suffix_len], suffix);
+    if (prefix_len > 0) {
+        @memcpy(proc.ipc_msg.data_buf[0..prefix_len], prefix);
     }
-    proc.ipc_msg.data_len = suffix_len;
+    if (suffix_len > 0) {
+        @memcpy(proc.ipc_msg.data_buf[prefix_len..][0..suffix_len], suffix);
+    }
+    proc.ipc_msg.data_len = prefix_len + suffix_len;
 
     // Pre-set return value (overridden on error in reply handler)
     proc.syscall_ret = fd;
 
-    sendToServer(chan, proc);
     proc.state = .blocked;
+    sendToServer(chan, proc);
     process.scheduleNext();
 }
 
 /// create(path_ptr, path_len, flags) → fd
 /// Like open but creates the file if it doesn't exist.
 /// flags bit 0 = directory.
-fn sysCreate(path_ptr: u64, path_len: u64, flags: u64) u64 {
+pub fn sysCreate(path_ptr: u64, path_len: u64, flags: u64) u64 {
     const proc = process.getCurrent() orelse return ENOSYS;
     if (path_ptr >= 0x0000_8000_0000_0000) return EFAULT;
     if (path_len == 0 or path_len > 256) return ENOENT;
@@ -1748,26 +2193,31 @@ fn sysCreate(path_ptr: u64, path_len: u64, flags: u64) u64 {
     proc.pending_op = .create;
     proc.pending_fd = fd;
 
-    // Build T_CREATE: [flags: u32][suffix bytes]
+    // Build T_CREATE: [flags: u32][prefix][suffix]
     proc.ipc_msg = ipc.Message.init(.t_create);
     writeU32LE(proc.ipc_msg.data_buf[0..4], @truncate(flags));
+    const c_prefix = resolved.prefix;
     const suffix = resolved.suffix;
+    const c_prefix_len: u32 = @intCast(c_prefix.len);
     const suffix_len: u32 = @intCast(suffix.len);
-    if (suffix_len > 0) {
-        @memcpy(proc.ipc_msg.data_buf[4..][0..suffix_len], suffix);
+    if (c_prefix_len > 0) {
+        @memcpy(proc.ipc_msg.data_buf[4..][0..c_prefix_len], c_prefix);
     }
-    proc.ipc_msg.data_len = 4 + suffix_len;
+    if (suffix_len > 0) {
+        @memcpy(proc.ipc_msg.data_buf[4 + c_prefix_len ..][0..suffix_len], suffix);
+    }
+    proc.ipc_msg.data_len = 4 + c_prefix_len + suffix_len;
 
     proc.syscall_ret = fd;
 
-    sendToServer(chan, proc);
     proc.state = .blocked;
+    sendToServer(chan, proc);
     process.scheduleNext();
 }
 
 /// read(fd, buf, count) → bytes_read
 /// For IPC channels: sends T_READ to the server and blocks for reply.
-fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
+pub fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
     const pipe_mod = @import("pipe.zig");
 
     // For fd 0, check if process has an explicit FdEntry override.
@@ -1856,6 +2306,11 @@ fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
         return procRead(entry_ptr, buf_ptr, count);
     }
 
+    // Container fd: kernel-generated container info
+    if (entry_ptr.fd_type == .cntr) {
+        return cntrRead(entry_ptr, buf_ptr, count);
+    }
+
     // Virtual device fds
     if (entry_ptr.fd_type == .dev_null) return 0; // EOF
     if (entry_ptr.fd_type == .dev_zero) {
@@ -1941,8 +2396,8 @@ fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
         proc.pending_fd = @intCast(fd);
         proc.ipc_recv_buf_ptr = buf_ptr;
 
-        sendToServer(chan, proc);
         proc.state = .blocked;
+        sendToServer(chan, proc);
         process.scheduleNext();
     }
 
@@ -1955,8 +2410,8 @@ fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
     proc.pending_op = .none;
     proc.ipc_recv_buf_ptr = buf_ptr;
 
-    sendToServer(chan, proc);
     proc.state = .blocked;
+    sendToServer(chan, proc);
     process.scheduleNext();
 }
 
@@ -2056,7 +2511,7 @@ fn sysKlog(buf_ptr: u64, buf_len: u64, offset: u64) u64 {
 
 /// sysinfo(info_ptr) → 0 or error
 /// Writes SysInfo struct { total_pages: u64, free_pages: u64, page_size: u64 } to user buffer.
-fn sysSysinfo(info_ptr: u64) u64 {
+pub fn sysSysinfo(info_ptr: u64) u64 {
     if (info_ptr >= 0x0000_8000_0000_0000) return EFAULT;
     if (info_ptr % 8 != 0) return EFAULT;
 
@@ -2085,6 +2540,13 @@ fn sysShutdown(flags: u64) noreturn {
         .riscv64 => @import("arch/riscv64/cpu.zig"),
         else => @compileError("unsupported arch for shutdown"),
     };
+    // Container processes cannot shut down the host
+    if (process.getCurrent()) |proc| {
+        if (proc.container_id != 0xFF) {
+            proc.state = .dead;
+            process.scheduleNext();
+        }
+    }
     if (flags == 1) {
         klog.warn("syscall: reboot requested\n");
         cpu.resetSystem();
@@ -2131,7 +2593,7 @@ fn sysUnmount(path_ptr: u64, path_len: u64) u64 {
     return 0;
 }
 
-fn sysSeek(fd: u64, offset: u64, whence: u64) u64 {
+pub fn sysSeek(fd: u64, offset: u64, whence: u64) u64 {
     const proc = process.getCurrent() orelse return ENOSYS;
     const entry_ptr = proc.getFdEntryPtr(@intCast(fd)) orelse return EBADF;
 
@@ -2143,7 +2605,7 @@ fn sysSeek(fd: u64, offset: u64, whence: u64) u64 {
     return entry_ptr.read_offset;
 }
 
-fn sysGetpid(which: u64) u64 {
+pub fn sysGetpid(which: u64) u64 {
     const proc = process.getCurrent() orelse return ENOSYS;
     if (which == 1) {
         // getppid
@@ -2153,7 +2615,7 @@ fn sysGetpid(which: u64) u64 {
 }
 
 /// close(fd) → 0 or error
-fn sysClose(fd: u64) u64 {
+pub fn sysClose(fd: u64) u64 {
     const proc = process.getCurrent() orelse return EBADF;
     if (fd >= 32) return EBADF;
 
@@ -2213,8 +2675,8 @@ fn sysClose(fd: u64) u64 {
         proc.pending_op = .close;
         proc.pending_fd = @intCast(fd);
 
-        sendToServer(chan, proc);
         proc.state = .blocked;
+        sendToServer(chan, proc);
         process.scheduleNext();
     }
 
@@ -2225,7 +2687,7 @@ fn sysClose(fd: u64) u64 {
 
 /// pipe(result_ptr) → 0 on success, negative on error.
 /// Creates a pipe and writes [read_fd: u32, write_fd: u32] to result_ptr.
-fn sysPipe(result_ptr: u64) u64 {
+pub fn sysPipe(result_ptr: u64) u64 {
     if (result_ptr == 0 or result_ptr >= 0x0000_8000_0000_0000) return EFAULT;
 
     const proc = process.getCurrent() orelse return EBADF;
@@ -2259,7 +2721,7 @@ fn sysPipe(result_ptr: u64) u64 {
 
 /// stat(fd, stat_buf_ptr) → 0 on success, negative on error.
 /// Returns file metadata (size, type) into user-provided Stat buffer.
-fn sysStat(fd: u64, stat_buf_ptr: u64) u64 {
+pub fn sysStat(fd: u64, stat_buf_ptr: u64) u64 {
     const proc = process.getCurrent() orelse return ENOSYS;
     if (stat_buf_ptr >= 0x0000_8000_0000_0000 or stat_buf_ptr == 0) return EFAULT;
     if (fd >= 32) return EBADF;
@@ -2279,6 +2741,16 @@ fn sysStat(fd: u64, stat_buf_ptr: u64) u64 {
         @memset(stat_ptr, 0);
         // file_type at offset 4: 1=directory for dir/pid_dir, 0=file otherwise
         if (entry.proc_kind == .dir or entry.proc_kind == .pid_dir) {
+            writeU32LE(@ptrCast(stat_ptr[4..8]), 1);
+        }
+        return 0;
+    }
+
+    // Container fds: synthetic stat
+    if (entry.fd_type == .cntr) {
+        const stat_ptr: *align(1) [64]u8 = @ptrFromInt(stat_buf_ptr);
+        @memset(stat_ptr, 0);
+        if (entry.cntr_kind == .dir) {
             writeU32LE(@ptrCast(stat_ptr[4..8]), 1);
         }
         return 0;
@@ -2314,8 +2786,8 @@ fn sysStat(fd: u64, stat_buf_ptr: u64) u64 {
         proc.pending_fd = @intCast(fd);
         proc.ipc_recv_buf_ptr = stat_buf_ptr;
 
-        sendToServer(chan, proc);
         proc.state = .blocked;
+        sendToServer(chan, proc);
         process.scheduleNext();
     }
 
@@ -2324,7 +2796,7 @@ fn sysStat(fd: u64, stat_buf_ptr: u64) u64 {
 
 /// remove(path_ptr, path_len) → 0 or negative error.
 /// Resolve path in namespace, send T_REMOVE to the server.
-fn sysRemove(path_ptr: u64, path_len: u64) u64 {
+pub fn sysRemove(path_ptr: u64, path_len: u64) u64 {
     const proc = process.getCurrent() orelse return ENOSYS;
     if (path_ptr >= 0x0000_8000_0000_0000) return EFAULT;
     if (path_len == 0 or path_len > 256) return ENOENT;
@@ -2339,27 +2811,32 @@ fn sysRemove(path_ptr: u64, path_len: u64) u64 {
     // Cannot remove on kernel-backed channels
     if (chan.kernel_data != null) return ENOSYS;
 
-    // Send T_REMOVE with path suffix
+    // Send T_REMOVE with [prefix][suffix]
     proc.ipc_msg = ipc.Message.init(.t_remove);
+    const rm_prefix = resolved.prefix;
     const suffix = resolved.suffix;
+    const rm_prefix_len: u32 = @intCast(rm_prefix.len);
     const suffix_len: u32 = @intCast(suffix.len);
-    if (suffix_len > 0) {
-        @memcpy(proc.ipc_msg.data_buf[0..suffix_len], suffix);
+    if (rm_prefix_len > 0) {
+        @memcpy(proc.ipc_msg.data_buf[0..rm_prefix_len], rm_prefix);
     }
-    proc.ipc_msg.data_len = suffix_len;
+    if (suffix_len > 0) {
+        @memcpy(proc.ipc_msg.data_buf[rm_prefix_len..][0..suffix_len], suffix);
+    }
+    proc.ipc_msg.data_len = rm_prefix_len + suffix_len;
 
     proc.pending_op = .remove;
     proc.pending_fd = 0;
     proc.syscall_ret = 0;
 
-    sendToServer(chan, proc);
     proc.state = .blocked;
+    sendToServer(chan, proc);
     process.scheduleNext();
 }
 
 /// rename(old_path_ptr, old_path_len, new_path_ptr, new_path_len) → 0 or negative error.
 /// Resolves both paths, verifies same server, sends T_RENAME.
-fn sysRename(old_ptr: u64, old_len: u64, new_ptr: u64, new_len: u64) u64 {
+pub fn sysRename(old_ptr: u64, old_len: u64, new_ptr: u64, new_len: u64) u64 {
     const proc = process.getCurrent() orelse return ENOSYS;
     if (old_ptr >= 0x0000_8000_0000_0000 or new_ptr >= 0x0000_8000_0000_0000) return EFAULT;
     if (old_len == 0 or old_len > 256 or new_len == 0 or new_len > 256) return ENOENT;
@@ -2376,21 +2853,38 @@ fn sysRename(old_ptr: u64, old_len: u64, new_ptr: u64, new_len: u64) u64 {
     const chan = ipc.getChannel(old_resolved.channel_id) orelse return ENOENT;
     if (chan.kernel_data != null) return ENOSYS;
 
-    // Build T_RENAME: old_suffix \0 new_suffix
+    // Build T_RENAME: [old_prefix][old_suffix] \0 [new_prefix][new_suffix]
     proc.ipc_msg = ipc.Message.init(.t_rename);
+    const old_prefix = old_resolved.prefix;
     const old_suffix = old_resolved.suffix;
+    const new_prefix = new_resolved.prefix;
     const new_suffix = new_resolved.suffix;
+    const old_plen: u32 = @intCast(old_prefix.len);
     const old_slen: u32 = @intCast(old_suffix.len);
+    const new_plen: u32 = @intCast(new_prefix.len);
     const new_slen: u32 = @intCast(new_suffix.len);
-    const total: u32 = old_slen + 1 + new_slen;
+    const old_total = old_plen + old_slen;
+    const new_total = new_plen + new_slen;
+    const total: u32 = old_total + 1 + new_total;
     if (total > ipc.MAX_MSG_DATA) return ENOENT;
 
-    if (old_slen > 0) {
-        @memcpy(proc.ipc_msg.data_buf[0..old_slen], old_suffix);
+    var pos: u32 = 0;
+    if (old_plen > 0) {
+        @memcpy(proc.ipc_msg.data_buf[pos..][0..old_plen], old_prefix);
+        pos += old_plen;
     }
-    proc.ipc_msg.data_buf[old_slen] = 0; // separator
+    if (old_slen > 0) {
+        @memcpy(proc.ipc_msg.data_buf[pos..][0..old_slen], old_suffix);
+        pos += old_slen;
+    }
+    proc.ipc_msg.data_buf[pos] = 0; // separator
+    pos += 1;
+    if (new_plen > 0) {
+        @memcpy(proc.ipc_msg.data_buf[pos..][0..new_plen], new_prefix);
+        pos += new_plen;
+    }
     if (new_slen > 0) {
-        @memcpy(proc.ipc_msg.data_buf[old_slen + 1 ..][0..new_slen], new_suffix);
+        @memcpy(proc.ipc_msg.data_buf[pos..][0..new_slen], new_suffix);
     }
     proc.ipc_msg.data_len = total;
 
@@ -2398,14 +2892,14 @@ fn sysRename(old_ptr: u64, old_len: u64, new_ptr: u64, new_len: u64) u64 {
     proc.pending_fd = 0;
     proc.syscall_ret = 0;
 
-    sendToServer(chan, proc);
     proc.state = .blocked;
+    sendToServer(chan, proc);
     process.scheduleNext();
 }
 
 /// truncate(fd, new_size) → 0 or negative error.
 /// Sends T_TRUNCATE to the server with handle + new size.
-fn sysTruncate(fd: u64, new_size: u64) u64 {
+pub fn sysTruncate(fd: u64, new_size: u64) u64 {
     const proc = process.getCurrent() orelse return ENOSYS;
     const entry = proc.getFdEntry(@intCast(fd)) orelse return EBADF;
 
@@ -2422,8 +2916,8 @@ fn sysTruncate(fd: u64, new_size: u64) u64 {
     proc.pending_fd = @intCast(fd);
     proc.syscall_ret = 0;
 
-    sendToServer(chan, proc);
     proc.state = .blocked;
+    sendToServer(chan, proc);
     process.scheduleNext();
 }
 
@@ -2450,8 +2944,8 @@ fn sysWstat(fd: u64, mode: u64, uid: u64, gid: u64, mask: u64) u64 {
     proc.pending_fd = @intCast(fd);
     proc.syscall_ret = 0;
 
-    sendToServer(chan, proc);
     proc.state = .blocked;
+    sendToServer(chan, proc);
     process.scheduleNext();
 }
 
@@ -2473,7 +2967,7 @@ fn sysGetuid() u64 {
 /// SYS 32: mmap — Anonymous memory mapping.
 /// args: addr (hint, ignored), length, prot, flags
 /// Returns virtual address of mapped region, or error.
-fn sysMmap(addr_hint: u64, length: u64, prot: u64, flags: u64) u64 {
+pub fn sysMmap(addr_hint: u64, length: u64, prot: u64, flags: u64) u64 {
     _ = addr_hint;
     const proc = process.getCurrent() orelse return ENOSYS;
 
@@ -2524,7 +3018,7 @@ fn sysMmap(addr_hint: u64, length: u64, prot: u64, flags: u64) u64 {
 
 /// SYS 33: munmap — Unmap memory region.
 /// Currently a no-op (acceptable leak for Phase 1000).
-fn sysMunmap(addr: u64, length: u64) u64 {
+pub fn sysMunmap(addr: u64, length: u64) u64 {
     _ = addr;
     _ = length;
     // Don't free physical pages — acceptable for single-threaded POSIX programs.
@@ -2532,7 +3026,7 @@ fn sysMunmap(addr: u64, length: u64) u64 {
 }
 
 /// SYS 34: dup — Duplicate file descriptor to lowest free slot.
-fn sysDup(old_fd: u64) u64 {
+pub fn sysDup(old_fd: u64) u64 {
     const proc = process.getCurrent() orelse return ENOSYS;
     if (old_fd >= process.MAX_FDS) return EBADF;
     const fds = process.thread_group.getFdSlice(proc);
@@ -2551,6 +3045,9 @@ fn sysDup(old_fd: u64) u64 {
                     pipe_mod.incrementWriters(entry.pipe_id);
                 }
             }
+            if (entry.fd_type == .dev_ether) {
+                @import("ether.zig").incRefClient(entry.ether_client);
+            }
             return @intCast(i);
         }
     }
@@ -2558,7 +3055,7 @@ fn sysDup(old_fd: u64) u64 {
 }
 
 /// SYS 35: dup2 — Duplicate old_fd to new_fd (closing new_fd first if open).
-fn sysDup2(old_fd: u64, new_fd: u64) u64 {
+pub fn sysDup2(old_fd: u64, new_fd: u64) u64 {
     const proc = process.getCurrent() orelse return ENOSYS;
     if (old_fd >= process.MAX_FDS or new_fd >= process.MAX_FDS) return EBADF;
     const fds = process.thread_group.getFdSlice(proc);
@@ -2570,12 +3067,15 @@ fn sysDup2(old_fd: u64, new_fd: u64) u64 {
     // Close new_fd if open
     if (fds[@intCast(new_fd)]) |existing| {
         if (existing.fd_type == .pipe) {
-            const pipe_mod = @import("pipe.zig");
+            const pipe_mod2 = @import("pipe.zig");
             if (existing.pipe_is_read) {
-                pipe_mod.closeReadEnd(existing.pipe_id);
+                pipe_mod2.closeReadEnd(existing.pipe_id);
             } else {
-                pipe_mod.closeWriteEnd(existing.pipe_id);
+                pipe_mod2.closeWriteEnd(existing.pipe_id);
             }
+        }
+        if (existing.fd_type == .dev_ether) {
+            @import("ether.zig").freeClient(existing.ether_client);
         }
         fds[@intCast(new_fd)] = null;
     }
@@ -2583,19 +3083,22 @@ fn sysDup2(old_fd: u64, new_fd: u64) u64 {
     fds[@intCast(new_fd)] = entry;
     // Increment pipe refcounts
     if (entry.fd_type == .pipe) {
-        const pipe_mod = @import("pipe.zig");
+        const pipe_mod2 = @import("pipe.zig");
         if (entry.pipe_is_read) {
-            pipe_mod.incrementReaders(entry.pipe_id);
+            pipe_mod2.incrementReaders(entry.pipe_id);
         } else {
-            pipe_mod.incrementWriters(entry.pipe_id);
+            pipe_mod2.incrementWriters(entry.pipe_id);
         }
+    }
+    if (entry.fd_type == .dev_ether) {
+        @import("ether.zig").incRefClient(entry.ether_client);
     }
     return new_fd;
 }
 
 /// SYS 36: arch_prctl — Set/get architecture-specific thread state.
 /// cmd: ARCH_SET_FS (0x1002) to set FS base for TLS.
-fn sysArchPrctl(cmd: u64, addr: u64) u64 {
+pub fn sysArchPrctl(cmd: u64, addr: u64) u64 {
     if (@import("builtin").cpu.arch != .x86_64) return ENOSYS;
     const cpu = @import("arch/x86_64/cpu.zig");
     const proc = process.getCurrent() orelse return ENOSYS;
@@ -2617,7 +3120,7 @@ fn sysArchPrctl(cmd: u64, addr: u64) u64 {
 ///
 /// musl's __clone asm pushes func+arg onto the new stack before calling clone.
 /// The child pops them off and calls func(arg) — we just set up the register state.
-fn sysClone(stack_top: u64, tls: u64, ctid_ptr: u64, ptid_ptr: u64, flags: u64) u64 {
+pub fn sysClone(stack_top: u64, tls: u64, ctid_ptr: u64, ptid_ptr: u64, flags: u64) u64 {
     _ = flags;
     const parent = process.getCurrent() orelse return ENOSYS;
 
@@ -2656,7 +3159,7 @@ fn sysClone(stack_top: u64, tls: u64, ctid_ptr: u64, ptid_ptr: u64, flags: u64) 
 }
 
 /// futex(addr, op, val, timeout) — placeholder, implemented in Phase J
-fn sysFutex(addr: u64, op: u64, val: u64, timeout: u64) u64 {
+pub fn sysFutex(addr: u64, op: u64, val: u64, timeout: u64) u64 {
     _ = timeout;
     const futex_mod = @import("futex.zig");
     const proc = process.getCurrent() orelse return ENOSYS;
@@ -2679,6 +3182,7 @@ fn sysFutex(addr: u64, op: u64, val: u64, timeout: u64) u64 {
 /// Copy file descriptor table from parent to child, incrementing pipe refcounts.
 fn copyFdTable(parent: *process.Process, child: *process.Process) void {
     const pipe_mod = @import("pipe.zig");
+    const ether_mod = @import("ether.zig");
     const fds = process.thread_group.getFdSlice(parent);
     for (0..process.MAX_FDS) |i| {
         if (fds[i]) |fentry| {
@@ -2690,11 +3194,14 @@ fn copyFdTable(parent: *process.Process, child: *process.Process) void {
                     pipe_mod.incrementWriters(fentry.pipe_id);
                 }
             }
+            if (fentry.fd_type == .dev_ether) {
+                ether_mod.incRefClient(fentry.ether_client);
+            }
         }
     }
 }
 
-fn sysRfork(flags: u64) u64 {
+pub fn sysRfork(flags: u64) u64 {
     const RFPROC: u64 = 0x01;
     const RFCFDG: u64 = 0x04;
     const RFNAMEG: u64 = 0x08;
@@ -2841,9 +3348,15 @@ fn sysIpcRecv(fd: u64, msg_buf_ptr: u64) u64 {
 
     // No message pending — add to server wait queue and block
     proc.ipc_recv_buf_ptr = msg_buf_ptr;
-    _ = chan.client.addServerWaiter(@intCast(proc.pid));
-    chan.client.recv_waiting = true;
-    chan.client.blocked_pid = proc.pid;
+    if (chan.client.addServerWaiter(@intCast(proc.pid))) {
+        // Successfully added to multi-server wait queue.
+        // Do NOT set legacy recv_waiting/blocked_pid — those are only
+        // for fallback when server_waiters is full.
+    } else {
+        // Queue full — use legacy single-waiter as fallback
+        chan.client.recv_waiting = true;
+        chan.client.blocked_pid = proc.pid;
+    }
     proc.state = .blocked;
 
     chan.lock.unlock();
@@ -2943,6 +3456,61 @@ fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
         .truncate, .wstat => {
             client_proc.syscall_ret = if (is_ok) 0 else EIO;
         },
+        .linux_stat_open => {
+            // Linux compat multi-step stat: open phase completed.
+            if (is_ok and reply_data_len >= 4) {
+                const handle = readU32LE(reply_data_ptr[0..4]);
+                if (client_proc.getFdEntryPtr(client_proc.pending_fd)) |fd_entry| {
+                    fd_entry.server_handle = handle;
+                }
+                // Phase 1 done. Send T_STAT to same server.
+                client_proc.ipc_msg = ipc.Message.init(.t_stat);
+                writeU32LE(client_proc.ipc_msg.data_buf[0..4], handle);
+                client_proc.ipc_msg.data_len = 4;
+                client_proc.pending_op = .linux_stat_done;
+                client_proc.ipc_recv_buf_ptr = client_proc.linux_stat_buf;
+                client_proc.linux_stat_fd = client_proc.pending_fd;
+                // Get channel and enqueue T_STAT
+                if (client_proc.getFdEntry(client_proc.pending_fd)) |fd_entry| {
+                    if (ipc.getChannel(fd_entry.channel_id)) |stat_chan| {
+                        sendToServer(stat_chan, client_proc);
+                        proc.ipc_serving_client = 0;
+                        return 0; // Don't markReady — still blocked
+                    }
+                }
+                // Fallback: can't stat, return error
+                client_proc.closeFd(client_proc.pending_fd);
+                client_proc.linux_stat_buf = 0;
+                client_proc.linux_stat_fd = 0;
+                client_proc.syscall_ret = EIO;
+            } else {
+                client_proc.closeFd(client_proc.pending_fd);
+                client_proc.linux_stat_buf = 0;
+                client_proc.syscall_ret = ENOENT;
+            }
+        },
+        .linux_stat_done => {
+            // Linux compat multi-step stat: stat phase completed. Translate + close.
+            if (is_ok and reply_data_len > 0 and client_proc.ipc_recv_buf_ptr != 0) {
+                client_proc.ipc_msg = ipc.Message.init(.r_ok);
+                const copy_len = @min(reply_data_len, 64);
+                client_proc.ipc_msg.data_len = copy_len;
+                @memcpy(client_proc.ipc_msg.data_buf[0..copy_len], reply_data_ptr[0..copy_len]);
+                client_proc.ipc_pending_msg = &client_proc.ipc_msg;
+                // Set pending_op to .stat so switchTo delivers raw data + translates
+                client_proc.pending_op = .stat;
+                client_proc.syscall_ret = 0;
+            } else {
+                client_proc.syscall_ret = if (is_ok) 0 else EIO;
+                client_proc.ipc_recv_buf_ptr = 0;
+            }
+            // Close the temp fd
+            if (client_proc.linux_stat_fd > 0) {
+                client_proc.closeFd(client_proc.linux_stat_fd);
+            }
+            client_proc.linux_stat_fd = 0;
+            client_proc.linux_stat_buf = 0;
+        },
         .console_read, .net_read, .net_connect, .net_listen, .dns_query, .icmp_read, .pipe_read, .pipe_write, .sleep, .ether_read => {},
         .none => {
             if (is_ok) {
@@ -3010,6 +3578,406 @@ fn sysIpcPair(result_ptr: u64) u64 {
     result[1] = @intCast(c_fd);
 
     return 0;
+}
+
+/// cntr_op(op, cntr_id, arg0, arg1, arg2) → result
+/// op=0: start  (arg0=elf_ptr, arg1=elf_len, arg2=argv_ptr) → pid
+/// op=1: stop   → 0 on success
+/// op=2: destroy → 0 on success
+/// op=3: exec   (arg0=elf_ptr, arg1=elf_len, arg2=argv_ptr) → pid
+pub fn sysCntrOp(op: u64, cntr_id: u64, a0: u64, a1: u64, a2: u64) u64 {
+    const container = @import("container.zig");
+    const caller = process.getCurrent() orelse {
+        klog.err("[cntr_op] getCurrent failed\n");
+        return ENOSYS;
+    };
+
+    // Only root (uid 0) or host processes can manage containers
+    if (caller.uid != 0) {
+        klog.err("[cntr_op] uid!=0\n");
+        return @bitCast(@as(i64, -1));
+    }
+    // Container processes cannot manage other containers
+    if (caller.container_id != container.HOST_CONTAINER) {
+        klog.err("[cntr_op] not host container\n");
+        return @bitCast(@as(i64, -1));
+    }
+
+    switch (op) {
+        // --- op=0: start container ---
+        0 => {
+            const ct = container.getById(@intCast(cntr_id)) orelse {
+                klog.err("[cntr_op] getById failed id=");
+                klog.errDec(cntr_id);
+                klog.err("\n");
+                return EINVAL;
+            };
+            if (ct.state != .created) {
+                klog.err("[cntr_op] state!=created (");
+                klog.errDec(@intFromEnum(ct.state));
+                klog.err(")\n");
+                return EINVAL;
+            }
+
+            const elf_ptr = a0;
+            const elf_len = a1;
+            const argv_ptr = a2;
+            if (elf_ptr == 0 or elf_ptr >= 0x0000_8000_0000_0000) {
+                klog.err("[cntr_op] bad elf_ptr\n");
+                return EFAULT;
+            }
+            if (elf_len == 0 or elf_len > 4 * 1024 * 1024) {
+                klog.err("[cntr_op] bad elf_len=");
+                klog.errDec(elf_len);
+                klog.err("\n");
+                return EINVAL;
+            }
+
+            const elf_data: []const u8 = @as([*]const u8, @ptrFromInt(elf_ptr))[0..@intCast(elf_len)];
+
+            klog.info("[cntr_op] starting container id=");
+            klog.infoDec(cntr_id);
+            klog.info(" elf_len=");
+            klog.infoDec(elf_len);
+            klog.info("\n");
+
+            // Delegate to container.start which creates process, loads ELF, sets up namespace
+            const pid = container.start(ct, elf_data, null) orelse {
+                klog.err("[cntr_op] container.start returned null\n");
+                return ENOMEM;
+            };
+
+            // Set up argv if provided
+            if (argv_ptr != 0 and argv_ptr < 0x0000_8000_0000_0000) {
+                if (container.getById(@intCast(cntr_id))) |ct2| {
+                    if (ct2.init_pid) |init_pid| {
+                        if (process.getByPid(init_pid)) |init_proc| {
+                            const child_pml4 = init_proc.pml4 orelse return ENOMEM;
+                            setupArgv(child_pml4, argv_ptr, init_proc);
+                        }
+                    }
+                }
+            }
+
+            return pid;
+        },
+        // --- op=1: stop container ---
+        1 => {
+            const ct = container.getById(@intCast(cntr_id)) orelse return EINVAL;
+            container.stop(ct);
+            return 0;
+        },
+        // --- op=2: destroy container ---
+        2 => {
+            const ct = container.getById(@intCast(cntr_id)) orelse return EINVAL;
+            container.destroy(ct);
+            return 0;
+        },
+        // --- op=3: exec (spawn into running container) ---
+        3 => {
+            const ct = container.getById(@intCast(cntr_id)) orelse return EINVAL;
+            if (ct.state != .running) return EINVAL;
+
+            const elf_ptr = a0;
+            const elf_len = a1;
+            const argv_ptr = a2;
+            if (elf_ptr == 0 or elf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+            if (elf_len == 0 or elf_len > 4 * 1024 * 1024) return EINVAL;
+
+            const elf_data: []const u8 = @as([*]const u8, @ptrFromInt(elf_ptr))[0..@intCast(elf_len)];
+
+            // Create a new process inside the container
+            const child = process.create() orelse return ENOMEM;
+
+            // Copy namespace from container's init process
+            if (ct.init_pid) |init_pid| {
+                if (process.getByPid(init_pid)) |init_proc| {
+                    init_proc.getNs().cloneInto(&child.ns);
+                }
+            }
+
+            // Load ELF
+            const load_result = elf.load(child.pml4.?, elf_data) catch {
+                child.state = .dead;
+                return ENOMEM;
+            };
+            child.user_rip = load_result.entry_point;
+            child.brk = load_result.brk;
+
+            // Allocate user stack
+            for (0..process.USER_STACK_PAGES) |i| {
+                const page = pmm.allocPage() orelse {
+                    child.state = .dead;
+                    return ENOMEM;
+                };
+                const ptr: [*]u8 = paging.physPtr(page);
+                @memset(ptr[0..mem.PAGE_SIZE], 0);
+                const vaddr = mem.USER_STACK_TOP - (process.USER_STACK_PAGES - i) * mem.PAGE_SIZE;
+                paging.mapPage(child.pml4.?, vaddr, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
+                    child.state = .dead;
+                    return ENOMEM;
+                };
+            }
+
+            // Set up argv
+            const child_pml4 = child.pml4.?;
+            if (argv_ptr != 0 and argv_ptr < 0x0000_8000_0000_0000) {
+                setupArgv(child_pml4, argv_ptr, child);
+            } else {
+                @memset(argv_layout_buf[0..8], 0);
+                _ = writeToChildMem(child_pml4, mem.ARGV_BASE, argv_layout_buf[0..8]);
+                child.user_rsp = mem.ARGV_BASE - 8;
+            }
+
+            // Write auxv
+            {
+                const AUXV_BASE: u64 = mem.ARGV_BASE - mem.PAGE_SIZE;
+                const auxv_page = pmm.allocPage() orelse {
+                    child.state = .dead;
+                    return ENOMEM;
+                };
+                const auxv_ptr2: [*]u8 = paging.physPtr(auxv_page);
+                @memset(auxv_ptr2[0..mem.PAGE_SIZE], 0);
+                paging.mapPage(child_pml4, AUXV_BASE, auxv_page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
+                    child.state = .dead;
+                    return ENOMEM;
+                };
+
+                var auxv_buf: [96]u8 = @splat(0);
+                var off: usize = 0;
+                writeU64LE(auxv_buf[off..][0..8], 3); off += 8;
+                writeU64LE(auxv_buf[off..][0..8], load_result.phdr_vaddr); off += 8;
+                writeU64LE(auxv_buf[off..][0..8], 5); off += 8;
+                writeU64LE(auxv_buf[off..][0..8], load_result.phnum); off += 8;
+                writeU64LE(auxv_buf[off..][0..8], 4); off += 8;
+                writeU64LE(auxv_buf[off..][0..8], load_result.phentsize); off += 8;
+                writeU64LE(auxv_buf[off..][0..8], 9); off += 8;
+                writeU64LE(auxv_buf[off..][0..8], load_result.entry_point); off += 8;
+                writeU64LE(auxv_buf[off..][0..8], 6); off += 8;
+                writeU64LE(auxv_buf[off..][0..8], mem.PAGE_SIZE); off += 8;
+                writeU64LE(auxv_buf[off..][0..8], 0); off += 8;
+                writeU64LE(auxv_buf[off..][0..8], 0); off += 8;
+                _ = writeToChildMem(child_pml4, AUXV_BASE, auxv_buf[0..off]);
+            }
+
+            // Set container association
+            child.container_id = ct.id;
+            child.compat = @intFromEnum(ct.compat);
+            child.uid = 0; // Container exec runs as root inside container
+            child.gid = 0;
+            container.addProcess(ct);
+
+            klog.info("[cntr_exec] container=");
+            klog.infoDec(ct.id);
+            klog.info(" pid=");
+            klog.infoDec(child.pid);
+            klog.info("\n");
+
+            // Process is fully initialized — make it runnable
+            process.markReady(child);
+
+            return child.pid;
+        },
+        // --- op=4: start_netd (spawn netd inside container) ---
+        4 => {
+            const ether_mod = @import("ether.zig");
+
+            const ct = container.getById(@intCast(cntr_id)) orelse return EINVAL;
+            if (ct.state != .running) return EINVAL;
+
+            const elf_ptr = a0;
+            const elf_len = a1;
+            if (elf_ptr == 0 or elf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+            if (elf_len == 0 or elf_len > 4 * 1024 * 1024) return EINVAL;
+
+            const elf_data: []const u8 = @as([*]const u8, @ptrFromInt(elf_ptr))[0..@intCast(elf_len)];
+
+            // Allocate ether client for the container netd
+            const ether_client = ether_mod.allocClient() orelse return ENOMEM;
+
+            // Create IPC channel pair for /net/ mount
+            const chan = ipc.channelCreate() catch {
+                ether_mod.freeClient(ether_client);
+                return ENOMEM;
+            };
+
+            // Create netd process (native Fornax, not compat)
+            const child = process.create() orelse {
+                ether_mod.freeClient(ether_client);
+                return ENOMEM;
+            };
+
+            // Copy namespace from container init
+            if (ct.init_pid) |init_pid| {
+                if (process.getByPid(init_pid)) |init_proc| {
+                    init_proc.getNs().cloneInto(&child.ns);
+                }
+            }
+
+            // Load netd ELF
+            const load_result = elf.load(child.pml4.?, elf_data) catch {
+                child.state = .dead;
+                ether_mod.freeClient(ether_client);
+                return ENOMEM;
+            };
+            child.user_rip = load_result.entry_point;
+            child.brk = load_result.brk;
+
+            // Allocate user stack
+            for (0..process.USER_STACK_PAGES) |i| {
+                const page = pmm.allocPage() orelse {
+                    child.state = .dead;
+                    ether_mod.freeClient(ether_client);
+                    return ENOMEM;
+                };
+                const ptr: [*]u8 = paging.physPtr(page);
+                @memset(ptr[0..mem.PAGE_SIZE], 0);
+                const vaddr = mem.USER_STACK_TOP - (process.USER_STACK_PAGES - i) * mem.PAGE_SIZE;
+                paging.mapPage(child.pml4.?, vaddr, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
+                    child.state = .dead;
+                    ether_mod.freeClient(ether_client);
+                    return ENOMEM;
+                };
+            }
+            child.user_rsp = mem.USER_STACK_INIT;
+
+            // No argv needed for netd
+            @memset(argv_layout_buf[0..8], 0);
+            _ = writeToChildMem(child.pml4.?, mem.ARGV_BASE, argv_layout_buf[0..8]);
+
+            // Set up fd map: server_fd→3, ether_fd→4
+            child.setFd(3, chan.server, true);
+            child.fds[4] = .{
+                .fd_type = .dev_ether,
+                .channel_id = 0,
+                .is_server = false,
+                .read_offset = 0,
+                .server_handle = 0,
+                .ether_client = ether_client,
+            };
+
+            // Container association (netd is native Fornax, not compat)
+            child.container_id = ct.id;
+            child.compat = 0; // Native Fornax
+            child.uid = 0;
+            child.gid = 0;
+            container.addProcess(ct);
+
+            ct.netd_pid = child.pid;
+
+            // Assign container IP: 10.0.1.(id+2) in network byte order
+            ct.net_ip = (@as(u32, 10)) | (@as(u32, 0) << 8) | (@as(u32, 1) << 16) | (@as(u32, ct.id + 2) << 24);
+
+            // Mount /net/ in container namespace (init process's namespace)
+            if (ct.init_pid) |init_pid| {
+                if (process.getByPid(init_pid)) |init_proc| {
+                    init_proc.getNs().mount("/net/", chan.client, .{}) catch {};
+                    // Also mount in the netd's namespace
+                    child.getNs().mount("/net/", chan.client, .{}) catch {};
+                }
+            }
+
+            klog.info("[cntr_netd] container=");
+            klog.infoDec(ct.id);
+            klog.info(" netd_pid=");
+            klog.infoDec(child.pid);
+            klog.info(" ip=10.0.1.");
+            klog.infoDec(ct.id + 2);
+            klog.info("\n");
+
+            // Process is fully initialized — make it runnable
+            process.markReady(child);
+
+            return child.pid;
+        },
+        else => return EINVAL,
+    }
+}
+
+/// Helper: set up argv layout in child process address space from wire format.
+fn setupArgv(child_pml4: *paging.PageTable, argv_ptr: u64, child: *process.Process) void {
+    const wire: [*]const u8 = @ptrFromInt(argv_ptr);
+    const wire_argc = @as(u32, wire[0]) |
+        (@as(u32, wire[1]) << 8) |
+        (@as(u32, wire[2]) << 16) |
+        (@as(u32, wire[3]) << 24);
+    const wire_total = @as(u32, wire[4]) |
+        (@as(u32, wire[5]) << 8) |
+        (@as(u32, wire[6]) << 16) |
+        (@as(u32, wire[7]) << 24);
+
+    if (wire_argc > 0 and wire_argc <= 64 and wire_total > 0 and wire_total <= 3000) {
+        const header_size: usize = 8 + @as(usize, wire_argc) * 8;
+        const total_size = header_size + wire_total;
+
+        if (total_size <= argv_layout_buf.len) {
+            @memset(argv_layout_buf[0..total_size], 0);
+
+            const argc64: u64 = wire_argc;
+            argv_layout_buf[0] = @truncate(argc64);
+            argv_layout_buf[1] = @truncate(argc64 >> 8);
+            argv_layout_buf[2] = @truncate(argc64 >> 16);
+            argv_layout_buf[3] = @truncate(argc64 >> 24);
+            argv_layout_buf[4] = @truncate(argc64 >> 32);
+            argv_layout_buf[5] = @truncate(argc64 >> 40);
+            argv_layout_buf[6] = @truncate(argc64 >> 48);
+            argv_layout_buf[7] = @truncate(argc64 >> 56);
+
+            const strings_start: usize = header_size;
+            @memcpy(argv_layout_buf[strings_start..][0..wire_total], wire[8..][0..wire_total]);
+
+            var str_offset: usize = 0;
+            var arg_i: usize = 0;
+            while (arg_i < wire_argc and str_offset < wire_total) {
+                const str_vaddr: u64 = mem.ARGV_BASE + strings_start + str_offset;
+                const ptr_offset = 8 + arg_i * 8;
+                argv_layout_buf[ptr_offset] = @truncate(str_vaddr);
+                argv_layout_buf[ptr_offset + 1] = @truncate(str_vaddr >> 8);
+                argv_layout_buf[ptr_offset + 2] = @truncate(str_vaddr >> 16);
+                argv_layout_buf[ptr_offset + 3] = @truncate(str_vaddr >> 24);
+                argv_layout_buf[ptr_offset + 4] = @truncate(str_vaddr >> 32);
+                argv_layout_buf[ptr_offset + 5] = @truncate(str_vaddr >> 40);
+                argv_layout_buf[ptr_offset + 6] = @truncate(str_vaddr >> 48);
+                argv_layout_buf[ptr_offset + 7] = @truncate(str_vaddr >> 56);
+
+                while (str_offset < wire_total and argv_layout_buf[strings_start + str_offset] != 0) {
+                    str_offset += 1;
+                }
+                str_offset += 1;
+                arg_i += 1;
+            }
+
+            _ = writeToChildMem(child_pml4, mem.ARGV_BASE, argv_layout_buf[0..total_size]);
+        }
+    }
+
+    child.user_rsp = mem.ARGV_BASE - 8;
+
+    // Set process name from argv[0] basename
+    if (argv_ptr != 0 and argv_ptr < 0x0000_8000_0000_0000) {
+        const w: [*]const u8 = @ptrFromInt(argv_ptr);
+        const wargc = @as(u32, w[0]) |
+            (@as(u32, w[1]) << 8) |
+            (@as(u32, w[2]) << 16) |
+            (@as(u32, w[3]) << 24);
+        const wtotal = @as(u32, w[4]) |
+            (@as(u32, w[5]) << 8) |
+            (@as(u32, w[6]) << 16) |
+            (@as(u32, w[7]) << 24);
+        if (wargc > 0 and wtotal > 0 and wtotal <= 3000) {
+            const str = w[8..][0..wtotal];
+            var str_end: usize = 0;
+            while (str_end < str.len and str[str_end] != 0) : (str_end += 1) {}
+            var base_start: usize = 0;
+            for (0..str_end) |si| {
+                if (str[si] == '/') base_start = si + 1;
+            }
+            const basename = str[base_start..str_end];
+            const copy_len = @min(basename.len, 15);
+            @memset(&child.name, 0);
+            @memcpy(child.name[0..copy_len], basename[0..copy_len]);
+        }
+    }
 }
 
 /// Copy an IPC message to a user-space IpcMessage buffer.
@@ -3232,6 +4200,14 @@ fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64, argv_p
 
     const elf_data: []const u8 = @as([*]const u8, @ptrFromInt(elf_ptr))[0..@intCast(elf_len)];
 
+    // Container process count quota check
+    if (parent.container_id != 0xFF) {
+        const container = @import("container.zig");
+        if (container.getById(parent.container_id)) |ct| {
+            if (!container.canSpawnProcess(ct)) return ENOMEM;
+        }
+    }
+
     // Create child process
     const child = process.create() orelse return ENOMEM;
 
@@ -3435,11 +4411,22 @@ fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64, argv_p
     child.uid = parent.uid;
     child.gid = parent.gid;
 
+    // Inherit container association
+    child.container_id = parent.container_id;
+    child.compat = parent.compat;
+    if (child.container_id != 0xFF) {
+        const container = @import("container.zig");
+        if (container.getById(child.container_id)) |ct| {
+            container.addProcess(ct);
+        }
+    }
+
     // Copy fd mappings from parent to child
     if (fd_map_len > 0) {
         const pipe_mod = @import("pipe.zig");
         const parent_fds = process.thread_group.getFdSlice(parent);
         const fd_maps: [*]const FdMapping = @ptrFromInt(fd_map_ptr);
+        const ether_mod2 = @import("ether.zig");
         for (0..@intCast(fd_map_len)) |i| {
             const m = fd_maps[i];
             if (m.parent_fd < process.MAX_FDS and m.child_fd < process.MAX_FDS) {
@@ -3452,6 +4439,9 @@ fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64, argv_p
                         } else {
                             pipe_mod.incrementWriters(fentry.pipe_id);
                         }
+                    }
+                    if (fentry.fd_type == .dev_ether) {
+                        ether_mod2.incRefClient(fentry.ether_client);
                     }
                 }
             }
@@ -3498,6 +4488,9 @@ fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64, argv_p
         klog.debugHex(load_result.entry_point);
     }
     klog.debug("]\n");
+
+    // Process is fully initialized — make it runnable
+    process.markReady(child);
 
     return child.pid;
 }

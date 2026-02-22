@@ -45,6 +45,7 @@ pub const SYS = enum(u64) {
     clone = 37,
     futex = 38,
     ipc_pair = 39,
+    cntr_op = 40,
 };
 
 const ipc = @import("ipc.zig");
@@ -162,6 +163,45 @@ pub fn ipc_pair() struct { server_fd: i32, client_fd: i32, err: i32 } {
     const err: i32 = @bitCast(@as(u32, @truncate(rc)));
     if (err < 0) return .{ .server_fd = -1, .client_fd = -1, .err = err };
     return .{ .server_fd = result[0], .client_fd = result[1], .err = 0 };
+}
+
+/// Container operations.
+pub const CNTR_START: u64 = 0;
+pub const CNTR_STOP: u64 = 1;
+pub const CNTR_DESTROY: u64 = 2;
+pub const CNTR_EXEC: u64 = 3;
+pub const CNTR_NETD: u64 = 4;
+
+/// cntr_start(cntr_id, elf_data, argv_block) → pid or negative error
+pub fn cntr_start(cntr_id: u32, elf_data: []const u8, argv_block: ?[]const u8) i32 {
+    const argv_ptr: u64 = if (argv_block) |blk| @intFromPtr(blk.ptr) else 0;
+    const result = syscall5(.cntr_op, CNTR_START, cntr_id, @intFromPtr(elf_data.ptr), elf_data.len, argv_ptr);
+    return @bitCast(@as(u32, @truncate(result)));
+}
+
+/// cntr_stop(cntr_id) → 0 or negative error
+pub fn cntr_stop(cntr_id: u32) i32 {
+    const result = syscall2(.cntr_op, CNTR_STOP, cntr_id);
+    return @bitCast(@as(u32, @truncate(result)));
+}
+
+/// cntr_destroy(cntr_id) → 0 or negative error
+pub fn cntr_destroy(cntr_id: u32) i32 {
+    const result = syscall2(.cntr_op, CNTR_DESTROY, cntr_id);
+    return @bitCast(@as(u32, @truncate(result)));
+}
+
+/// cntr_exec(cntr_id, elf_data, argv_block) → pid or negative error
+pub fn cntr_exec(cntr_id: u32, elf_data: []const u8, argv_block: ?[]const u8) i32 {
+    const argv_ptr: u64 = if (argv_block) |blk| @intFromPtr(blk.ptr) else 0;
+    const result = syscall5(.cntr_op, CNTR_EXEC, cntr_id, @intFromPtr(elf_data.ptr), elf_data.len, argv_ptr);
+    return @bitCast(@as(u32, @truncate(result)));
+}
+
+/// cntr_netd(cntr_id, netd_elf) → netd_pid or negative error
+pub fn cntr_netd(cntr_id: u32, netd_elf: []const u8) i32 {
+    const result = syscall5(.cntr_op, CNTR_NETD, cntr_id, @intFromPtr(netd_elf.ptr), netd_elf.len, 0);
+    return @bitCast(@as(u32, @truncate(result)));
 }
 
 pub fn brk(new_brk: u64) u64 {

@@ -129,7 +129,8 @@ var saved_intervals: [MAX_JOBS]SavedInterval = [_]SavedInterval{.{}} ** MAX_JOBS
 // ── Handle management ───────────────────────────────────────────
 
 fn allocHandle(kind: HandleKind) ?u32 {
-    for (&handles, 0..) |*h, i| {
+    // Start from 1: handle 0 is reserved (kernel treats server_handle=0 as "no handle")
+    for (handles[1..], 1..) |*h, i| {
         if (!h.active) {
             h.* = .{ .active = true, .kind = kind, .read_done = false };
             return @intCast(i);
@@ -168,11 +169,11 @@ fn readU32LE(bytes: *const [4]u8) u32 {
 // ── IPC handlers ────────────────────────────────────────────────
 
 fn handleOpen(msg: *fx.IpcMessage, reply: *fx.IpcMessage) void {
-    if (msg.data_len <= 4) {
+    if (msg.data_len == 0) {
         reply.* = fx.IpcMessage.init(fx.R_ERROR);
         return;
     }
-    const path_bytes: []const u8 = msg.data[4..msg.data_len];
+    const path_bytes: []const u8 = msg.data[0..msg.data_len];
     const path = if (path_bytes.len > 6 and startsWith(path_bytes, "sched/"))
         path_bytes[6..]
     else

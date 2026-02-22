@@ -18,6 +18,7 @@ const ipc = @import("ipc.zig");
 const elf = @import("elf.zig");
 const pmm = @import("pmm.zig");
 const mem = @import("mem.zig");
+const SpinLock = @import("spinlock.zig").SpinLock;
 
 const paging = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/paging.zig"),
@@ -34,10 +35,18 @@ const paging = switch (@import("builtin").cpu.arch) {
     },
 };
 
-const MAX_CONTAINERS = 16;
-const MAX_NAME = 64;
-const MAX_PATH = 256;
+pub const MAX_CONTAINERS = 16;
+pub const MAX_NAME = 64;
+pub const MAX_PATH = 256;
 const USER_STACK_PAGES = process.USER_STACK_PAGES;
+
+/// 0xFF means "host" (not in any container).
+pub const HOST_CONTAINER: u8 = 0xFF;
+
+pub const CompatMode = enum(u8) {
+    fornax = 0, // Native Fornax binaries
+    linux = 1, // Linux syscall translation
+};
 
 pub const Container = struct {
     /// Human-readable container name.
@@ -50,30 +59,60 @@ pub const Container = struct {
     rootfs_path_len: u16,
     /// Resource quotas for all processes in this container.
     quotas: process.ResourceQuotas,
-    /// Whether this container is active.
+    /// Whether this container slot is allocated.
     active: bool,
     /// Container state.
     state: ContainerState,
+    /// Stable index (0..MAX_CONTAINERS-1).
+    id: u8,
+    /// Compatibility mode for binaries in this container.
+    compat: CompatMode,
+    /// PID of the container's dedicated netd instance.
+    netd_pid: ?u32,
+    /// Bridge virtual port index.
+    bridge_port: ?u8,
+    /// Live process count in this container (atomic).
+    process_count: u16,
+    /// Aggregate pages across all container processes (atomic).
+    pages_used_total: u32,
+    /// Assigned internal IP (e.g. 10.0.1.x, network byte order).
+    net_ip: u32,
+    /// Default command (from Containerfile CMD).
+    cmd: [MAX_PATH]u8,
+    cmd_len: u16,
+    /// Per-container lock for state transitions.
+    lock: SpinLock,
 };
 
-pub const ContainerState = enum {
-    free,
-    created, // configured but not started
-    running, // init process running
-    stopped, // init process exited
-    failed, // init process crashed
+pub const ContainerState = enum(u8) {
+    free = 0,
+    created = 1, // configured but not started
+    running = 2, // init process running
+    stopped = 3, // init process exited
+    failed = 4, // init process crashed
 };
 
 var containers: [MAX_CONTAINERS]Container = undefined;
 var initialized: bool = false;
+/// Global lock for container create/destroy (infrequent operations).
+var containers_lock: SpinLock = .{};
 
 pub fn init() void {
-    for (&containers) |*c| {
+    for (&containers, 0..) |*c, i| {
         c.active = false;
         c.init_pid = null;
         c.state = .free;
         c.name_len = 0;
         c.rootfs_path_len = 0;
+        c.id = @intCast(i);
+        c.compat = .fornax;
+        c.netd_pid = null;
+        c.bridge_port = null;
+        c.process_count = 0;
+        c.pages_used_total = 0;
+        c.net_ip = 0;
+        c.cmd_len = 0;
+        c.lock = .{};
     }
     initialized = true;
     klog.info("Containers: initialized (max ");
@@ -81,10 +120,13 @@ pub fn init() void {
     klog.info(")\n");
 }
 
-/// Create a new container configuration.
+/// Create a new container configuration. Returns the container or null if full.
 pub fn create(name: []const u8, rootfs_path: []const u8, quotas: process.ResourceQuotas) ?*Container {
     if (!initialized) return null;
     if (name.len > MAX_NAME or rootfs_path.len > MAX_PATH) return null;
+
+    containers_lock.lock();
+    defer containers_lock.unlock();
 
     for (&containers) |*c| {
         if (!c.active) {
@@ -96,10 +138,124 @@ pub fn create(name: []const u8, rootfs_path: []const u8, quotas: process.Resourc
             c.init_pid = null;
             c.state = .created;
             c.active = true;
+            c.compat = .fornax;
+            c.netd_pid = null;
+            c.bridge_port = null;
+            c.process_count = 0;
+            c.pages_used_total = 0;
+            c.net_ip = 0;
+            c.cmd_len = 0;
             return c;
         }
     }
     return null;
+}
+
+/// Allocate a container slot with no name/rootfs (used by /cntr/clone).
+/// Caller configures fields via ctl writes.
+pub fn allocSlot() ?*Container {
+    if (!initialized) return null;
+
+    containers_lock.lock();
+    defer containers_lock.unlock();
+
+    for (&containers) |*c| {
+        if (!c.active) {
+            @memset(&c.name, 0);
+            c.name_len = 0;
+            @memset(&c.rootfs_path, 0);
+            c.rootfs_path_len = 0;
+            c.quotas = .{};
+            c.init_pid = null;
+            c.state = .created;
+            c.active = true;
+            c.compat = .fornax;
+            c.netd_pid = null;
+            c.bridge_port = null;
+            c.process_count = 0;
+            c.pages_used_total = 0;
+            c.net_ip = 0;
+            @memset(&c.cmd, 0);
+            c.cmd_len = 0;
+            return c;
+        }
+    }
+    return null;
+}
+
+/// Get container by ID. Returns null if invalid or inactive.
+pub fn getById(id: u8) ?*Container {
+    if (id >= MAX_CONTAINERS) return null;
+    const c = &containers[id];
+    if (!c.active) return null;
+    return c;
+}
+
+/// Get the containers array (for iteration).
+pub fn getAll() *[MAX_CONTAINERS]Container {
+    return &containers;
+}
+
+/// Increment process count (atomic, no lock needed on hot path).
+pub fn addProcess(ct: *Container) void {
+    _ = @atomicRmw(u16, &ct.process_count, .Add, 1, .monotonic);
+}
+
+/// Decrement process count (atomic).
+pub fn removeProcess(ct: *Container) void {
+    _ = @atomicRmw(u16, &ct.process_count, .Sub, 1, .monotonic);
+}
+
+/// Add pages to container aggregate (atomic).
+pub fn addPages(ct: *Container, count: u32) void {
+    _ = @atomicRmw(u32, &ct.pages_used_total, .Add, count, .monotonic);
+}
+
+/// Subtract pages from container aggregate (atomic).
+pub fn subPages(ct: *Container, count: u32) void {
+    _ = @atomicRmw(u32, &ct.pages_used_total, .Sub, count, .monotonic);
+}
+
+/// Check if the container quota allows more pages.
+pub fn canAllocPage(ct: *const Container) bool {
+    const used = @atomicLoad(u32, &@constCast(ct).pages_used_total, .monotonic);
+    return used < ct.quotas.max_memory_pages;
+}
+
+/// Check if the container quota allows more child processes.
+pub fn canSpawnProcess(ct: *const Container) bool {
+    const count = @atomicLoad(u16, &@constCast(ct).process_count, .monotonic);
+    return count < ct.quotas.max_children;
+}
+
+/// Kill all processes in a container.
+pub fn killAllProcesses(ct: *Container) void {
+    const table = process.getProcessTable();
+    for (table) |*p| {
+        if (p.state != .free and p.state != .dead and p.container_id == ct.id) {
+            p.state = .dead;
+        }
+    }
+}
+
+/// Destroy a container: stop all processes, free the slot.
+pub fn destroy(ct: *Container) void {
+    ct.lock.lock();
+    defer ct.lock.unlock();
+
+    if (ct.state == .running) {
+        killAllProcesses(ct);
+    }
+    ct.state = .free;
+    ct.active = false;
+    ct.init_pid = null;
+    ct.netd_pid = null;
+    ct.process_count = 0;
+    ct.pages_used_total = 0;
+
+    klog.info("[container] Destroyed container ");
+    klog.infoDec(ct.id);
+    klog.info("\n");
 }
 
 /// Start a container: create a process with isolated namespace, load ELF,
@@ -107,16 +263,42 @@ pub fn create(name: []const u8, rootfs_path: []const u8, quotas: process.Resourc
 /// `init_elf` is the raw ELF binary for the container's init process.
 /// `console_channel_id` is the IPC channel for /dev/console access (optional).
 pub fn start(ct: *Container, init_elf: []const u8, console_channel_id: ?ipc.ChannelId) ?u32 {
-    if (ct.state != .created) return null;
+    if (ct.state != .created) {
+        klog.err("[container] start: state is not .created\n");
+        return null;
+    }
 
     // Create the container's init process
-    const proc = process.create() orelse return null;
+    const proc = process.create() orelse {
+        klog.err("[container] start: process.create() failed\n");
+        return null;
+    };
 
     // Apply resource quotas
     proc.quotas = ct.quotas;
 
     // Create a fresh, empty namespace for isolation
     proc.ns = namespace.Namespace.init();
+
+    // Mount root filesystem with prefix for rootfs isolation.
+    // The container sees "/" but IPC messages prepend the rootfs path.
+    // Ensure prefix ends with '/' so that prefix + suffix forms a valid path
+    // (e.g. prefix="/var/lib/fnx/images/X/rootfs/" + suffix="tmp/msg.txt").
+    if (ct.rootfs_path_len > 0) {
+        const root_ns = namespace.getRootNamespace();
+        if (root_ns.resolve("/")) |root_res| {
+            var prefix_buf: [MAX_PATH + 1]u8 = undefined;
+            var prefix_len = ct.rootfs_path_len;
+            @memcpy(prefix_buf[0..prefix_len], ct.rootfs_path[0..prefix_len]);
+            if (prefix_len > 0 and prefix_buf[prefix_len - 1] != '/') {
+                prefix_buf[prefix_len] = '/';
+                prefix_len += 1;
+            }
+            proc.ns.mountWithPrefix("/", root_res.channel_id, .{ .replace = true }, prefix_buf[0..prefix_len]) catch {
+                klog.err("[container] Failed to mount rootfs\n");
+            };
+        }
+    }
 
     // Mount /dev/console if a channel was provided
     if (console_channel_id) |chan_id| {
@@ -130,7 +312,7 @@ pub fn start(ct: *Container, init_elf: []const u8, console_channel_id: ?ipc.Chan
         klog.err("[container] ELF load failed for '");
         klog.err(ct.name[0..ct.name_len]);
         klog.err("'\n");
-        proc.state = .dead;
+        proc.state = .free;
         return null;
     };
 
@@ -141,7 +323,7 @@ pub fn start(ct: *Container, init_elf: []const u8, console_channel_id: ?ipc.Chan
     for (0..USER_STACK_PAGES) |i| {
         const page = process.allocPageForProcess(proc) orelse {
             klog.err("[container] Stack alloc failed (quota?)\n");
-            proc.state = .dead;
+            proc.state = .free;
             return null;
         };
         const ptr: [*]u8 = paging.physPtr(page);
@@ -150,11 +332,16 @@ pub fn start(ct: *Container, init_elf: []const u8, console_channel_id: ?ipc.Chan
         const virt = mem.USER_STACK_TOP - (USER_STACK_PAGES - i) * mem.PAGE_SIZE;
         paging.mapPage(proc.pml4.?, virt, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
             klog.err("[container] Stack map failed\n");
-            proc.state = .dead;
+            proc.state = .free;
             return null;
         };
     }
     proc.user_rsp = mem.USER_STACK_INIT;
+
+    // Track container association
+    proc.container_id = ct.id;
+    proc.compat = @intFromEnum(ct.compat);
+    addProcess(ct);
 
     ct.init_pid = proc.pid;
     ct.state = .running;
@@ -167,17 +354,16 @@ pub fn start(ct: *Container, init_elf: []const u8, console_channel_id: ?ipc.Chan
     klog.infoDec(ct.quotas.max_memory_pages);
     klog.info(" pages)\n");
 
+    // Process is fully initialized — make it runnable
+    process.markReady(proc);
+
     return proc.pid;
 }
 
-/// Stop a container (kill its init process).
+/// Stop a container (kill all its processes).
 pub fn stop(ct: *Container) void {
     if (ct.state != .running) return;
-    if (ct.init_pid) |pid| {
-        if (process.getByPid(pid)) |proc| {
-            proc.state = .dead;
-        }
-    }
+    killAllProcesses(ct);
     ct.state = .stopped;
     ct.init_pid = null;
 }
@@ -190,6 +376,15 @@ pub fn findByName(name: []const u8) ?*Container {
         }
     }
     return null;
+}
+
+/// Count active containers.
+pub fn activeCount() u32 {
+    var count: u32 = 0;
+    for (&containers) |*c| {
+        if (c.active) count += 1;
+    }
+    return count;
 }
 
 fn strEqual(a: []const u8, b: []const u8) bool {

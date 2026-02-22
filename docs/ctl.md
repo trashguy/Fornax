@@ -160,6 +160,60 @@ Served by netd (userspace daemon). Mounted via IPC.
 |------|-----|-------------|
 | `/net/ipifc/0/ctl` | RW | Read: `ip IP mask MASK gateway GW mtu 1500\n`. Write: `add IP mask GW`. |
 
+## Container Control (`/cntr/`)
+
+Kernel-intercepted. Feature-gated behind `-Dcontainers=true`.
+
+### `/cntr/clone` (read)
+
+Allocates a new container, returns decimal ID.
+
+### `/cntr/N/status` (read)
+
+```
+id N
+name <name>
+state created|running|stopped|failed
+compat fornax|linux
+init_pid N
+procs N
+pages N
+quota_pages N
+quota_children N
+rootfs <path>
+ip <addr>
+cmd <command>
+```
+
+### `/cntr/N/ctl` (write)
+
+| Command | Action |
+|---------|--------|
+| `name <name>` | Set container name. |
+| `rootfs <path>` | Set rootfs path. |
+| `compat linux` | Enable Linux syscall translation. |
+| `cmd <command>` | Set default command. |
+| `quota pages N` | Set memory page quota. |
+| `quota children N` | Set max child processes. |
+| `stop` | Kill all container processes. |
+| `destroy` | Stop + free container slot. |
+
+### `/cntr/N/procs` (read)
+
+One PID per line for all processes in this container.
+
+## Bridge Control (`/bridge/`)
+
+Served by bridge daemon (userspace). Mounted via IPC.
+
+| Path | R/W | Description |
+|------|-----|-------------|
+| `/bridge/clone` | R | Allocate virtual port, returns port ID. |
+| `/bridge/N/ctl` | W | `mac XX:XX:XX:XX:XX:XX`, `ip A.B.C.D`. |
+| `/bridge/N/data` | RW | Raw Ethernet frame I/O for port. |
+| `/bridge/status` | R | Port list + NAT entry count. |
+| `/bridge/ctl` | W | `flush` — clear NAT and MAC tables. |
+
 ## Implementation Notes
 
 - Kernel virtual files use `FdType` enum variants in `src/process.zig`

@@ -32,13 +32,6 @@ pub fn wait(proc: *process.Process, addr: u64, expected_val: u32) u64 {
 
     if (addr == 0 or addr >= 0x0000_8000_0000_0000) return EAGAIN;
 
-    // Read the current value at the user address.
-    // The caller's CR3 is loaded, so user pointers are valid.
-    const user_ptr: *const u32 = @ptrFromInt(addr);
-    const current_val = user_ptr.*;
-
-    if (current_val != expected_val) return EAGAIN;
-
     // Get the PML4 physical address for address space identity
     const pml4_phys: u64 = if (proc.thread_group) |tg|
         (if (tg.pml4) |p| @intFromPtr(p) else 0)
@@ -46,6 +39,17 @@ pub fn wait(proc: *process.Process, addr: u64, expected_val: u32) u64 {
         (if (proc.pml4) |p| @intFromPtr(p) else 0);
 
     futex_lock.lock();
+
+    // Read the current value at the user address INSIDE the lock
+    // to avoid TOCTOU race with wake() on another core.
+    // The caller's CR3 is loaded, so user pointers are valid.
+    const user_ptr: *const u32 = @ptrFromInt(addr);
+    const current_val = user_ptr.*;
+
+    if (current_val != expected_val) {
+        futex_lock.unlock();
+        return EAGAIN;
+    }
 
     // Find a free waiter slot
     var slot: ?*FutexWaiter = null;

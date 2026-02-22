@@ -44,7 +44,7 @@ fn resetMock() void {
 fn createStack() !*tcp.TcpStack {
     const allocator = std.testing.allocator;
     const stack = try allocator.create(tcp.TcpStack);
-    stack.* = tcp.TcpStack.init(&mockSend, &mockGetIp, &mockGetTicks);
+    stack.initInPlace(&mockSend, &mockGetIp, &mockGetTicks);
     stack.setMaxConnections(8); // small for testing
     return stack;
 }

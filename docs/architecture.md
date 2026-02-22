@@ -142,16 +142,17 @@ VMS-inspired crash recovery (`src/supervisor.zig`). File servers are registered 
 A container is not a special kernel concept — it combines existing primitives (`src/container.zig`):
 
 ```
-rfork(RFNAMEG)                    isolated namespace
-bind("/rootfs", "/", REPLACE)     new root filesystem
-mount(console_chan, "/dev/con")   give it a console
-mount(net_chan, "/net")           give it networking
-exec("/init")                    run container init
+/cntr/clone                       allocate container slot
+write(/cntr/N/ctl, "rootfs ...")  set isolated rootfs
+write(/cntr/N/ctl, "compat ...")  set compat mode (fornax/linux)
+SYS 40 cntr_start(N, elf, argv)  load ELF + start init process
 ```
 
-Resource quotas enforce limits on memory pages, channels, children, and CPU priority.
+Resource quotas enforce container-wide limits on memory pages and process count. Per-container networking via shared ether clients or the bridge server.
 
-OCI/Docker images can be imported and converted to native format by the userspace `oci_import` tool.
+The `fnx` CLI provides a podman-familiar interface (`fnx run`, `fnx ps`, `fnx build`). Containerfile/Dockerfile build support with FROM, COPY, RUN, CMD instructions. Linux syscall compatibility (`src/linux_compat.zig`) enables running Alpine/musl binaries.
+
+See `docs/containers.md` for the full design.
 
 ## Syscall Interface
 

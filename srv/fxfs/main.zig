@@ -34,7 +34,7 @@ const DT_REG: u8 = 1;
 const DT_DIR: u8 = 2;
 
 // Max constants
-const MAX_HANDLES = 32;
+const MAX_HANDLES = 128;
 const MAX_NAME = 255;
 const NODE_HEADER_SIZE = 16;
 const NODE_DATA_SIZE = BLOCK_SIZE - NODE_HEADER_SIZE;
@@ -165,6 +165,15 @@ fn cacheRead(block_nr: u64) ?*[BLOCK_SIZE]u8 {
 }
 
 fn cacheInsert(block_nr: u64, data: *const [BLOCK_SIZE]u8) *[BLOCK_SIZE]u8 {
+    // Check if this block is already cached — reuse that slot to prevent duplicates
+    for (0..CACHE_SIZE) |i| {
+        if (cache_entries[i].valid and cache_entries[i].block_nr == block_nr) {
+            @memcpy(&cache_blocks[i], data);
+            cache_entries[i].use_count = 1;
+            return &cache_blocks[i];
+        }
+    }
+
     // Find free slot or evict LRU
     var min_use: u32 = 0xFFFFFFFF;
     var evict_idx: usize = 0;
@@ -202,6 +211,7 @@ fn readBlock(block_nr: u64, buf: *[BLOCK_SIZE]u8) bool {
 }
 
 fn writeBlock(block_nr: u64, buf: *const [BLOCK_SIZE]u8) bool {
+    cacheInvalidate(block_nr);
     const n = fx.pwrite(BLK_FD, buf, block_nr * BLOCK_SIZE);
     return n == BLOCK_SIZE;
 }
@@ -738,7 +748,11 @@ fn readFileData(inode_nr: u64, file_offset: u64, dest: []u8) u32 {
 
     // Fast path: check EXTENT_DATA at offset 0 (handles inline + single extent)
     if (btreeSearch(.{ .inode_nr = inode_nr, .item_type = EXTENT_DATA, .offset = 0 })) |data| {
-        if (data.len == EXTENT_DATA_SIZE and readU64LE(data[0..8]) > 0) {
+        const is_extent = data.len == EXTENT_DATA_SIZE and blk: {
+            const blk_nr = readU64LE(data[0..8]);
+            break :blk blk_nr >= sb_data_start and blk_nr < sb_total_blocks;
+        };
+        if (is_extent) {
             // Extent at offset 0
             const disk_block = readU64LE(data[0..8]);
             const num_blocks = readU32LE(data[8..12]);
@@ -782,8 +796,9 @@ fn readFileData(inode_nr: u64, file_offset: u64, dest: []u8) u32 {
             if (c.result > 0) return;
             if (data.len != EXTENT_DATA_SIZE) return;
             const disk_block = readU64LE(data[0..8]);
-            if (disk_block == 0) return;
+            if (disk_block < sb_data_start or disk_block >= sb_total_blocks) return;
             const num_blocks = readU32LE(data[8..12]);
+            if (num_blocks == 0 or num_blocks > sb_total_blocks - disk_block) return;
             const ext_start = k.offset;
             const ext_end = ext_start + @as(u64, num_blocks) * BLOCK_SIZE;
             if (c.file_offset >= ext_start and c.file_offset < ext_end) {
@@ -1647,11 +1662,15 @@ fn freeAllExtents(inode_nr: u64) void {
 
     _ = btreeScan(inode_nr, EXTENT_DATA, &ctx, struct {
         fn cb(c: *Ctx, k: Key, data: []const u8) void {
-            // Free data blocks if this is an extent reference (not inline)
+            // Free data blocks if this is a real extent reference (not inline data).
+            // Inline data can be any size including EXTENT_DATA_SIZE (16 bytes),
+            // so validate that the block number is within filesystem bounds.
             if (data.len == EXTENT_DATA_SIZE) {
                 const disk_block = readU64LE(data[0..8]);
                 const num_blocks = readU32LE(data[8..12]);
-                if (disk_block != 0) {
+                if (disk_block >= sb_data_start and disk_block < sb_total_blocks and
+                    num_blocks > 0 and num_blocks <= sb_total_blocks - disk_block)
+                {
                     var b: u64 = 0;
                     while (b < num_blocks) : (b += 1) {
                         freeBlock(disk_block + b);
@@ -1671,6 +1690,7 @@ fn freeAllExtents(inode_nr: u64) void {
         _ = btreeDelete(ctx.keys[i]);
     }
 }
+
 
 fn handleOpen(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
     const path = req.data[0..req.data_len];
@@ -2139,6 +2159,7 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
 
     // For small files, store inline in the B-tree
     if (new_end <= 3800) {
+
         // Build combined buffer: preserve existing data, place new data at write_offset
         var combined: [3800]u8 = [_]u8{0} ** 3800;
 
@@ -2146,7 +2167,10 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
         // a slice into a cached block buffer that gets invalidated by btreeDelete)
         if (write_offset > 0) {
             if (btreeSearch(.{ .inode_nr = h.inode_nr, .item_type = EXTENT_DATA, .offset = 0 })) |existing| {
-                const is_extent = existing.len == EXTENT_DATA_SIZE and readU64LE(existing[0..8]) > 0;
+                const is_extent = existing.len == EXTENT_DATA_SIZE and blk: {
+                    const blk_nr = readU64LE(existing[0..8]);
+                    break :blk blk_nr >= sb_data_start and blk_nr < sb_total_blocks;
+                };
                 if (!is_extent) {
                     const copy_len = @min(existing.len, write_offset);
                     @memcpy(combined[0..copy_len], existing[0..copy_len]);
@@ -2157,14 +2181,18 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
         // Place new data at write_offset
         @memcpy(combined[write_offset..][0..write_data.len], write_data);
 
+
         // Delete all old extent data
         freeAllExtents(h.inode_nr);
 
+
         // Insert combined inline data
         if (!btreeInsert(.{ .inode_nr = h.inode_nr, .item_type = EXTENT_DATA, .offset = 0 }, combined[0..new_end])) {
+
             resp.* = fx.IpcMessage.init(fx.R_ERROR);
             return;
         }
+
     } else if (write_offset >= old_size) {
         // Append path: write_offset is at or past end of file.
         // Don't rewrite old blocks — just handle the partial last block and add new blocks.
@@ -2175,7 +2203,10 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
             var inline_buf: [3800]u8 = [_]u8{0} ** 3800;
             var inline_len: usize = 0;
             if (btreeSearch(.{ .inode_nr = h.inode_nr, .item_type = EXTENT_DATA, .offset = 0 })) |data| {
-                const is_extent = data.len == EXTENT_DATA_SIZE and readU64LE(data[0..8]) > 0;
+                const is_extent = data.len == EXTENT_DATA_SIZE and blk: {
+                    const blk_nr = readU64LE(data[0..8]);
+                    break :blk blk_nr >= sb_data_start and blk_nr < sb_total_blocks;
+                };
                 if (!is_extent) {
                     inline_len = data.len;
                     @memcpy(inline_buf[0..inline_len], data);
@@ -2290,7 +2321,10 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
         var was_inline = false;
         if (old_size > 0 and old_size <= 3800) {
             if (btreeSearch(.{ .inode_nr = h.inode_nr, .item_type = EXTENT_DATA, .offset = 0 })) |data| {
-                const is_extent = data.len == EXTENT_DATA_SIZE and readU64LE(data[0..8]) > 0;
+                const is_extent = data.len == EXTENT_DATA_SIZE and blk: {
+                    const blk_nr = readU64LE(data[0..8]);
+                    break :blk blk_nr >= sb_data_start and blk_nr < sb_total_blocks;
+                };
                 if (!is_extent) {
                     @memcpy(inline_buf[0..data.len], data);
                     was_inline = true;
@@ -2392,6 +2426,7 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
         }
     }
 
+
     // Update inode size + mtime
     var inode_data: [INODE_ITEM_SIZE]u8 = undefined;
     writeU16LE(inode_data[0..2], inode.mode);
@@ -2404,14 +2439,18 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
     writeU64LE(inode_data[32..40], inode.ctime);
 
     if (!btreeUpdate(.{ .inode_nr = h.inode_nr, .item_type = INODE_ITEM, .offset = 0 }, &inode_data)) {
+
         resp.* = fx.IpcMessage.init(fx.R_ERROR);
         return;
     }
 
+
     if (!commitTransaction()) {
+
         resp.* = fx.IpcMessage.init(fx.R_ERROR);
         return;
     }
+
 
     // Advance write offset
     h.write_offset = new_end;

@@ -94,9 +94,9 @@ pub const ResourceQuotas = struct {
     cpu_priority: u8 = 128, // 0=lowest, 255=highest
 };
 
-pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, remove, rename, truncate, wstat, console_read, net_read, net_connect, net_listen, dns_query, icmp_read, pipe_read, pipe_write, sleep, ether_read };
+pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, remove, rename, truncate, wstat, console_read, net_read, net_connect, net_listen, dns_query, icmp_read, pipe_read, pipe_write, sleep, ether_read, linux_stat_open, linux_stat_done };
 
-pub const FdType = enum(u8) { ipc, net, pipe, blk, proc, dev_null, dev_zero, dev_random, dev_pci, dev_usb, dev_mouse, dev_cpu, dev_ether, dev_sysname, dev_osversion, dev_time, dev_kmesg, dev_reboot, dev_drivers, dev_pid, dev_user, dev_consctl, dev_sysstat };
+pub const FdType = enum(u8) { ipc, net, pipe, blk, proc, cntr, dev_null, dev_zero, dev_random, dev_pci, dev_usb, dev_mouse, dev_cpu, dev_ether, dev_sysname, dev_osversion, dev_time, dev_kmesg, dev_reboot, dev_drivers, dev_pid, dev_user, dev_consctl, dev_sysstat };
 
 pub const ProcFdKind = enum(u8) {
     dir,
@@ -104,6 +104,14 @@ pub const ProcFdKind = enum(u8) {
     status,
     ctl,
     meminfo,
+};
+
+pub const CntrFdKind = enum(u8) {
+    dir, // /cntr/ directory listing
+    clone, // /cntr/clone — allocate container
+    status, // /cntr/N/status
+    ctl, // /cntr/N/ctl
+    procs, // /cntr/N/procs
 };
 
 pub const NetFdKind = enum(u8) {
@@ -148,6 +156,9 @@ pub const FdEntry = struct {
     proc_pid: u32 = 0,
     /// Ether-specific fields (only used when fd_type == .dev_ether)
     ether_client: u8 = 0,
+    /// Container-specific fields (only used when fd_type == .cntr)
+    cntr_kind: CntrFdKind = .dir,
+    cntr_id: u8 = 0,
 };
 
 pub const Process = struct {
@@ -223,6 +234,14 @@ pub const Process = struct {
     ipc_serving_client: u32 = 0,
     /// Process name (basename of executable), for /proc/N/status.
     name: [16]u8 = .{0} ** 16,
+    /// Container ID: 0xFF = host, 0..15 = container index.
+    container_id: u8 = 0xFF,
+    /// Compatibility mode: 0 = fornax, 1 = linux syscall translation.
+    compat: u8 = 0,
+    /// Linux compat: user buffer ptr for multi-step stat (0 = not in multi-step stat).
+    linux_stat_buf: u64 = 0,
+    /// Linux compat: temp fd used during multi-step path stat.
+    linux_stat_fd: u32 = 0,
 
     pub fn initFds(self: *Process) void {
         for (&self.fds) |*fd| {
@@ -356,6 +375,28 @@ pub const Process = struct {
             return null;
         }
 
+    pub fn allocCntrFd(self: *Process, kind: CntrFdKind, cntr_id: u8) ?u32 {
+        const fds = if (self.thread_group) |tg|
+            (if (tg.fd_table) |ft| &ft.fds else &self.fds)
+        else
+            &self.fds;
+        for (3..MAX_FDS) |i| {
+            if (fds[i] == null) {
+                fds[i] = .{
+                    .fd_type = .cntr,
+                    .channel_id = 0,
+                    .is_server = false,
+                    .read_offset = 0,
+                    .server_handle = 0,
+                    .cntr_kind = kind,
+                    .cntr_id = cntr_id,
+                };
+                return @intCast(i);
+            }
+        }
+        return null;
+    }
+
     /// Set a specific fd to a channel entry.
     pub fn setFd(self: *Process, fd: u32, channel_id: ipc.ChannelId, is_server: bool) void {
         if (fd < MAX_FDS) {
@@ -459,6 +500,18 @@ pub fn init() void {
         p.vt = 0;
         p.thread_group = null;
         p.ctid_ptr = 0;
+        p.container_id = 0xFF;
+        p.compat = 0;
+        p.uid = 0;
+        p.gid = 0;
+        p.fs_base = 0;
+        p.mmap_next = 0;
+        p.name = .{0} ** 16;
+        p.assigned_core = 0;
+        p.core_affinity = -1;
+        p.cores_ran_on = 0;
+        p.linux_stat_buf = 0;
+        p.linux_stat_fd = 0;
         p.initFds();
     }
     thread_group.init();
@@ -483,7 +536,35 @@ pub fn create() ?*Process {
                 break;
             }
         }
-        const p = slot orelse break :blk null;
+        const p = slot orelse {
+            // Diagnostic: dump table state counts
+            var n_free: u32 = 0;
+            var n_blocked: u32 = 0;
+            var n_ready: u32 = 0;
+            var n_zombie: u32 = 0;
+            var n_dead: u32 = 0;
+            for (&processes) |*pp| {
+                switch (pp.state) {
+                    .free => n_free += 1,
+                    .blocked => n_blocked += 1,
+                    .ready, .running => n_ready += 1,
+                    .zombie => n_zombie += 1,
+                    .dead => n_dead += 1,
+                }
+            }
+            klog.err("process.create: no free slot! free=");
+            klog.errDec(n_free);
+            klog.err(" blocked=");
+            klog.errDec(n_blocked);
+            klog.err(" ready=");
+            klog.errDec(n_ready);
+            klog.err(" zombie=");
+            klog.errDec(n_zombie);
+            klog.err(" dead=");
+            klog.errDec(n_dead);
+            klog.err("\n");
+            break :blk null;
+        };
         // Claim the slot immediately so no other core takes it
         p.state = .blocked;
         break :blk p;
@@ -496,11 +577,19 @@ pub fn create() ?*Process {
     }
 
     // Allocate address space
-    const addr_space = paging.createAddressSpace() orelse return null;
+    const addr_space = paging.createAddressSpace() orelse {
+        klog.err("process.create: createAddressSpace failed\n");
+        proc.state = .free; // release the claimed slot
+        return null;
+    };
 
     // Allocate kernel stack — contiguous physical pages required because the
     // higher-half mapping is a direct phys→virt translation (no per-page mappings).
-    const stack_base: u64 = pmm.allocContiguousPages(KERNEL_STACK_PAGES) orelse return null;
+    const stack_base: u64 = pmm.allocContiguousPages(KERNEL_STACK_PAGES) orelse {
+        klog.err("process.create: allocContiguousPages failed\n");
+        proc.state = .free; // release the claimed slot
+        return null;
+    };
     const stack_virt = if (paging.isInitialized()) stack_base + mem.KERNEL_VIRT_BASE else stack_base;
 
     // Parent is whoever is currently running (null for kernel-spawned processes)
@@ -538,6 +627,11 @@ pub fn create() ?*Process {
     proc.ctid_ptr = 0;
     proc.fs_base = 0;
     proc.mmap_next = 0x0000_4000_0000_0000;
+    proc.container_id = 0xFF; // host (not in any container)
+    proc.compat = 0; // native Fornax
+    proc.name = .{0} ** 16;
+    proc.linux_stat_buf = 0;
+    proc.linux_stat_fd = 0;
     namespace.getRootNamespace().cloneInto(&proc.ns);
     proc.ipc_msg = ipc.Message.init(.t_open);
 
@@ -546,8 +640,9 @@ pub fn create() ?*Process {
     proc.core_affinity = -1; // any core
     proc.cores_ran_on = 0;
 
-    // Enqueue on the assigned core's run queue
-    markReady(proc);
+    // NOTE: process starts in .blocked state. Caller MUST call markReady()
+    // after fully initializing the process (ELF load, stack, argv, etc.).
+    // This prevents SMP races where another core schedules a half-initialized process.
 
     return proc;
 }
@@ -1177,6 +1272,11 @@ fn switchTo(proc: *Process) noreturn {
             if (proc.pending_op == .read or proc.pending_op == .stat) {
                 // Raw data delivery for read/stat replies — copy just data, not IpcMessage wrapper
                 deliverRawData(msg, proc.ipc_recv_buf_ptr);
+                // Linux compat: translate Fornax stat → Linux stat in-place
+                if (proc.pending_op == .stat and proc.compat == 1) {
+                    const linux_compat = @import("linux_compat.zig");
+                    linux_compat.translateStatInPlace(proc.ipc_recv_buf_ptr);
+                }
             } else {
                 deliverIpcMessage(msg, proc.ipc_recv_buf_ptr);
             }
@@ -1230,14 +1330,36 @@ fn deliverIpcMessage(msg: *const ipc.Message, user_buf_ptr: u64) void {
 /// Allocate a physical page for a process, checking quotas.
 pub fn allocPageForProcess(proc: *Process) ?u64 {
     if (proc.pages_used >= proc.quotas.max_memory_pages) return null;
+    // Container-wide memory quota check
+    if (proc.container_id != 0xFF) {
+        const container = @import("container.zig");
+        if (container.getById(proc.container_id)) |ct| {
+            if (!container.canAllocPage(ct)) return null;
+        }
+    }
     const page = pmm.allocPage() orelse return null;
     proc.pages_used += 1;
+    // Track container aggregate
+    if (proc.container_id != 0xFF) {
+        const container = @import("container.zig");
+        if (container.getById(proc.container_id)) |ct| {
+            container.addPages(ct, 1);
+        }
+    }
     return page;
 }
 
 /// Free the user address space (page tables and user pages).
 /// Safe to call even if pml4 is null.
 pub fn freeUserMemory(proc: *Process) void {
+    // Decrement container page aggregate before zeroing
+    if (proc.container_id != 0xFF and proc.pages_used > 0) {
+        const container = @import("container.zig");
+        if (container.getById(proc.container_id)) |ct| {
+            container.subPages(ct, proc.pages_used);
+        }
+    }
+
     if (proc.thread_group) |tg| {
         // Thread: release group reference. Last thread frees the address space.
         _ = thread_group.releaseGroup(tg, proc);

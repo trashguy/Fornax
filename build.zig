@@ -6,6 +6,7 @@ pub fn build(b: *std.Build) void {
     const cluster = b.option(bool, "cluster", "Enable clustering support (gossip discovery, remote namespaces, scheduler)") orelse false;
     const posix = b.option(bool, "posix", "Enable C/POSIX realm support") orelse false;
     const tcc_enabled = b.option(bool, "tcc", "Build TCC C compiler (requires -Dposix=true)") orelse false;
+    const containers = b.option(bool, "containers", "Enable container support (fnx CLI, Linux compat, bridge)") orelse false;
     const test_packages = b.option(bool, "test-packages", "Build test packages (xxd) for integration tests") orelse false;
     const user_strip = b.option(bool, "strip", "Strip debug info from userspace binaries") orelse
         (optimize != .Debug); // strip by default on release builds
@@ -18,6 +19,7 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption(bool, "cluster", cluster);
     build_options.addOption(bool, "posix", posix);
+    build_options.addOption(bool, "containers", containers);
 
     // ── Host tool: mkinitrd ───────────────────────────────────────────
     const mkinitrd = b.addExecutable(.{
@@ -876,6 +878,41 @@ const touch_bin = b.addExecutable(.{
     });
     uptime_bin.image_base = user_image_base;
 
+    // ── Container support (gated behind -Dcontainers=true) ──────────
+    var fnx_bin: ?*std.Build.Step.Compile = null;
+    var bridge_bin: ?*std.Build.Step.Compile = null;
+    if (containers) {
+        const fnx_exe = b.addExecutable(.{
+            .name = "fnx",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("cmd/fnx/main.zig"),
+                .target = x86_64_freestanding,
+                .optimize = user_optimize,
+                .strip = if (user_strip) true else null,
+                .imports = &.{
+                    .{ .name = "fornax", .module = fornax_module },
+                },
+            }),
+        });
+        fnx_exe.image_base = user_image_base;
+        fnx_bin = fnx_exe;
+
+        const bridge_exe = b.addExecutable(.{
+            .name = "bridge",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("srv/bridge/main.zig"),
+                .target = x86_64_freestanding,
+                .optimize = user_optimize,
+                .strip = if (user_strip) true else null,
+                .imports = &.{
+                    .{ .name = "fornax", .module = fornax_module },
+                },
+            }),
+        });
+        bridge_exe.image_base = user_image_base;
+        bridge_bin = bridge_exe;
+    }
+
     // ── POSIX realm support (gated behind -Dposix=true) ─────────────
     // POSIX realm isolation is handled by lib/posix/crt0.S (rfork(RFNAMEG))
     // which runs before musl's __libc_start_main. No separate loader needed.
@@ -1494,6 +1531,20 @@ const touch_bin = b.addExecutable(.{
         x86_initrd.step.dependOn(&tcc_lic.step);
         const musl_lic = b.addInstallFile(b.path("LICENSES/musl"), "rootfs/lib/legal/musl/COPYING");
         x86_initrd.step.dependOn(&musl_lic.step);
+    }
+
+    // Install container programs to rootfs (if enabled)
+    if (fnx_bin) |fnx_exe| {
+        const fnx_install = b.addInstallArtifact(fnx_exe, .{
+            .dest_dir = .{ .override = .{ .custom = "rootfs/bin" } },
+        });
+        x86_initrd.step.dependOn(&fnx_install.step);
+    }
+    if (bridge_bin) |bridge_exe| {
+        const bridge_install = b.addInstallArtifact(bridge_exe, .{
+            .dest_dir = .{ .override = .{ .custom = "rootfs/bin" } },
+        });
+        x86_initrd.step.dependOn(&bridge_install.step);
     }
 
     // Install test packages (if enabled)

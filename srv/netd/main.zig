@@ -64,7 +64,8 @@ const Handle = struct {
 var handles: [MAX_HANDLES]Handle = [_]Handle{.{}} ** MAX_HANDLES;
 
 fn allocHandle(kind: HandleKind, conn: u8) ?u32 {
-    for (&handles, 0..) |*h, i| {
+    // Start from 1: handle 0 is reserved (kernel treats server_handle=0 as "no handle")
+    for (handles[1..], 1..) |*h, i| {
         if (!h.active) {
             h.* = .{ .active = true, .kind = kind, .conn = conn, .read_done = false };
             return @intCast(i);
@@ -200,12 +201,12 @@ fn buildUdp(buf: []u8, src_port: u16, dst_port: u16, data: []const u8) ?usize {
 // ── IPC handlers ──────────────────────────────────────────────────
 
 fn handleOpen(msg: *fx.IpcMessage, reply: *fx.IpcMessage) void {
-    // Extract path from message data (first 4 bytes = parent handle, rest = path)
-    if (msg.data_len <= 4) {
+    // T_OPEN data = [path] (no header — unlike T_WRITE/T_READ which have a handle prefix)
+    if (msg.data_len == 0) {
         reply.* = fx.IpcMessage.init(fx.R_ERROR);
         return;
     }
-    const path_bytes = msg.data[4..msg.data_len];
+    const path_bytes = msg.data[0..msg.data_len];
 
     // Strip leading "net/" if present (namespace mount point variation)
     var path = path_bytes;
@@ -1120,7 +1121,7 @@ export fn _start() noreturn {
     // For now, use QEMU default MAC. TODO: read from ctl.
 
     // Initialize network stack
-    tcp_stack = net.tcp.TcpStack.init(&sendTcpIpPacket, &getOurIp, &getTicks);
+    tcp_stack.initInPlace(&sendTcpIpPacket, &getOurIp, &getTicks);
     tcp_stack.setWaiterCallback(&tcpWaiterCallback);
     tcp_stack.setMaxConnections(32);
 

@@ -53,8 +53,8 @@ pub var asm_states: [MAX_CORES]AsmState = [_]AsmState{.{}} ** MAX_CORES;
 // ── Zig-level per-CPU state ───────────────────────────────────────────
 
 /// Circular run queue for per-core scheduling.
-/// Local push/pop are lockless (single producer/consumer = owning core).
-/// Steal operations from other cores acquire the lock.
+/// All operations are lock-protected: push is called from any core
+/// (via markReady), pop from the owning core, steal from remote cores.
 pub const RunQueue = struct {
     entries: [RUN_QUEUE_SIZE]u16 = [_]u16{0} ** RUN_QUEUE_SIZE,
     head: u32 = 0,
@@ -63,6 +63,8 @@ pub const RunQueue = struct {
     lock: SpinLock = .{},
 
     pub fn push(self: *RunQueue, pid: u16) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
         if (self.len >= RUN_QUEUE_SIZE) return false;
         self.entries[self.tail % RUN_QUEUE_SIZE] = pid;
         self.tail +%= 1;
@@ -71,6 +73,8 @@ pub const RunQueue = struct {
     }
 
     pub fn pop(self: *RunQueue) ?u16 {
+        self.lock.lock();
+        defer self.lock.unlock();
         if (self.len == 0) return null;
         const pid = self.entries[self.head % RUN_QUEUE_SIZE];
         self.head +%= 1;
@@ -79,13 +83,19 @@ pub const RunQueue = struct {
     }
 
     pub fn isEmpty(self: *const RunQueue) bool {
-        return self.len == 0;
+        return @atomicLoad(u32, &self.len, .acquire) == 0;
     }
 
-    /// Steal half of victim's queue into self. Both queues locked by caller.
+    /// Steal half of victim's queue into self.
+    /// Acquires self.lock then tryLock on victim to avoid ABBA deadlock.
     /// Returns number of entries stolen.
     pub fn stealHalf(self: *RunQueue, victim: *RunQueue) u32 {
-        victim.lock.lock();
+        self.lock.lock();
+        if (!victim.lock.tryLock()) {
+            self.lock.unlock();
+            return 0; // Contended — skip this victim
+        }
+        defer self.lock.unlock();
         defer victim.lock.unlock();
 
         const to_steal = victim.len / 2;

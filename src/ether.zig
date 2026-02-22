@@ -18,6 +18,7 @@ const MAX_WAITERS = 4;
 pub const EtherClient = struct {
     active: bool,
     exclusive: bool, // true = kernel stack skips frame processing
+    refcount: u8, // number of fds pointing to this client
     ring: [FRAME_RING_SIZE][MAX_FRAME]u8,
     frame_lens: [FRAME_RING_SIZE]u16,
     head: u8, // next write position
@@ -37,6 +38,7 @@ pub fn init() void {
 fn resetClient(c: *EtherClient) void {
     c.active = false;
     c.exclusive = false;
+    c.refcount = 0;
     // ring/frame_lens left undefined (BSS)
     c.head = 0;
     c.count = 0;
@@ -49,8 +51,13 @@ pub fn allocClient() ?u8 {
     for (&clients, 0..) |*c, i| {
         c.lock.lock();
         if (!c.active) {
-            resetClient(c);
+            // Reset fields but preserve lock (we're holding it)
             c.active = true;
+            c.exclusive = false;
+            c.refcount = 1;
+            c.head = 0;
+            c.count = 0;
+            c.read_waiters = [_]?u16{null} ** MAX_WAITERS;
             c.lock.unlock();
             return @intCast(i);
         }
@@ -59,12 +66,27 @@ pub fn allocClient() ?u8 {
     return null;
 }
 
-/// Free a client slot.
+/// Increment refcount for an ether client (fd inheritance).
+pub fn incRefClient(idx: u8) void {
+    if (idx >= MAX_ETHER_CLIENTS) return;
+    const c = &clients[idx];
+    c.lock.lock();
+    defer c.lock.unlock();
+    if (c.active) c.refcount +|= 1;
+}
+
+/// Decrement refcount; free client slot when last fd closes.
 pub fn freeClient(idx: u8) void {
     if (idx >= MAX_ETHER_CLIENTS) return;
     const c = &clients[idx];
     c.lock.lock();
+    if (c.refcount > 1) {
+        c.refcount -= 1;
+        c.lock.unlock();
+        return;
+    }
     c.active = false;
+    c.refcount = 0;
     // Wake any blocked readers with EOF
     for (&c.read_waiters) |*w| {
         if (w.*) |pid| {

@@ -97,27 +97,26 @@ pub const TcpStack = struct {
     active_opens: u64,
     passive_opens: u64,
 
-    pub fn init(send_fn: SendFn, get_ip_fn: GetIpFn, get_ticks_fn: GetTicksFn) TcpStack {
-        var stack: TcpStack = undefined;
-        stack.sendFn = send_fn;
-        stack.getIpFn = get_ip_fn;
-        stack.getTicksFn = get_ticks_fn;
-        stack.waiter_cb = null;
-        stack.next_ephemeral_port = 49152;
-        stack.seq_counter = 1000;
-        stack.max_connections = 32;
-        stack.segments_tx = 0;
-        stack.segments_rx = 0;
-        stack.retransmits = 0;
-        stack.active_opens = 0;
-        stack.passive_opens = 0;
-        for (&stack.connections) |*c| {
+    /// Initialize a TcpStack in place (avoids ~5 MB return-by-value).
+    pub fn initInPlace(self: *TcpStack, send_fn: SendFn, get_ip_fn: GetIpFn, get_ticks_fn: GetTicksFn) void {
+        self.sendFn = send_fn;
+        self.getIpFn = get_ip_fn;
+        self.getTicksFn = get_ticks_fn;
+        self.waiter_cb = null;
+        self.next_ephemeral_port = 49152;
+        self.seq_counter = 1000;
+        self.max_connections = 32;
+        self.segments_tx = 0;
+        self.segments_rx = 0;
+        self.retransmits = 0;
+        self.active_opens = 0;
+        self.passive_opens = 0;
+        for (&self.connections) |*c| {
             resetConn(c);
         }
-        for (&stack.conn_hash) |*h| {
+        for (&self.conn_hash) |*h| {
             h.* = HASH_EMPTY;
         }
-        return stack;
     }
 
     pub fn setWaiterCallback(self: *TcpStack, cb: WaiterCallback) void {

@@ -21,6 +21,8 @@ pub const MountFlags = packed struct {
     _padding: u5 = 0,
 };
 
+pub const MAX_PREFIX = 128;
+
 pub const MountEntry = struct {
     /// Mount point path (e.g., "/dev/console").
     path: [MAX_PATH]u8,
@@ -31,6 +33,9 @@ pub const MountEntry = struct {
     flags: MountFlags,
     /// Whether this entry is active.
     active: bool,
+    /// Path prefix prepended to suffix in IPC messages (for container rootfs).
+    prefix: [MAX_PREFIX]u8 = .{0} ** MAX_PREFIX,
+    prefix_len: u8 = 0,
 };
 
 pub const Namespace = struct {
@@ -81,6 +86,38 @@ pub const Namespace = struct {
         return error.TooManyMounts;
     }
 
+    /// Mount with a path prefix (for container rootfs isolation).
+    /// The prefix is prepended to the suffix in IPC messages.
+    pub fn mountWithPrefix(self: *Namespace, path: []const u8, channel_id: ipc.ChannelId, flags: MountFlags, prefix: []const u8) !void {
+        if (path.len > MAX_PATH) return error.PathTooLong;
+        if (prefix.len > MAX_PREFIX) return error.PathTooLong;
+
+        if (flags.replace) {
+            for (&self.mounts) |*m| {
+                if (m.active and pathEqual(m.path[0..m.path_len], path)) {
+                    m.active = false;
+                    self.count -= 1;
+                    break;
+                }
+            }
+        }
+
+        for (&self.mounts) |*m| {
+            if (!m.active) {
+                @memcpy(m.path[0..path.len], path);
+                m.path_len = @intCast(path.len);
+                m.channel_id = channel_id;
+                m.flags = flags;
+                m.active = true;
+                @memcpy(m.prefix[0..prefix.len], prefix);
+                m.prefix_len = @intCast(prefix.len);
+                self.count += 1;
+                return;
+            }
+        }
+        return error.TooManyMounts;
+    }
+
     /// Unmount the file server at the given path.
     pub fn unmount(self: *Namespace, path: []const u8) void {
         for (&self.mounts) |*m| {
@@ -92,25 +129,36 @@ pub const Namespace = struct {
         }
     }
 
+    pub const ResolveResult = struct {
+        channel_id: ipc.ChannelId,
+        suffix: []const u8,
+        prefix: []const u8,
+    };
+
     /// Look up the longest-prefix matching mount for a path.
-    /// Returns the channel ID of the file server and the remaining path suffix.
-    pub fn resolve(self: *const Namespace, path: []const u8) ?struct { channel_id: ipc.ChannelId, suffix: []const u8 } {
+    /// Returns the channel ID, the remaining path suffix, and any mount prefix
+    /// (used for container rootfs isolation — prefix is prepended to suffix in IPC).
+    pub fn resolve(self: *const Namespace, path: []const u8) ?ResolveResult {
         var best_len: u16 = 0;
         var best_channel: ?ipc.ChannelId = null;
+        var best_idx: usize = 0;
 
-        for (&self.mounts) |*m| {
+        for (&self.mounts, 0..) |*m, idx| {
             if (!m.active) continue;
             const mount_path = m.path[0..m.path_len];
             if (isPrefix(mount_path, path) and m.path_len >= best_len) {
                 best_len = m.path_len;
                 best_channel = m.channel_id;
+                best_idx = idx;
             }
         }
 
         if (best_channel) |ch| {
+            const entry = &self.mounts[best_idx];
             return .{
                 .channel_id = ch,
                 .suffix = if (best_len < path.len) path[best_len..] else "",
+                .prefix = entry.prefix[0..entry.prefix_len],
             };
         }
         return null;

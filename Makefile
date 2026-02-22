@@ -1,6 +1,7 @@
 .PHONY: all x86_64 aarch64 riscv64 run run-x86_64 run-smp run-aarch64 run-riscv64 disk disk-x86_64 disk-aarch64 clean clean-disk help
 .PHONY: release release-x86_64 release-aarch64 release-riscv64 run-release disk-img disk-format
 .PHONY: run-posix run-posix-release run-tcc
+.PHONY: run-containers run-containers-dev
 .PHONY: run-dev run-dev-posix test unit-test integration-test
 
 all: x86_64 aarch64
@@ -48,6 +49,14 @@ run-posix-release:
 run-tcc:
 	zig build x86_64 -Dposix=true -Dtcc=true
 	./scripts/run-x86_64.sh
+
+run-containers:
+	zig build x86_64 -Dcontainers=true
+	./scripts/run-x86_64.sh -smp 4 -m 2048
+
+run-containers-dev:
+	zig build x86_64 -Dcontainers=true
+	./scripts/run-x86_64.sh -smp 8 -m 8192
 
 run-dev:
 	zig build x86_64
@@ -112,6 +121,8 @@ help:
 	@echo "  make run-tcc         Run x86_64 with POSIX + TCC compiler"
 	@echo "  make run-posix       Run x86_64 with C/POSIX realm support"
 	@echo "  make run-posix-release  Run x86_64 with POSIX (ReleaseSafe kernel)"
+	@echo "  make run-containers  Run x86_64 with container support (4 cores, 2GB)"
+	@echo "  make run-containers-dev  Run x86_64 with containers (8 cores, 8GB)"
 	@echo "  make run-dev         Run x86_64 with 8 cores and 8GB RAM"
 	@echo "  make run-dev-posix   Run x86_64 with POSIX, 8 cores and 8GB RAM"
 	@echo "  make test            Run unit tests (host-targeted zig test)"

@@ -83,6 +83,44 @@ fn isAlive(pid: i32) bool {
 }
 
 /// Spawn netd: userspace network server at /net.
+/// Spawn bridge: Ethernet bridge server at /bridge (optional, for containers).
+fn spawnBridge() void {
+    const bridge_elf = loadBin("bridge") orelse return; // not present = skip
+
+    const pair = fx.ipc_pair();
+    if (pair.err < 0) return;
+
+    const ether_fd = fx.open("/dev/ether0");
+    if (ether_fd < 0) {
+        _ = fx.close(pair.server_fd);
+        _ = fx.close(pair.client_fd);
+        return;
+    }
+
+    const mappings = [_]fx.FdMapping{
+        .{ .parent_fd = @intCast(pair.server_fd), .child_fd = 3 },
+        .{ .parent_fd = @intCast(ether_fd), .child_fd = 4 },
+    };
+    const pid = fx.spawn(bridge_elf, &mappings, null);
+    if (pid < 0) {
+        _ = fx.close(pair.server_fd);
+        _ = fx.close(pair.client_fd);
+        _ = fx.close(ether_fd);
+        return;
+    }
+
+    const rc = fx.mount(pair.client_fd, "/bridge/", 0);
+    if (rc < 0) {
+        out.puts("init: failed to mount bridge at /bridge\n");
+    } else {
+        out.puts("init: bridge mounted at /bridge\n");
+    }
+
+    _ = fx.close(pair.server_fd);
+    _ = fx.close(pair.client_fd);
+    _ = fx.close(ether_fd);
+}
+
 fn spawnNetd() void {
     // Create IPC channel pair
     const pair = fx.ipc_pair();
@@ -190,6 +228,9 @@ export fn _start() noreturn {
         _ = fx.wstat(shadow_fd, 0o600, 0, 0, fx.WSTAT_MODE);
         _ = fx.close(shadow_fd);
     }
+
+    // Spawn bridge (optional, for container networking)
+    spawnBridge();
 
     // Spawn netd (userspace network server)
     spawnNetd();

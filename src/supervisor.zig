@@ -182,6 +182,9 @@ fn spawnServiceProcess(svc: *SupervisedService) bool {
     svc.pid = proc.pid;
     svc.channel_id = chan_pair.server;
 
+    // Process is fully initialized — make it runnable
+    process.markReady(proc);
+
     klog.debug("[supervisor] Spawned '");
     klog.debug(svc.name[0..svc.name_len]);
     klog.debug("' (pid=");

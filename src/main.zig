@@ -305,6 +305,9 @@ fn spawnPartfs() void {
     klog.debugHex(load_result.entry_point);
     klog.debug("]\n");
 
+    // Process is fully initialized — make it runnable
+    process.markReady(proc);
+
     klog.info("Spawned partfs (PID ");
     klog.infoDec(proc.pid);
     klog.info(")\n");
@@ -405,6 +408,9 @@ fn spawnFxfs() void {
     klog.debugHex(load_result.entry_point);
     klog.debug("]\n");
 
+    // Process is fully initialized — make it runnable
+    process.markReady(proc);
+
     klog.info("Spawned fxfs (PID ");
     klog.infoDec(proc.pid);
     klog.info(")\n");
@@ -462,6 +468,9 @@ fn spawnInit() void {
     klog.debug(" entry=");
     klog.debugHex(load_result.entry_point);
     klog.debug("]\n");
+
+    // Process is fully initialized — make it runnable
+    process.markReady(proc);
 
     klog.info("Spawned init (PID ");
     klog.infoDec(proc.pid);

@@ -320,8 +320,36 @@ No sockets API. To make an HTTP request:
 3. `write("/net/tcp/N/data", "GET / HTTP/1.1\r\n...")`
 4. `read("/net/tcp/N/data")` → response
 
+## Container Networking
+
+When containers are enabled (`-Dcontainers=true`), each container can have its own netd instance with independent network state.
+
+### Shared Ether Model
+
+Each container's netd gets its own `/dev/ether0` client via `ether.allocClient()`. All clients receive all frames (broadcast delivery); each netd filters by its own IP. Container IPs are assigned from 10.0.1.0/24 (host keeps 10.0.2.15).
+
+This model is simple but provides no L2 isolation between containers.
+
+### Bridge Server
+
+The bridge (`srv/bridge/main.zig`) adds L2 isolation and NAT. Mounted at `/bridge/` via IPC.
+
+```
+Container netd ──IPC──▶ bridge port N ──▶ bridge ──▶ /dev/ether0
+                                            │
+                                         NAT table
+                                         MAC table
+```
+
+- Virtual ports (16 max): each with MAC, IP, frame ring buffer
+- MAC learning: source MAC → port mapping with aging
+- NAT: SNAT outbound (container IP → host IP), DNAT inbound replies
+- Incremental checksum update (RFC 1624) for IP + TCP/UDP headers
+
+Threads: IPC workers, frame RX (ether → ports), timer (NAT/MAC aging at 1s interval).
+
+See `docs/containers.md` for full bridge ctl file reference.
+
 ## Future Work
 
-- **Bridge server** (`srv/bridge/main.zig`): Software Ethernet switch + NAT for container networking. Requires container infrastructure.
-- **Per-realm isolation**: Each POSIX realm/container gets its own netd instance with independent state. Tested via `rfork(RFNAMEG)` + per-realm mount.
 - **ctl file expansion**: Runtime TCP tuning (keepalive, MSS, window scaling), routing tables, interface configuration.
