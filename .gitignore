@@ -1,6 +1,7 @@
 zig-out/
 zig-cache/
 .zig-cache/
+__pycache__/
 *.o
 *.efi
 *.EFI
@@ -8,3 +9,4 @@ zig-cache/
 .idea/
 .DS_Store
 test-serial.log
+.serena/
