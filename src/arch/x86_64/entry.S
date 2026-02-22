@@ -121,11 +121,20 @@ syscall_return_path:
     popq %rax
     popq %r11
     popq %rcx
-    popq %rsp
 
-    # Swap GS back: kernel PerCpu → user GS
+    # Save user RSP to per-CPU scratch (kernel GS still active)
+    popq %gs:PERCPU_USR
+
+    # Build IRETQ frame with explicit segment selectors.
+    # (SYSRETQ can leave SS without RPL=3 on some KVM/QEMU combos.)
+    pushq $USER_DS                  # SS  = 0x1B
+    pushq %gs:PERCPU_USR            # RSP = saved user RSP
+    pushq %r11                      # RFLAGS
+    pushq $USER_CS                  # CS  = 0x23
+    pushq %rcx                      # RIP
+
     swapgs
-    sysretq
+    iretq
 
 # =============================================================================
 # resume_from_kernel_frame — Resume a blocked process

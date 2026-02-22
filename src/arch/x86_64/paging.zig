@@ -338,6 +338,15 @@ pub fn switchAddressSpace(pml4: *PageTable) void {
         : .{ .memory = true });
 }
 
+/// Switch CR3 to the kernel's master PML4.
+/// Must be called before freeAddressSpace() to avoid walking freed page tables.
+pub fn switchToKernel() void {
+    asm volatile ("mov %[cr3], %%cr3"
+        :
+        : [cr3] "r" (kernel_pml4_phys),
+        : .{ .memory = true });
+}
+
 /// Get the physical address of the kernel PML4.
 pub fn getKernelPml4() *PageTable {
     return tablePtr(kernel_pml4_phys);
@@ -380,24 +389,33 @@ pub fn freeAddressSpace(pml4: *PageTable) void {
     for (0..256) |pml4_idx| {
         if (pml4.entries[pml4_idx] & Flags.PRESENT == 0) continue;
         const pdpt_phys = pml4.entries[pml4_idx] & ADDR_MASK;
+
+        // Validate PDPT physical address is in sane range (below 4 GB)
+        if (pdpt_phys >= 0x1_0000_0000) continue;
+
         const pdpt: *PageTable = tablePtr(pdpt_phys);
 
         for (0..512) |pdpt_idx| {
             if (pdpt.entries[pdpt_idx] & Flags.PRESENT == 0) continue;
             if (pdpt.entries[pdpt_idx] & Flags.HUGE_PAGE != 0) {
-                // 1GB huge page — don't free (kernel identity map)
                 continue;
             }
             const pd_phys = pdpt.entries[pdpt_idx] & ADDR_MASK;
+
+            if (pd_phys >= 0x1_0000_0000) continue;
+
             const pd: *PageTable = tablePtr(pd_phys);
 
             for (0..512) |pd_idx| {
                 if (pd.entries[pd_idx] & Flags.PRESENT == 0) continue;
                 if (pd.entries[pd_idx] & Flags.HUGE_PAGE != 0) {
-                    // 2MB huge page — part of identity map, don't free
                     continue;
                 }
                 const pt_phys = pd.entries[pd_idx] & ADDR_MASK;
+
+                // Validate PT physical address
+                if (pt_phys >= 0x1_0000_0000) continue;
+
                 const pt: *PageTable = tablePtr(pt_phys);
 
                 // Free leaf (4KB) pages that have USER flag
@@ -414,10 +432,8 @@ pub fn freeAddressSpace(pml4: *PageTable) void {
                 }
             }
 
-            // Free the PD page itself if it has USER flag in PDPT entry
-            if (pdpt.entries[pdpt_idx] & Flags.USER != 0) {
-                pmm.freePage(pd_phys);
-            }
+            // Always free the PD page (allocated in createAddressSpace)
+            pmm.freePage(pd_phys);
         }
 
         // Free the PDPT page

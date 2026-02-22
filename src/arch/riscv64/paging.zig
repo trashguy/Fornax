@@ -359,6 +359,14 @@ pub fn switchAddressSpace(root: *PageTable) void {
     asm volatile ("sfence.vma" ::: .{ .memory = true });
 }
 
+/// Switch SATP to the kernel's root page table.
+/// Must be called before freeAddressSpace() to avoid walking freed page tables.
+pub fn switchToKernel() void {
+    const satp_val: u64 = (@as(u64, 9) << 60) | (kernel_root_phys >> 12);
+    cpu.csrWrite(cpu.CSR_SATP, satp_val);
+    asm volatile ("sfence.vma" ::: .{ .memory = true });
+}
+
 /// Get the kernel root page table.
 pub fn getKernelRoot() *PageTable {
     return tablePtr(kernel_root_phys);

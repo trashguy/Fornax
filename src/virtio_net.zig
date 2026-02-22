@@ -11,6 +11,16 @@ const pmm = @import("pmm.zig");
 const klog = @import("klog.zig");
 const virtio = @import("virtio.zig");
 
+const paging = switch (@import("builtin").cpu.arch) {
+    .x86_64 => @import("arch/x86_64/paging.zig"),
+    .riscv64 => @import("arch/riscv64/paging.zig"),
+    else => struct {
+        pub fn physPtr(_: u64) [*]u8 {
+            return @ptrFromInt(0);
+        }
+    },
+};
+
 const pci = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/pci.zig"),
     .riscv64 => @import("arch/riscv64/pci.zig"),
@@ -53,6 +63,8 @@ pub const NetDevice = struct {
     mac: [6]u8,
     rx_buffers: [RX_BUFFERS]u64, // physical addresses of receive buffers
     initialized: bool,
+    /// Index of the RX buffer to recycle on next poll (0xFF = none pending).
+    pending_recycle: u8,
 };
 
 var net_dev: NetDevice = .{
@@ -62,6 +74,7 @@ var net_dev: NetDevice = .{
     .mac = .{ 0, 0, 0, 0, 0, 0 },
     .rx_buffers = .{0} ** RX_BUFFERS,
     .initialized = false,
+    .pending_recycle = 0xFF,
 };
 
 /// Initialize the virtio-net device.
@@ -138,8 +151,8 @@ fn postRxBuffers() void {
         const buf_phys = pmm.allocPage() orelse break;
         net_dev.rx_buffers[i] = buf_phys;
 
-        // Zero the buffer
-        const ptr: [*]u8 = @ptrFromInt(buf_phys);
+        // Zero the buffer via higher-half (safe regardless of identity-map state)
+        const ptr: [*]u8 = paging.physPtr(buf_phys);
         @memset(ptr[0..4096], 0);
 
         // Add to RX queue (device-writable since device writes received packets here)
@@ -164,7 +177,10 @@ pub fn send(data: []const u8) bool {
 
     // Allocate a page for the TX buffer
     const buf_phys = pmm.allocPage() orelse return false;
-    const buf: [*]u8 = @ptrFromInt(buf_phys);
+    // Use higher-half pointer — identity-map may have been modified by user
+    // ELF mappings (huge page splits), so @ptrFromInt(buf_phys) can write
+    // to the wrong physical page.
+    const buf: [*]u8 = paging.physPtr(buf_phys);
 
     // Write virtio-net header (all zeros = no offloading)
     const hdr_size = @sizeOf(VirtioNetHeader);
@@ -176,9 +192,28 @@ pub fn send(data: []const u8) bool {
     const total_len: u32 = @intCast(hdr_size + data.len);
 
     // Add to TX queue
-    _ = virtio.addBuffer(tx, buf_phys, total_len, false) orelse return false;
+    _ = virtio.addBuffer(tx, buf_phys, total_len, false) orelse {
+        pmm.freePage(buf_phys);
+        return false;
+    };
     virtio.notify(tx);
 
+    // Poll for TX completion so we can free the buffer page.
+    // Synchronous send — waits until the device processes the descriptor.
+    var spins: u32 = 0;
+    while (virtio.pollUsed(tx) == null) : (spins += 1) {
+        if (spins > 10_000_000) {
+            klog.err("virtio-net: TX timeout\n");
+            pmm.freePage(buf_phys);
+            return false;
+        }
+        cpu.spinHint();
+    }
+
+    // Synchronous TX complete — recycle descriptor for next send
+    tx.next_desc = 0;
+
+    pmm.freePage(buf_phys);
     return true;
 }
 
@@ -187,18 +222,39 @@ pub fn poll() ?[]u8 {
     if (!net_dev.initialized) return null;
 
     const rx = &(net_dev.rx_queue.?);
+
+    // Recycle the previous RX buffer before polling for a new one.
+    // The caller has finished processing the frame returned by the last poll().
+    if (net_dev.pending_recycle != 0xFF) {
+        const idx: u16 = net_dev.pending_recycle;
+        // Zero the buffer before re-posting
+        const buf_phys = net_dev.rx_buffers[idx];
+        const ptr: [*]u8 = paging.physPtr(buf_phys);
+        @memset(ptr[0..4096], 0);
+        // Re-post existing descriptor to the available ring (descriptor
+        // already points to the correct buffer from initial setup)
+        virtio.recycleDesc(rx, idx);
+        virtio.notify(rx);
+        net_dev.pending_recycle = 0xFF;
+    }
+
     const used = virtio.pollUsed(rx) orelse return null;
 
     const buf_idx = used.id;
     if (buf_idx >= RX_BUFFERS) return null;
 
     const buf_phys = net_dev.rx_buffers[buf_idx];
-    const buf: [*]u8 = @ptrFromInt(buf_phys);
+    // Use higher-half pointer — safe regardless of which process's page
+    // tables are active (identity-map may have modified entries).
+    const buf: [*]u8 = paging.physPtr(buf_phys);
 
     const hdr_size = @sizeOf(VirtioNetHeader);
     const data_len = used.len;
 
     if (data_len <= hdr_size) return null;
+
+    // Mark this buffer for recycling on next poll() call
+    net_dev.pending_recycle = @intCast(buf_idx);
 
     const frame_len: usize = @intCast(data_len - hdr_size);
     return buf[hdr_size..][0..frame_len];

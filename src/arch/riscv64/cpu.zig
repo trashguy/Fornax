@@ -111,6 +111,11 @@ pub inline fn spinHint() void {
     asm volatile ("nop");
 }
 
+/// Single WFI — yields the hart so QEMU can process pending device I/O.
+pub inline fn hltOnce() void {
+    asm volatile ("wfi");
+}
+
 // ── Memory barriers ──────────────────────────────────────────────────
 pub fn fence() void {
     asm volatile ("fence rw, rw" ::: .{ .memory = true });

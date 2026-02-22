@@ -31,6 +31,7 @@ var pkginfo_buf: [4096]u8 linksection(".bss") = undefined;
 var files_list_buf: [16384]u8 linksection(".bss") = undefined;
 var path_scratch: [512]u8 linksection(".bss") = undefined;
 var path_scratch2: [512]u8 linksection(".bss") = undefined;
+var abs_path_buf: [512]u8 linksection(".bss") = undefined;
 var dir_buf: [4096]u8 linksection(".bss") = undefined;
 var hash_buf: [8192]u8 linksection(".bss") = undefined;
 
@@ -125,11 +126,16 @@ const GzipReader = struct {
     }
 
     fn readBlock(self: *GzipReader, dest: *[tar.HEADER_SIZE]u8) bool {
-        if (self.inflater.done) return false;
-        const n = self.inflater.readBytes(&self.bit_reader, dest);
-        if (n == 0) return false;
-        if (n < tar.HEADER_SIZE) {
-            @memset(dest[n..], 0);
+        var pos: usize = 0;
+        while (pos < tar.HEADER_SIZE) {
+            if (self.inflater.done) break;
+            const n = self.inflater.readBytes(&self.bit_reader, dest[pos..]);
+            if (n == 0) break;
+            pos += n;
+        }
+        if (pos == 0) return false;
+        if (pos < tar.HEADER_SIZE) {
+            @memset(dest[pos..], 0);
         }
         return true;
     }
@@ -759,12 +765,12 @@ fn extractPackage(fd: i32, info: *PkgInfo) bool {
         const hdr = tar.Header{ .raw = &header };
         if (!hdr.validateChecksum()) continue;
 
-        const name = hdr.name(&path_scratch);
+        const raw_name = hdr.name(&path_scratch);
         const size = hdr.size();
         const typeflag = hdr.typeflag();
 
-        // Skip metadata files
-        if (strEql(name, ".PKGINFO") or strEql(name, ".INSTALL")) {
+        // Skip metadata files (check before path prefix)
+        if (strEql(raw_name, ".PKGINFO") or strEql(raw_name, ".INSTALL")) {
             if (typeflag == '0' or typeflag == 0) {
                 const blocks = (size + tar.HEADER_SIZE - 1) / tar.HEADER_SIZE;
                 var bi: u64 = 0;
@@ -775,7 +781,15 @@ fn extractPackage(fd: i32, info: *PkgInfo) bool {
             continue;
         }
 
-        if (!tar.isSafePath(name)) continue;
+        if (!tar.isSafePath(raw_name)) continue;
+
+        // Ensure absolute path — Fornax namespace requires leading '/'
+        const name = if (raw_name.len > 0 and raw_name[0] != '/') blk: {
+            if (raw_name.len + 1 >= abs_path_buf.len) break :blk raw_name;
+            abs_path_buf[0] = '/';
+            @memcpy(abs_path_buf[1..][0..raw_name.len], raw_name);
+            break :blk abs_path_buf[0 .. raw_name.len + 1];
+        } else raw_name;
 
         if (typeflag == '5') {
             // Directory
@@ -1108,8 +1122,14 @@ fn installRemotePackage(name: []const u8) void {
 
         // Verify SHA-256
         if (pkg.sha256_valid) {
-            if (!verifySha256(cache_path, &pkg.sha256_hex)) {
-                err.print("fay: SHA-256 mismatch for {s}!\n", .{pkg.nameSlice()});
+            var actual_hash: [64]u8 = undefined;
+            if (hashFile(cache_path, &actual_hash)) {
+                if (!strEql(&actual_hash, &pkg.sha256_hex)) {
+                    err.print("fay: SHA-256 mismatch for {s}\n", .{pkg.nameSlice()});
+                    continue;
+                }
+            } else {
+                err.print("fay: cannot hash {s}\n", .{cache_path});
                 continue;
             }
         }

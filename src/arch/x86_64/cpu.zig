@@ -98,6 +98,13 @@ pub inline fn spinHint() void {
     asm volatile ("pause");
 }
 
+/// Single HLT with interrupts enabled — yields the vCPU so QEMU's event
+/// loop can process pending device I/O (AIO completions, virtio kicks).
+/// Unlike halt() this returns once an interrupt fires.
+pub inline fn hltOnce() void {
+    asm volatile ("sti; hlt; cli");
+}
+
 /// Flush TLB by reloading CR3.
 pub fn flushTlb() void {
     asm volatile (

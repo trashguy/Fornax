@@ -19,6 +19,9 @@ const MAX_CHANNELS = 256;
 /// Maximum inline message data size.
 pub const MAX_MSG_DATA = 4096;
 
+/// Maximum number of clients that can queue on a single channel.
+pub const MAX_CLIENT_WAITERS = 16;
+
 /// 9P-inspired message tags.
 pub const Tag = enum(u32) {
     t_open = 1,
@@ -76,26 +79,78 @@ const ChannelState = enum {
     closed,
 };
 
-/// A channel endpoint.
+/// Maximum number of server threads that can block on recv simultaneously.
+pub const MAX_SERVER_WAITERS = 8;
+
+/// A pending client entry in the IPC queue.
+pub const PendingClient = struct {
+    pid: u32,
+    msg_ptr: ?*Message,
+};
+
 pub const ChannelEnd = struct {
     /// Process ID of the process that owns this end (0 = unowned).
     owner_pid: u32,
-    /// Pending message (set by sender, consumed by receiver at rendezvous).
-    pending_msg: ?*Message,
-    /// Whether this end is waiting to send.
-    send_waiting: bool,
-    /// Whether this end is waiting to receive.
-    recv_waiting: bool,
-    /// PID of the process currently blocked on this end (0 = none).
-    blocked_pid: u32,
+    /// Ring buffer of pending client senders.
+    pending: [MAX_CLIENT_WAITERS]PendingClient = [_]PendingClient{.{ .pid = 0, .msg_ptr = null }} ** MAX_CLIENT_WAITERS,
+    pending_head: u8 = 0,
+    pending_count: u8 = 0,
+    /// PID of the client currently being served by the server (set by recv, used by reply).
+    serving_pid: u32 = 0,
+    /// Whether the server end is waiting to receive.
+    recv_waiting: bool = false,
+    /// PID of the server process blocked on recv (0 = none). Used for single-server fast path.
+    blocked_pid: u32 = 0,
+    /// Queue of server PIDs waiting for messages (multi-threaded server support).
+    server_waiters: [MAX_SERVER_WAITERS]u16 = [_]u16{0} ** MAX_SERVER_WAITERS,
+    server_waiter_count: u8 = 0,
+
+    /// Enqueue a client sender. Returns false if queue is full.
+    pub fn enqueue(self: *ChannelEnd, pid: u32, msg_ptr: *Message) bool {
+        if (self.pending_count >= MAX_CLIENT_WAITERS) return false;
+        const idx = (self.pending_head + self.pending_count) % MAX_CLIENT_WAITERS;
+        self.pending[idx] = .{ .pid = pid, .msg_ptr = msg_ptr };
+        self.pending_count += 1;
+        return true;
+    }
+
+    /// Dequeue the next pending client. Returns null if empty.
+    pub fn dequeue(self: *ChannelEnd) ?PendingClient {
+        if (self.pending_count == 0) return null;
+        const entry = self.pending[self.pending_head];
+        self.pending_head = (self.pending_head + 1) % MAX_CLIENT_WAITERS;
+        self.pending_count -= 1;
+        return entry;
+    }
+
+    /// Check if there are pending client messages.
+    pub fn hasPending(self: *const ChannelEnd) bool {
+        return self.pending_count > 0;
+    }
+
+    /// Add a server PID to the wait queue. Returns false if full.
+    pub fn addServerWaiter(self: *ChannelEnd, pid: u16) bool {
+        if (self.server_waiter_count >= MAX_SERVER_WAITERS) return false;
+        self.server_waiters[self.server_waiter_count] = pid;
+        self.server_waiter_count += 1;
+        return true;
+    }
+
+    /// Remove and return the first server waiter. Returns null if empty.
+    pub fn popServerWaiter(self: *ChannelEnd) ?u16 {
+        if (self.server_waiter_count == 0) return null;
+        const pid = self.server_waiters[0];
+        var i: u8 = 1;
+        while (i < self.server_waiter_count) : (i += 1) {
+            self.server_waiters[i - 1] = self.server_waiters[i];
+        }
+        self.server_waiter_count -= 1;
+        return pid;
+    }
 };
 
 const empty_end = ChannelEnd{
     .owner_pid = 0,
-    .pending_msg = null,
-    .send_waiting = false,
-    .recv_waiting = false,
-    .blocked_pid = 0,
 };
 
 /// A channel: two endpoints connected together.
@@ -193,9 +248,8 @@ pub fn send(chan_id: ChannelId, msg: *Message) IpcError!void {
 
     if (chan.state != .open) return error.ChannelClosed;
 
-    // Synchronous rendezvous: store message for receiver
-    chan.client.pending_msg = msg;
-    chan.client.send_waiting = true;
+    // Enqueue message in client ring buffer
+    _ = chan.client.enqueue(0, msg);
 }
 
 /// Receive a message on a channel (from server side).
@@ -210,10 +264,10 @@ pub fn recv(chan_id: ChannelId, out_msg: *Message) IpcError!void {
 
     if (chan.state != .open) return error.ChannelClosed;
 
-    if (chan.client.pending_msg) |pending| {
-        out_msg.* = pending.*;
-        chan.client.pending_msg = null;
-        chan.client.send_waiting = false;
+    if (chan.client.dequeue()) |entry| {
+        if (entry.msg_ptr) |pending| {
+            out_msg.* = pending.*;
+        }
     } else {
         return error.WouldBlock;
     }
@@ -230,7 +284,8 @@ pub fn reply(chan_id: ChannelId, msg: *Message) IpcError!void {
 
     if (chan.state != .open) return error.ChannelClosed;
 
-    chan.server.pending_msg = msg;
+    // Server reply is handled directly in syscall.zig's sysIpcReply
+    _ = msg;
 }
 
 /// Close a channel.

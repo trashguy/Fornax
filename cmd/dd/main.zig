@@ -86,11 +86,17 @@ export fn _start() noreturn {
         blocks_in += 1;
         const nbytes: usize = @intCast(n);
 
-        const written = fx.syscall.write(out_fd, buf[0..nbytes]);
-        if (written == 0) break;
+        // Handle short writes by looping
+        var written_total: usize = 0;
+        while (written_total < nbytes) {
+            const w = fx.syscall.write(out_fd, buf[written_total..nbytes]);
+            if (w == 0 or w > nbytes - written_total) break; // error or EOF
+            written_total += w;
+        }
+        if (written_total == 0) break;
 
         blocks_out += 1;
-        total_bytes += nbytes;
+        total_bytes += written_total;
     }
 
     // Close fds

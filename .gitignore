@@ -7,3 +7,4 @@ zig-cache/
 *.img
 .idea/
 .DS_Store
+test-serial.log

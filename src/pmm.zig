@@ -165,6 +165,48 @@ pub fn allocPage() ?usize {
     return null;
 }
 
+/// Allocate `count` physically contiguous pages.
+/// Returns the physical address of the first page, or null if no
+/// contiguous run of that length is available.
+pub fn allocContiguousPages(count: usize) ?usize {
+    if (!initialized or count == 0) return null;
+    pmm_lock.lock();
+    defer pmm_lock.unlock();
+
+    var start = search_hint;
+    var checked: usize = 0;
+    while (checked < total_pages) {
+        // Check if `count` pages starting at `start` are all free
+        var run_ok = true;
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const page = (start + i) % total_pages;
+            if (page + count > total_pages and start + i >= total_pages) {
+                // Would wrap around — skip
+                run_ok = false;
+                break;
+            }
+            if (!isFree(page)) {
+                // Skip past this used page
+                checked += i + 1;
+                start = start + i + 1;
+                run_ok = false;
+                break;
+            }
+        }
+        if (run_ok) {
+            // Found a run — mark all used
+            for (0..count) |j| {
+                markUsed((start + j) % total_pages);
+            }
+            free_pages -= count;
+            search_hint = start + count;
+            return (start % total_pages) * page_size;
+        }
+    }
+    return null;
+}
+
 pub fn freePage(phys_addr: usize) void {
     if (!initialized) return;
     pmm_lock.lock();
@@ -188,6 +230,14 @@ fn isFree(page: usize) bool {
     const byte = page / 8;
     const bit: u3 = @intCast(page % 8);
     return (bitmap[byte] & (@as(u8, 1) << bit)) == 0;
+}
+
+/// Check if a physical address is free in the bitmap (public, for diagnostics).
+pub fn isFreeAddr(phys_addr: usize) bool {
+    if (!initialized) return false;
+    const page = phys_addr / page_size;
+    if (page >= total_pages) return false;
+    return isFree(page);
 }
 
 fn markFree(page: usize) void {

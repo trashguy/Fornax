@@ -22,6 +22,7 @@ pub const tar = @import("tar.zig");
 pub const json = @import("json.zig");
 pub const sha256 = @import("sha256.zig");
 pub const http = @import("http.zig");
+pub const thread = @import("thread.zig");
 
 // Re-export syscall functions at top level for backward compatibility.
 pub const SYS = syscall.SYS;

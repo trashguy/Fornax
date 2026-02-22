@@ -215,7 +215,9 @@ pub const Inflater = struct {
     fn writeByte(self: *Inflater, b: u8) void {
         self.window[self.win_pos] = b;
         self.win_pos = (self.win_pos + 1) & 0x7FFF;
-        self.out_buf[self.out_ready] = b;
+        if (self.out_ready < self.out_size) {
+            self.out_buf[self.out_ready] = b;
+        }
         self.out_ready += 1;
     }
 
@@ -286,6 +288,19 @@ pub const Inflater = struct {
     /// written to `dest`, or 0 on EOF/error.
     pub fn readBytes(self: *Inflater, reader: *BitReader, dest: []u8) usize {
         if (self.done) return 0;
+
+        // Deliver leftover bytes from previous call's overshoot
+        if (self.out_ready > self.out_pos) {
+            const avail = self.out_ready - self.out_pos;
+            const n = @min(avail, dest.len);
+            @memcpy(dest[0..n], self.out_buf[self.out_pos..][0..n]);
+            self.out_pos += n;
+            if (self.out_pos >= self.out_ready) {
+                self.out_pos = 0;
+                self.out_ready = 0;
+            }
+            return n;
+        }
 
         self.out_pos = 0;
         self.out_ready = 0;
@@ -370,9 +385,25 @@ pub const Inflater = struct {
     }
 
     fn finishRead(self: *Inflater, dest: []u8) usize {
-        const n = @min(self.out_ready, dest.len);
+        const in_buf = @min(self.out_ready, self.out_size);
+        const n = @min(in_buf, dest.len);
         if (n > 0) {
             @memcpy(dest[0..n], self.out_buf[0..n]);
+        }
+        const excess = self.out_ready - n;
+        if (excess > 0) {
+            // Replay excess bytes from window into out_buf for next call
+            const to_save = @min(excess, self.out_size);
+            var src = (self.win_pos -% excess) & 0x7FFF;
+            for (0..to_save) |i| {
+                self.out_buf[i] = self.window[src];
+                src = (src + 1) & 0x7FFF;
+            }
+            self.out_pos = 0;
+            self.out_ready = to_save;
+        } else {
+            self.out_pos = 0;
+            self.out_ready = 0;
         }
         return n;
     }

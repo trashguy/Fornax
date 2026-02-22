@@ -1,7 +1,7 @@
 .PHONY: all x86_64 aarch64 riscv64 run run-x86_64 run-smp run-aarch64 run-riscv64 disk disk-x86_64 disk-aarch64 clean clean-disk help
 .PHONY: release release-x86_64 release-aarch64 release-riscv64 run-release disk-img disk-format
 .PHONY: run-posix run-posix-release run-tcc
-.PHONY: run-dev run-dev-posix
+.PHONY: run-dev run-dev-posix test
 
 all: x86_64 aarch64
 
@@ -57,6 +57,9 @@ run-dev-posix:
 	zig build x86_64 -Dposix=true
 	./scripts/run-x86_64.sh -smp 8 -m 8192
 
+test:
+	python3 scripts/test-integration.py
+
 run-aarch64: aarch64
 	./scripts/run-aarch64.sh
 
@@ -106,6 +109,7 @@ help:
 	@echo "  make run-posix-release  Run x86_64 with POSIX (ReleaseSafe kernel)"
 	@echo "  make run-dev         Run x86_64 with 8 cores and 8GB RAM"
 	@echo "  make run-dev-posix   Run x86_64 with POSIX, 8 cores and 8GB RAM"
+	@echo "  make test            Run integration tests (headless QEMU)"
 	@echo "  make disk            Create x86_64 bootable disk image"
 	@echo "  make clean-disk      Remove disk image (re-created and formatted on next run)"
 	@echo "  make clean           Remove build artifacts and disk images"

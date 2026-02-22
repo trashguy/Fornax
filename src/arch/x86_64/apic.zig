@@ -447,13 +447,10 @@ fn startAps() void {
     // Boot each AP sequentially
     for (1..core_count) |i| {
         // Allocate 16 KB kernel stack (4 contiguous pages)
-        const stack_page = pmm.allocPage() orelse {
+        const stack_page = pmm.allocContiguousPages(4) orelse {
             klog.err("SMP: failed to alloc AP kernel stack\n");
             return;
         };
-        _ = pmm.allocPage() orelse return;
-        _ = pmm.allocPage() orelse return;
-        _ = pmm.allocPage() orelse return;
         const stack_top = stack_page + mem.KERNEL_VIRT_BASE + 4 * mem.PAGE_SIZE;
         percpu.asm_states[i].kernel_stack_top = stack_top;
 

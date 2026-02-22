@@ -216,28 +216,26 @@ pub fn setupQueue(dev: *VirtioDevice, queue_index: u16) ?Virtqueue {
     const used_pages = (used_size + 4095) / 4096;
     const total_pages = desc_avail_pages + used_pages;
 
-    // Allocate contiguous pages
-    const first_page = pmm.allocPage() orelse return null;
-    var pages_got: usize = 1;
-    while (pages_got < total_pages) : (pages_got += 1) {
-        const page = pmm.allocPage() orelse return null;
-        // If not contiguous, we have a problem — for now just hope they are
-        _ = page;
-    }
+    // Allocate guaranteed-contiguous pages (device DMA requires contiguous physical memory)
+    const first_page = pmm.allocContiguousPages(total_pages) orelse return null;
 
     const phys_addr: u64 = first_page;
 
+    // Use higher-half pointers for CPU access — immune to identity-map modifications
+    // by user ELF mappings (huge page splits in per-process page tables).
+    const base: u64 = first_page + @import("mem.zig").KERNEL_VIRT_BASE;
+
     // Zero all queue memory
-    const ptr: [*]u8 = @ptrFromInt(first_page);
+    const ptr: [*]u8 = @ptrFromInt(base);
     @memset(ptr[0 .. total_pages * 4096], 0);
 
-    // Set up pointers
-    const desc_ptr: [*]VirtqDesc = @ptrFromInt(first_page);
-    const avail_ptr: *VirtqAvail = @ptrFromInt(first_page + desc_size);
-    const avail_ring_ptr: [*]u16 = @ptrFromInt(first_page + desc_size + 4);
-    const used_addr = (first_page + desc_size + avail_size + 4095) & ~@as(usize, 4095);
-    const used_ptr: *VirtqUsed = @ptrFromInt(used_addr);
-    const used_ring_ptr: [*]VirtqUsedElem = @ptrFromInt(used_addr + 4);
+    // Set up pointers (all higher-half)
+    const desc_ptr: [*]VirtqDesc = @ptrFromInt(base);
+    const avail_ptr: *VirtqAvail = @ptrFromInt(base + desc_size);
+    const avail_ring_ptr: [*]u16 = @ptrFromInt(base + desc_size + 4);
+    const used_virt = (base + desc_size + avail_size + 4095) & ~@as(usize, 4095);
+    const used_ptr: *VirtqUsed = @ptrFromInt(used_virt);
+    const used_ring_ptr: [*]VirtqUsedElem = @ptrFromInt(used_virt + 4);
 
     // Tell device the queue address (in units of 4096 bytes)
     write32(dev.io_base, REG_QUEUE_ADDRESS, @intCast(phys_addr / 4096));
@@ -341,11 +339,22 @@ pub fn pollUsed(vq: *Virtqueue) ?VirtqUsedElem {
     // Memory barrier — ensure we see the latest used index
     memoryBarrier();
 
-    if (vq.last_used_idx == vq.used.idx) return null;
+    // Volatile read of used.idx to prevent compiler from caching the value
+    const used_idx = @as(*volatile u16, @ptrCast(&vq.used.idx)).*;
+    if (vq.last_used_idx == used_idx) return null;
 
     const elem = vq.used_ring[vq.last_used_idx % vq.size];
     vq.last_used_idx +%= 1;
     return elem;
+}
+
+/// Re-post an existing descriptor to the available ring without allocating a new
+/// descriptor slot. Used for recycling RX buffers that have already been set up.
+pub fn recycleDesc(vq: *Virtqueue, desc_idx: u16) void {
+    const avail_idx = vq.avail.idx;
+    vq.avail_ring[avail_idx % vq.size] = desc_idx;
+    memoryBarrier();
+    vq.avail.idx = avail_idx +% 1;
 }
 
 /// Read the ISR status register (clears interrupt).

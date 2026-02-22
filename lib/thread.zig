@@ -1,7 +1,10 @@
 /// Native Zig threading API for Fornax.
 ///
-/// Provides Thread.spawn() and Mutex backed by the clone/futex syscalls.
+/// Provides spawnThread() and Mutex backed by the clone/futex syscalls.
+/// The clone wrapper uses inline asm to handle the child's first execution:
+/// parent returns child PID, child pops func/arg from stack, calls func, exits.
 const fx = @import("syscall.zig");
+const arch = @import("builtin").cpu.arch;
 
 const THREAD_STACK_SIZE = 64 * 4096; // 256 KB stack per thread
 
@@ -12,7 +15,7 @@ pub const ThreadHandle = struct {
 
 /// Spawn a new thread that calls `func(arg)`.
 /// Returns a ThreadHandle that can be used with join().
-pub fn spawnThread(comptime func: fn (*anyopaque) callconv(.C) void, arg: ?*anyopaque) !ThreadHandle {
+pub fn spawnThread(comptime func: fn (*anyopaque) callconv(.c) void, arg: ?*anyopaque) !ThreadHandle {
     // Allocate stack via mmap (MAP_ANONYMOUS | MAP_PRIVATE)
     const MAP_ANONYMOUS: u64 = 0x20;
     const MAP_PRIVATE: u64 = 0x02;
@@ -24,50 +27,77 @@ pub fn spawnThread(comptime func: fn (*anyopaque) callconv(.C) void, arg: ?*anyo
 
     const stack_top = stack_base + THREAD_STACK_SIZE;
 
-    // Set up the stack: push arg and func pointer for the child's entry stub
-    // The child thread will pop these and call func(arg)
-    const sp: [*]u64 = @ptrFromInt(stack_top - 16);
-    sp[0] = @intFromPtr(arg);
-    sp[1] = @intFromPtr(&threadEntry);
+    // Store ctid at the base of the stack (persistent shared memory, not on parent's stack)
+    const ctid_ptr: *volatile u32 = @ptrFromInt(stack_base);
+    ctid_ptr.* = 0;
 
-    // ctid location — thread will clear this on exit
-    var ctid: u32 align(4) = 0;
-    _ = &ctid;
-
-    // Store the actual function pointer + arg in the top of the stack
-    // so threadEntry can find them
-    const setup: [*]u64 = @ptrFromInt(stack_top - 32);
-    setup[0] = @intFromPtr(func);
+    // Set up child stack: func and arg at the top.
+    // After clone, child RSP = stack_top - 16.
+    //   [RSP + 0] = func address
+    //   [RSP + 8] = arg pointer
+    // Child pops these in asm and calls func(arg).
+    const setup: [*]u64 = @ptrFromInt(stack_top - 16);
+    setup[0] = @intFromPtr(&func);
     setup[1] = @intFromPtr(arg);
 
-    const tid = fx.clone(
-        stack_top - 32, // stack pointer (points to setup area)
-        0, // tls (not used for Zig threads)
-        @intFromPtr(&ctid), // ctid_ptr
-        0, // ptid_ptr
-        0, // flags
-    );
+    const child_rsp = stack_top - 16;
+    const ctid_addr = @intFromPtr(ctid_ptr);
 
-    if (tid == 0) {
-        // We are the child thread — this shouldn't happen in the parent's
-        // execution path because clone returns child_pid to parent.
-        unreachable;
-    }
+    // Raw clone syscall with inline asm that handles the child case.
+    // Parent path: returns child PID (RAX > 0).
+    // Child path: pops func/arg, calls func(arg), exits (never returns).
+    const tid: u64 = switch (arch) {
+        .x86_64 => asm volatile (
+        // Clone syscall
+            \\ syscall
+            \\ testq %%rax, %%rax
+            \\ jnz 1f
+            // ── Child path ──
+            \\ xorl %%ebp, %%ebp
+            \\ popq %%r12
+            \\ popq %%rdi
+            \\ callq *%%r12
+            \\ movl $14, %%eax
+            \\ xorl %%edi, %%edi
+            \\ syscall
+            \\ 1:
+            : [ret] "={rax}" (-> u64),
+            : [nr] "{rax}" (@intFromEnum(fx.SYS.clone)),
+              [a0] "{rdi}" (child_rsp),
+              [a1] "{rsi}" (@as(u64, 0)),
+              [a2] "{rdx}" (ctid_addr),
+              [a3] "{r10}" (@as(u64, 0)),
+              [a4] "{r8}" (@as(u64, 0)),
+            : .{ .rcx = true, .r11 = true, .memory = true }),
+        .riscv64 => asm volatile (
+            \\ ecall
+            \\ bnez a0, 1f
+            // ── Child path ──
+            \\ ld t0, 0(sp)
+            \\ ld a0, 8(sp)
+            \\ addi sp, sp, 16
+            \\ jalr t0
+            \\ li a7, 14
+            \\ li a0, 0
+            \\ ecall
+            \\ 1:
+            : [ret] "={x10}" (-> u64),
+            : [nr] "{x17}" (@intFromEnum(fx.SYS.clone)),
+              [a0] "{x10}" (child_rsp),
+              [a1] "{x11}" (@as(u64, 0)),
+              [a2] "{x12}" (ctid_addr),
+              [a3] "{x13}" (@as(u64, 0)),
+              [a4] "{x14}" (@as(u64, 0)),
+            : .{ .memory = true }),
+        else => @compileError("unsupported arch for spawnThread"),
+    };
 
     if (tid > 0xFFFF_FFFF_FFFF_0000) return error.CloneFailed;
 
     return ThreadHandle{
         .tid = @truncate(tid),
-        .ctid_ptr = &ctid,
+        .ctid_ptr = ctid_ptr,
     };
-}
-
-fn threadEntry() callconv(.C) noreturn {
-    // NOTE: This is a placeholder. For native Zig threads, the actual entry
-    // mechanism depends on the stack setup. The clone syscall resumes at
-    // the parent's RIP with RAX=0, so musl-style stub is needed.
-    // For now, native Zig threading is a stretch goal — POSIX pthread works.
-    fx.exit(0);
 }
 
 /// Mutex — futex-based mutual exclusion lock.

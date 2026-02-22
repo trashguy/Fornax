@@ -137,6 +137,9 @@ pub fn releaseGroup(g: *ThreadGroup, proc: *process.Process) bool {
     if (pml4) |p| {
         // TLB shootdown for all cores that ran any thread in this group
         shootdownGroup(g);
+        // Switch to kernel page tables before freeing, so CR3 doesn't
+        // point to the page tables we're about to free.
+        paging.switchToKernel();
         paging.freeAddressSpace(p);
     }
 

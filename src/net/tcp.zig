@@ -2,17 +2,22 @@
 ///
 /// Minimal TCP implementation with connection state machine, retransmission,
 /// and ring buffers. Supports connect, listen, send, and receive.
+///
+/// SMP: Global tcp_lock guards connections[], next_ephemeral_port, and
+/// seq_counter. All public API functions acquire the lock. Internal helpers
+/// are called from within locked contexts and must not re-acquire.
 const ipv4 = @import("ipv4.zig");
 const klog = @import("../klog.zig");
 const timer = @import("../timer.zig");
 const process = @import("../process.zig");
+const SpinLock = @import("../spinlock.zig").SpinLock;
 
 const HEADER_SIZE = 20; // no options
 const MAX_CONNECTIONS = 16;
-const RX_BUF_SIZE = 4096;
+const RX_BUF_SIZE = 16384;
 const TX_BUF_SIZE = 4096;
 const DEFAULT_MSS: u16 = 1460;
-const DEFAULT_WINDOW: u16 = 4096;
+const DEFAULT_WINDOW: u16 = 16384;
 const INITIAL_RTO: u32 = 18; // ~1 second at 18 Hz
 const MAX_RETRIES: u8 = 8;
 const TIME_WAIT_TICKS: u32 = 36; // ~2 seconds
@@ -38,6 +43,8 @@ pub const TcpState = enum(u8) {
     closing,
 };
 
+const MAX_WAITERS = 4;
+
 pub const Connection = struct {
     state: TcpState,
     local_port: u16,
@@ -61,10 +68,10 @@ pub const Connection = struct {
     retransmit_tick: u32,
     retransmit_count: u8,
     rto: u32,
-    // Blocked process tracking
-    read_waiter_pid: u16,
-    connect_waiter_pid: u16,
-    listen_waiter_pid: u16,
+    // Blocked process tracking (multi-slot for SMP/threads)
+    read_waiters: [MAX_WAITERS]?u16,
+    connect_waiters: [MAX_WAITERS]?u16,
+    listen_waiters: [MAX_WAITERS]?u16,
     // Listener parent index (for connections spawned by accept)
     parent_idx: u8,
     in_use: bool,
@@ -75,8 +82,13 @@ var connections: [MAX_CONNECTIONS]Connection linksection(".bss") = undefined;
 var next_ephemeral_port: u16 = 49152;
 var seq_counter: u32 = 1000;
 
+/// Global TCP lock — protects connections[], next_ephemeral_port, seq_counter.
+var tcp_lock: SpinLock = .{};
+
 // Forward-declare the net module for sending
 const net = @import("../net.zig");
+
+const no_waiters = [_]?u16{null} ** MAX_WAITERS;
 
 pub fn init() void {
     for (&connections) |*c| {
@@ -104,9 +116,9 @@ fn emptyConn() Connection {
         .retransmit_tick = 0,
         .retransmit_count = 0,
         .rto = INITIAL_RTO,
-        .read_waiter_pid = 0,
-        .connect_waiter_pid = 0,
-        .listen_waiter_pid = 0,
+        .read_waiters = no_waiters,
+        .connect_waiters = no_waiters,
+        .listen_waiters = no_waiters,
         .parent_idx = 0xFF,
         .in_use = false,
     };
@@ -114,6 +126,13 @@ fn emptyConn() Connection {
 
 /// Allocate a new TCP connection slot.
 pub fn alloc() ?u8 {
+    tcp_lock.lock();
+    defer tcp_lock.unlock();
+    return allocLocked();
+}
+
+/// Internal alloc — caller must hold tcp_lock.
+fn allocLocked() ?u8 {
     for (&connections, 0..) |*c, i| {
         if (!c.in_use) {
             c.* = emptyConn();
@@ -129,6 +148,8 @@ pub fn alloc() ?u8 {
 /// Get connection state for status queries.
 pub fn getState(idx: u8) ?TcpState {
     if (idx >= MAX_CONNECTIONS) return null;
+    tcp_lock.lock();
+    defer tcp_lock.unlock();
     if (!connections[idx].in_use) return null;
     return connections[idx].state;
 }
@@ -136,6 +157,8 @@ pub fn getState(idx: u8) ?TcpState {
 /// Get connection's local port and IP.
 pub fn getLocal(idx: u8) ?struct { ip: [4]u8, port: u16 } {
     if (idx >= MAX_CONNECTIONS) return null;
+    tcp_lock.lock();
+    defer tcp_lock.unlock();
     if (!connections[idx].in_use) return null;
     return .{ .ip = connections[idx].local_ip, .port = connections[idx].local_port };
 }
@@ -143,6 +166,8 @@ pub fn getLocal(idx: u8) ?struct { ip: [4]u8, port: u16 } {
 /// Get connection's remote port and IP.
 pub fn getRemote(idx: u8) ?struct { ip: [4]u8, port: u16 } {
     if (idx >= MAX_CONNECTIONS) return null;
+    tcp_lock.lock();
+    defer tcp_lock.unlock();
     if (!connections[idx].in_use) return null;
     return .{ .ip = connections[idx].remote_ip, .port = connections[idx].remote_port };
 }
@@ -150,6 +175,8 @@ pub fn getRemote(idx: u8) ?struct { ip: [4]u8, port: u16 } {
 /// Initiate a TCP connection (active open).
 pub fn connect(idx: u8, ip: [4]u8, port: u16) bool {
     if (idx >= MAX_CONNECTIONS) return false;
+    tcp_lock.lock();
+    defer tcp_lock.unlock();
     const c = &connections[idx];
     if (!c.in_use or c.state != .closed) return false;
 
@@ -176,6 +203,8 @@ pub fn connect(idx: u8, ip: [4]u8, port: u16) bool {
 /// Set up a listening socket (passive open).
 pub fn announce(idx: u8, port: u16) bool {
     if (idx >= MAX_CONNECTIONS) return false;
+    tcp_lock.lock();
+    defer tcp_lock.unlock();
     const c = &connections[idx];
     if (!c.in_use or c.state != .closed) return false;
 
@@ -191,6 +220,8 @@ pub fn announce(idx: u8, port: u16) bool {
 /// Queue data for transmission on an established connection.
 pub fn sendData(idx: u8, data: []const u8) u16 {
     if (idx >= MAX_CONNECTIONS) return 0;
+    tcp_lock.lock();
+    defer tcp_lock.unlock();
     const c = &connections[idx];
     if (c.state != .established and c.state != .close_wait) return 0;
 
@@ -210,9 +241,12 @@ pub fn sendData(idx: u8, data: []const u8) u16 {
 /// Read received data from the connection's rx ring buffer.
 pub fn recvData(idx: u8, buf: []u8) u16 {
     if (idx >= MAX_CONNECTIONS) return 0;
+    tcp_lock.lock();
+    defer tcp_lock.unlock();
     const c = &connections[idx];
     if (c.rx_count == 0) return 0;
 
+    const old_count = c.rx_count;
     const to_copy: u16 = @intCast(@min(buf.len, c.rx_count));
     // Read from ring buffer — head points to the write position,
     // read position = head - count (wrapped)
@@ -223,18 +257,31 @@ pub fn recvData(idx: u8, buf: []u8) u16 {
         buf[i] = c.rx_buf[(read_pos + i) % RX_BUF_SIZE];
     }
     c.rx_count -= to_copy;
+
+    // Send window update ACK if buffer was previously too full for an MSS-sized
+    // segment and now has room. This unblocks the remote when it stopped sending
+    // due to a small/zero advertised window.
+    const was_full = old_count > RX_BUF_SIZE / 2;
+    const now_has_room = c.rx_count <= RX_BUF_SIZE / 2;
+    if (c.state == .established and was_full and now_has_room) {
+        sendAck(c);
+    }
     return to_copy;
 }
 
 /// Check if connection has data available to read.
 pub fn hasData(idx: u8) bool {
     if (idx >= MAX_CONNECTIONS) return false;
+    tcp_lock.lock();
+    defer tcp_lock.unlock();
     return connections[idx].rx_count > 0;
 }
 
 /// Check if connection is in a state where no more data will arrive (EOF).
 pub fn isEof(idx: u8) bool {
     if (idx >= MAX_CONNECTIONS) return true;
+    tcp_lock.lock();
+    defer tcp_lock.unlock();
     const c = &connections[idx];
     return c.state == .close_wait or c.state == .closing or
         c.state == .last_ack or c.state == .time_wait or c.state == .closed;
@@ -243,6 +290,8 @@ pub fn isEof(idx: u8) bool {
 /// Initiate a graceful close (send FIN).
 pub fn startClose(idx: u8) void {
     if (idx >= MAX_CONNECTIONS) return;
+    tcp_lock.lock();
+    defer tcp_lock.unlock();
     const c = &connections[idx];
 
     switch (c.state) {
@@ -255,11 +304,15 @@ pub fn startClose(idx: u8) void {
             c.state = .last_ack;
         },
         .syn_sent, .syn_received => {
-            // Abort
+            // Abort — wake blocked waiters before freeing
+            wakeAllWaiters(&c.connect_waiters, true);
+            wakeAllWaiters(&c.read_waiters, true);
             sendRst(c);
             freeConn(c);
         },
         .listen => {
+            // Wake blocked accept waiters before freeing
+            wakeAllWaiters(&c.listen_waiters, true);
             freeConn(c);
         },
         else => {},
@@ -269,19 +322,25 @@ pub fn startClose(idx: u8) void {
 /// Register a waiter for read (blocks until data arrives).
 pub fn setReadWaiter(idx: u8, pid: u16) void {
     if (idx >= MAX_CONNECTIONS) return;
-    connections[idx].read_waiter_pid = pid;
+    tcp_lock.lock();
+    defer tcp_lock.unlock();
+    addWaiter(&connections[idx].read_waiters, pid);
 }
 
 /// Register a waiter for connect completion.
 pub fn setConnectWaiter(idx: u8, pid: u16) void {
     if (idx >= MAX_CONNECTIONS) return;
-    connections[idx].connect_waiter_pid = pid;
+    tcp_lock.lock();
+    defer tcp_lock.unlock();
+    addWaiter(&connections[idx].connect_waiters, pid);
 }
 
 /// Register a waiter for listen/accept.
 pub fn setListenWaiter(idx: u8, pid: u16) void {
     if (idx >= MAX_CONNECTIONS) return;
-    connections[idx].listen_waiter_pid = pid;
+    tcp_lock.lock();
+    defer tcp_lock.unlock();
+    addWaiter(&connections[idx].listen_waiters, pid);
 }
 
 /// Process an incoming TCP segment.
@@ -312,6 +371,9 @@ pub fn handlePacket(payload: []const u8, ip_hdr: ipv4.Header) void {
     }
 
     const data = payload[data_offset..];
+
+    tcp_lock.lock();
+    defer tcp_lock.unlock();
 
     // Demux: find matching connection
     // First try established/in-progress connections
@@ -344,6 +406,9 @@ pub fn handlePacket(payload: []const u8, ip_hdr: ipv4.Header) void {
 
 /// Timer tick — check retransmission timers and TIME_WAIT expiry.
 pub fn tick(now: u32) void {
+    tcp_lock.lock();
+    defer tcp_lock.unlock();
+
     for (&connections) |*c| {
         if (!c.in_use) continue;
 
@@ -352,7 +417,7 @@ pub fn tick(now: u32) void {
                 if (now -% c.retransmit_tick >= c.rto) {
                     if (c.retransmit_count >= MAX_RETRIES) {
                         klog.debug("tcp: connect timeout\n");
-                        wakeWaiter(&c.connect_waiter_pid, true);
+                        wakeAllWaiters(&c.connect_waiters, true);
                         freeConn(c);
                     } else {
                         // Retransmit SYN
@@ -372,7 +437,7 @@ pub fn tick(now: u32) void {
                     if (now -% c.retransmit_tick >= c.rto) {
                         if (c.retransmit_count >= MAX_RETRIES) {
                             klog.debug("tcp: retransmit timeout\n");
-                            wakeWaiter(&c.read_waiter_pid, true);
+                            wakeAllWaiters(&c.read_waiters, true);
                             sendRst(c);
                             freeConn(c);
                         } else {
@@ -405,6 +470,7 @@ pub fn tick(now: u32) void {
 }
 
 // ── Internal helpers ────────────────────────────────────────────────
+// All functions below are called with tcp_lock held.
 
 fn handleSegment(c: *Connection, idx: u8, seq: u32, ack: u32, flags: u8, window: u16, data: []const u8, ip_hdr: ipv4.Header) void {
     _ = ip_hdr;
@@ -413,9 +479,9 @@ fn handleSegment(c: *Connection, idx: u8, seq: u32, ack: u32, flags: u8, window:
     // RST handling — always process
     if (flags & RST != 0) {
         klog.debug("tcp: received RST\n");
-        wakeWaiter(&c.connect_waiter_pid, true);
-        wakeWaiter(&c.read_waiter_pid, true);
-        wakeWaiter(&c.listen_waiter_pid, true);
+        wakeAllWaiters(&c.connect_waiters, true);
+        wakeAllWaiters(&c.read_waiters, true);
+        wakeAllWaiters(&c.listen_waiters, true);
         freeConn(c);
         return;
     }
@@ -434,7 +500,7 @@ fn handleSegment(c: *Connection, idx: u8, seq: u32, ack: u32, flags: u8, window:
                     c.tx_len = 0;
                     sendAck(c);
                     klog.debug("tcp: connected\n");
-                    wakeWaiter(&c.connect_waiter_pid, false);
+                    wakeAllWaiters(&c.connect_waiters, false);
                 }
             }
         },
@@ -448,7 +514,7 @@ fn handleSegment(c: *Connection, idx: u8, seq: u32, ack: u32, flags: u8, window:
                 klog.debug("tcp: accept complete\n");
                 // Wake the listener's waiter
                 if (c.parent_idx != 0xFF and c.parent_idx < MAX_CONNECTIONS) {
-                    wakeWaiter(&connections[c.parent_idx].listen_waiter_pid, false);
+                    wakeAllWaiters(&connections[c.parent_idx].listen_waiters, false);
                 }
             }
         },
@@ -525,20 +591,42 @@ fn handleEstablished(c: *Connection, seq: u32, ack: u32, flags: u8, window: u16,
             c.rx_count += to_buf;
             c.rcv_nxt +%= @as(u32, to_buf);
 
-            // Wake read waiter
-            wakeWaiter(&c.read_waiter_pid, false);
+            if (to_buf < data.len) {
+                klog.debug("tcp: partial buf ");
+                klog.debugDec(to_buf);
+                klog.debug("/");
+                klog.debugDec(@as(u16, @intCast(data.len)));
+                klog.debug(" rx_count=");
+                klog.debugDec(c.rx_count);
+                klog.debug("\n");
+            }
+
+            // Wake read waiters
+            wakeAllWaiters(&c.read_waiters, false);
+        } else {
+            klog.debug("tcp: OOO seq=");
+            klog.debugHex(seq);
+            klog.debug(" exp=");
+            klog.debugHex(c.rcv_nxt);
+            klog.debug("\n");
         }
         // Send ACK (even for out-of-order to trigger fast retransmit on remote)
         sendAck(c);
+    } else if (flags & FIN == 0) {
+        // ACK-only (no data, no FIN) — print for debug
+        klog.debug("tcp: ack-only\n");
     }
 
     // Process FIN
     if (flags & FIN != 0) {
-        c.rcv_nxt = seq +% @as(u32, @intCast(data.len)) +% 1;
+        // Only advance rcv_nxt if this FIN's seq matches what we expect
+        if (seq == c.rcv_nxt or (data.len > 0 and seq +% @as(u32, @intCast(data.len)) == c.rcv_nxt)) {
+            c.rcv_nxt +%= 1; // FIN consumes one sequence number
+        }
         sendAck(c);
         c.state = .close_wait;
         // Wake reader with EOF
-        wakeWaiter(&c.read_waiter_pid, false);
+        wakeAllWaiters(&c.read_waiters, false);
         klog.debug("tcp: remote closed (FIN)\n");
     }
 }
@@ -575,8 +663,8 @@ fn handleListenSegment(listener: *Connection, listener_idx: u8, seq: u32, flags:
     if (flags & ACK != 0) return; // SYN must not have ACK
     if (flags & RST != 0) return;
 
-    // Allocate a child connection
-    const child_idx = alloc() orelse {
+    // Allocate a child connection (lock already held)
+    const child_idx = allocLocked() orelse {
         klog.debug("tcp: listen: no free connections\n");
         return;
     };
@@ -627,7 +715,8 @@ fn sendRst(c: *Connection) void {
 
 fn sendFlags(c: *Connection, flags: u8, seq: u32) void {
     var tcp_buf: [HEADER_SIZE]u8 = undefined;
-    buildHeader(&tcp_buf, c.local_port, c.remote_port, seq, c.rcv_nxt, flags, DEFAULT_WINDOW, 0);
+    const window = RX_BUF_SIZE - c.rx_count;
+    buildHeader(&tcp_buf, c.local_port, c.remote_port, seq, c.rcv_nxt, flags, window, 0);
 
     // Compute checksum
     const cksum = tcpChecksum(c.local_ip, c.remote_ip, &tcp_buf);
@@ -643,7 +732,8 @@ fn sendDataSegment(c: *Connection) void {
     var tcp_buf: [HEADER_SIZE + TX_BUF_SIZE]u8 = undefined;
     const total_len = HEADER_SIZE + send_len;
 
-    buildHeader(tcp_buf[0..HEADER_SIZE], c.local_port, c.remote_port, c.snd_una, c.rcv_nxt, ACK | PSH, DEFAULT_WINDOW, 0);
+    const window = RX_BUF_SIZE - c.rx_count;
+    buildHeader(tcp_buf[0..HEADER_SIZE], c.local_port, c.remote_port, c.snd_una, c.rcv_nxt, ACK | PSH, window, 0);
 
     // Copy data
     @memcpy(tcp_buf[HEADER_SIZE..][0..send_len], c.tx_buf[0..send_len]);
@@ -737,17 +827,33 @@ fn freeConn(c: *Connection) void {
     c.* = emptyConn();
 }
 
-fn wakeWaiter(waiter_pid: *u16, is_error: bool) void {
-    if (waiter_pid.* == 0) return;
-    const pid = waiter_pid.*;
-    waiter_pid.* = 0;
+// ── Waiter helpers ──────────────────────────────────────────────────
 
-    if (process.getByPid(pid)) |proc| {
-        if (proc.state == .blocked) {
-            if (is_error) {
-                proc.syscall_ret = 0xFFFF_FFFF_FFFF_FFF2; // -ECONNRESET equivalent
+/// Add a PID to a waiter array. Overwrites oldest slot if full.
+fn addWaiter(waiters: *[MAX_WAITERS]?u16, pid: u16) void {
+    for (waiters) |*w| {
+        if (w.* == null) {
+            w.* = pid;
+            return;
+        }
+    }
+    // Full — overwrite first slot (shouldn't happen in practice)
+    waiters[0] = pid;
+}
+
+/// Wake all waiters in the array and clear it.
+fn wakeAllWaiters(waiters: *[MAX_WAITERS]?u16, is_error: bool) void {
+    for (waiters) |*w| {
+        if (w.*) |pid| {
+            w.* = null;
+            if (process.getByPid(pid)) |proc| {
+                if (proc.state == .blocked) {
+                    if (is_error) {
+                        proc.syscall_ret = 0xFFFF_FFFF_FFFF_FFF2; // -ECONNRESET equivalent
+                    }
+                    process.markReady(proc);
+                }
             }
-            process.markReady(proc);
         }
     }
 }

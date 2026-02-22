@@ -99,20 +99,45 @@ fn readU32LE(buf: *const [4]u8) u32 {
 
 /// Send a client message on a channel and wake the server if it's blocked in recv.
 fn sendToServer(chan: *ipc.Channel, proc: *process.Process) void {
-    chan.client.pending_msg = &proc.ipc_msg;
-    chan.client.send_waiting = true;
-    chan.client.blocked_pid = proc.pid;
+    chan.lock.lock();
+    defer chan.lock.unlock();
 
-    if (chan.server.recv_waiting and chan.server.blocked_pid != 0) {
-        if (process.getByPid(chan.server.blocked_pid)) |server_proc| {
-            server_proc.ipc_pending_msg = &proc.ipc_msg;
+    // Enqueue this client's message in the ring buffer
+    if (!chan.client.enqueue(proc.pid, &proc.ipc_msg)) {
+        // Queue full — leave process blocked, it will be retried
+        // when a slot opens (on next sysIpcReply)
+        return;
+    }
+
+    // Fast path: if a server thread is waiting for a message, wake it directly
+    if (chan.client.server_waiter_count > 0) {
+        if (chan.client.popServerWaiter()) |server_pid_u16| {
+            const server_pid: u32 = server_pid_u16;
+            if (process.getByPid(server_pid)) |server_proc| {
+                // Dequeue the entry we just enqueued and deliver it
+                if (chan.client.dequeue()) |entry| {
+                    if (entry.msg_ptr) |msg_ptr| {
+                        server_proc.ipc_pending_msg = msg_ptr;
+                    }
+                    server_proc.ipc_serving_client = entry.pid;
+                }
+                process.markReady(server_proc);
+                server_proc.syscall_ret = 0;
+            }
+        }
+    } else if (chan.client.recv_waiting and chan.client.blocked_pid != 0) {
+        // Legacy single-server fast path
+        if (process.getByPid(chan.client.blocked_pid)) |server_proc| {
+            if (chan.client.dequeue()) |entry| {
+                if (entry.msg_ptr) |msg_ptr| {
+                    server_proc.ipc_pending_msg = msg_ptr;
+                }
+                server_proc.ipc_serving_client = entry.pid;
+            }
             process.markReady(server_proc);
             server_proc.syscall_ret = 0;
-            chan.server.recv_waiting = false;
-            chan.server.blocked_pid = 0;
-            // Message delivered via ipc_pending_msg — clear pending_msg so
-            // the server's next sysIpcRecv doesn't re-deliver it.
-            chan.client.pending_msg = null;
+            chan.client.recv_waiting = false;
+            chan.client.blocked_pid = 0;
         }
     }
 }
@@ -2132,12 +2157,8 @@ fn sysRfork(flags: u64) u64 {
             child.needs_stack_free = false;
         }
 
-        // Allocate kernel stack
-        var stack_base: u64 = 0;
-        for (0..process.KERNEL_STACK_PAGES) |i| {
-            const page = pmm.allocPage() orelse return ENOMEM;
-            if (i == 0) stack_base = page;
-        }
+        // Allocate kernel stack (contiguous — higher-half is direct phys→virt)
+        const stack_base: u64 = pmm.allocContiguousPages(process.KERNEL_STACK_PAGES) orelse return ENOMEM;
         const stack_virt = if (paging.isInitialized()) stack_base + mem.KERNEL_VIRT_BASE else stack_base;
 
         // Address space: deep-copy or share
@@ -2237,20 +2258,28 @@ fn sysIpcRecv(fd: u64, msg_buf_ptr: u64) u64 {
 
     const chan = ipc.getChannel(entry.channel_id) orelse return EBADF;
 
-    // Check for pending message from client
-    if (chan.client.pending_msg) |msg| {
+    chan.lock.lock();
+
+    // Check for pending message from client ring buffer
+    if (chan.client.dequeue()) |pending_entry| {
         // Message available — deliver directly to user buffer
-        // (We're in the server's address space, so user pointers are valid)
-        deliverToUserBuf(msg, msg_buf_ptr);
-        chan.client.pending_msg = null;
+        if (pending_entry.msg_ptr) |msg_ptr| {
+            deliverToUserBuf(msg_ptr, msg_buf_ptr);
+        }
+        // Track which client we're serving so sysIpcReply knows who to wake
+        proc.ipc_serving_client = pending_entry.pid;
+        chan.lock.unlock();
         return 0;
     }
 
-    // No message pending — block waiting for one
+    // No message pending — add to server wait queue and block
     proc.ipc_recv_buf_ptr = msg_buf_ptr;
-    chan.server.recv_waiting = true;
-    chan.server.blocked_pid = proc.pid;
+    _ = chan.client.addServerWaiter(@intCast(proc.pid));
+    chan.client.recv_waiting = true;
+    chan.client.blocked_pid = proc.pid;
     proc.state = .blocked;
+
+    chan.lock.unlock();
     process.scheduleNext();
 }
 
@@ -2263,7 +2292,7 @@ fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
 
     if (reply_msg_ptr >= 0x0000_8000_0000_0000 or reply_msg_ptr == 0) return EFAULT;
 
-    const chan = ipc.getChannel(entry.channel_id) orelse return EBADF;
+    _ = ipc.getChannel(entry.channel_id) orelse return EBADF;
 
     // Read reply from server's user space
     const reply_tag_ptr: *align(1) const u32 = @ptrFromInt(reply_msg_ptr);
@@ -2273,23 +2302,24 @@ fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
     const reply_tag = reply_tag_ptr.*;
     const reply_data_len = @min(reply_len_ptr.*, ipc.MAX_MSG_DATA);
 
-    // Find the blocked client
-    if (!chan.client.send_waiting or chan.client.blocked_pid == 0) return 0;
-    const client_proc = process.getByPid(chan.client.blocked_pid) orelse return 0;
+    // Find the client being served by this server thread
+    const serving_pid = proc.ipc_serving_client;
+    if (serving_pid == 0) return 0;
+    const client_proc = process.getByPid(serving_pid) orelse {
+        proc.ipc_serving_client = 0;
+        return 0;
+    };
 
     const is_ok = reply_tag == @intFromEnum(ipc.Tag.r_ok);
 
     switch (client_proc.pending_op) {
         .open, .create => {
             if (is_ok and reply_data_len >= 4) {
-                // Extract handle from reply, store in fd entry
                 const handle = readU32LE(reply_data_ptr[0..4]);
                 if (client_proc.getFdEntryPtr(client_proc.pending_fd)) |fd_entry| {
                     fd_entry.server_handle = handle;
                 }
-                // syscall_ret already set to fd in sysOpen/sysCreate
             } else {
-                // Error: deallocate the pre-allocated fd
                 client_proc.closeFd(client_proc.pending_fd);
                 client_proc.syscall_ret = ENOENT;
             }
@@ -2297,14 +2327,12 @@ fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
         .read => {
             if (is_ok) {
                 if (reply_data_len > 0 and client_proc.ipc_recv_buf_ptr != 0) {
-                    // Copy reply data to client's buffer via deferred delivery
                     client_proc.ipc_msg = ipc.Message.init(.r_ok);
                     client_proc.ipc_msg.data_len = reply_data_len;
                     @memcpy(client_proc.ipc_msg.data_buf[0..reply_data_len], reply_data_ptr[0..reply_data_len]);
                     client_proc.ipc_pending_msg = &client_proc.ipc_msg;
                 }
                 client_proc.syscall_ret = reply_data_len;
-                // Update read_offset in fd entry
                 if (client_proc.getFdEntryPtr(client_proc.pending_fd)) |fd_entry| {
                     fd_entry.read_offset += reply_data_len;
                 }
@@ -2317,7 +2345,6 @@ fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
             if (is_ok and reply_data_len >= 4) {
                 client_proc.syscall_ret = readU32LE(reply_data_ptr[0..4]);
             } else if (is_ok) {
-                // Server replied OK but no explicit length — derive from request
                 client_proc.syscall_ret = if (client_proc.ipc_msg.data_len > 4)
                     client_proc.ipc_msg.data_len - 4
                 else
@@ -2332,7 +2359,6 @@ fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
         },
         .stat => {
             if (is_ok and reply_data_len > 0 and client_proc.ipc_recv_buf_ptr != 0) {
-                // Copy stat data to client's buffer via deferred delivery
                 client_proc.ipc_msg = ipc.Message.init(.r_ok);
                 const copy_len = @min(reply_data_len, 64);
                 client_proc.ipc_msg.data_len = copy_len;
@@ -2350,21 +2376,16 @@ fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
         .truncate, .wstat => {
             client_proc.syscall_ret = if (is_ok) 0 else EIO;
         },
-        .console_read, .net_read, .net_connect, .net_listen, .dns_query, .icmp_read, .pipe_read, .pipe_write, .sleep => {
-            // These don't go through IPC — should not happen here
-        },
+        .console_read, .net_read, .net_connect, .net_listen, .dns_query, .icmp_read, .pipe_read, .pipe_write, .sleep => {},
         .none => {
-            // Raw IPC (existing behavior for servers using ipc_recv/ipc_reply directly)
             if (is_ok) {
                 if (client_proc.ipc_recv_buf_ptr != 0 and reply_data_len > 0) {
-                    // Client was doing a raw read — copy reply data
                     client_proc.ipc_msg = ipc.Message.init(.r_ok);
                     client_proc.ipc_msg.data_len = reply_data_len;
                     @memcpy(client_proc.ipc_msg.data_buf[0..reply_data_len], reply_data_ptr[0..reply_data_len]);
                     client_proc.ipc_pending_msg = &client_proc.ipc_msg;
                     client_proc.syscall_ret = reply_data_len;
                 } else {
-                    // Client was doing a raw write — return data_len as bytes written
                     client_proc.syscall_ret = client_proc.ipc_msg.data_len;
                     client_proc.ipc_recv_buf_ptr = 0;
                 }
@@ -2381,8 +2402,7 @@ fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
         client_proc.pending_op = .none;
     }
     process.markReady(client_proc);
-    chan.client.send_waiting = false;
-    chan.client.blocked_pid = 0;
+    proc.ipc_serving_client = 0;
 
     return 0;
 }

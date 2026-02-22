@@ -128,14 +128,16 @@ const GzipReader = struct {
     }
 
     fn readBlock(self: *GzipReader, dest: *[tar.HEADER_SIZE]u8) bool {
-        if (self.inflater.done) return false;
-
-        const n = self.inflater.readBytes(&self.bit_reader, dest);
-        if (n == 0) return false;
-
-        // Pad partial reads
-        if (n < tar.HEADER_SIZE) {
-            @memset(dest[n..], 0);
+        var pos: usize = 0;
+        while (pos < tar.HEADER_SIZE) {
+            if (self.inflater.done) break;
+            const n = self.inflater.readBytes(&self.bit_reader, dest[pos..]);
+            if (n == 0) break;
+            pos += n;
+        }
+        if (pos == 0) return false;
+        if (pos < tar.HEADER_SIZE) {
+            @memset(dest[pos..], 0);
         }
         return true;
     }

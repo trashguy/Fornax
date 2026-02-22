@@ -232,7 +232,13 @@ pub const Response = struct {
             const n = self.readBody(buf);
             if (n <= 0) break;
             const nbytes: usize = @intCast(n);
-            _ = fx.syscall.write(out_fd, buf[0..nbytes]);
+            // Write all bytes, handling partial writes (IPC caps at 4092 bytes)
+            var written: usize = 0;
+            while (written < nbytes) {
+                const w = fx.syscall.write(out_fd, buf[written..nbytes]);
+                if (w <= 0) return total;
+                written += @intCast(w);
+            }
             total += nbytes;
         }
         return total;

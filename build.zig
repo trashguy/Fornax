@@ -6,6 +6,7 @@ pub fn build(b: *std.Build) void {
     const cluster = b.option(bool, "cluster", "Enable clustering support (gossip discovery, remote namespaces, scheduler)") orelse false;
     const posix = b.option(bool, "posix", "Enable C/POSIX realm support") orelse false;
     const tcc_enabled = b.option(bool, "tcc", "Build TCC C compiler (requires -Dposix=true)") orelse false;
+    const test_packages = b.option(bool, "test-packages", "Build test packages (xxd) for integration tests") orelse false;
     const user_strip = b.option(bool, "strip", "Strip debug info from userspace binaries") orelse
         (optimize != .Debug); // strip by default on release builds
 
@@ -811,6 +812,7 @@ const touch_bin = b.addExecutable(.{
     var hello_c_bin: ?*std.Build.Step.Compile = null;
     var posix_disk_programs: [4]?*std.Build.Step.Compile = .{ null, null, null, null };
     var tcc_bin: ?*std.Build.Step.Compile = null;
+    var xxd_test_bin: ?*std.Build.Step.Compile = null;
 
     if (posix) {
 
@@ -1281,6 +1283,26 @@ const touch_bin = b.addExecutable(.{
                     tcc_bin = tcc_exe;
                 }
             }
+
+            // ── Test packages (gated behind -Dtest-packages=true) ──
+            if (test_packages) {
+                const xxd_exe = b.addExecutable(.{
+                    .name = "xxd",
+                    .root_module = b.createModule(.{
+                        .target = x86_64_freestanding,
+                        .optimize = user_optimize,
+                        .strip = if (user_strip) true else null,
+                    }),
+                });
+                xxd_exe.addAssemblyFile(b.path("lib/posix/crt0.S"));
+                xxd_exe.addCSourceFile(.{ .file = b.path("lib/posix/shim.c"), .flags = c_flags });
+                xxd_exe.addCSourceFile(.{ .file = b.path("../fornax-ports/posix/xxd/xxd.c"), .flags = c_flags });
+                for (musl_sources) |src| {
+                    xxd_exe.addCSourceFile(.{ .file = musl_dep.path(src), .flags = c_flags });
+                }
+                xxd_exe.image_base = user_image_base;
+                xxd_test_bin = xxd_exe;
+            }
         }
     }
 
@@ -1397,6 +1419,14 @@ const touch_bin = b.addExecutable(.{
         x86_initrd.step.dependOn(&tcc_lic.step);
         const musl_lic = b.addInstallFile(b.path("LICENSES/musl"), "rootfs/lib/legal/musl/COPYING");
         x86_initrd.step.dependOn(&musl_lic.step);
+    }
+
+    // Install test packages (if enabled)
+    if (xxd_test_bin) |xxd_exe| {
+        const xxd_install = b.addInstallArtifact(xxd_exe, .{
+            .dest_dir = .{ .override = .{ .custom = "test-packages" } },
+        });
+        x86_initrd.step.dependOn(&xxd_install.step);
     }
 
     // ── aarch64 UEFI kernel ─────────────────────────────────────────

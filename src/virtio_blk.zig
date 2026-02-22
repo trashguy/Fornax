@@ -9,6 +9,16 @@ const pmm = @import("pmm.zig");
 const klog = @import("klog.zig");
 const virtio = @import("virtio.zig");
 
+const paging = switch (@import("builtin").cpu.arch) {
+    .x86_64 => @import("arch/x86_64/paging.zig"),
+    .riscv64 => @import("arch/riscv64/paging.zig"),
+    else => struct {
+        pub fn physPtr(_: u64) [*]u8 {
+            return @ptrFromInt(0);
+        }
+    },
+};
+
 const pci = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/pci.zig"),
     .riscv64 => @import("arch/riscv64/pci.zig"),
@@ -132,14 +142,27 @@ pub fn readBlock(block: u64, buf: *[4096]u8) bool {
 
     if (sector + SECTORS_PER_BLOCK > blk_dev.capacity) return false;
 
-    // Allocate DMA-safe pages (identity-mapped physical memory)
-    const req_phys = pmm.allocPage() orelse return false;
+    // Allocate DMA pages. Use higher-half pointers for CPU access — identity-map
+    // may have been modified by user ELF mappings (huge page splits).
+    const req_phys = pmm.allocPage() orelse {
+        klog.err("virtio-blk: read OOM req blk=");
+        klog.errDec(block);
+        klog.err(" free=");
+        klog.errDec(pmm.getFreePages());
+        klog.err("\n");
+        return false;
+    };
     const data_phys = pmm.allocPage() orelse {
+        klog.err("virtio-blk: read OOM data blk=");
+        klog.errDec(block);
+        klog.err(" free=");
+        klog.errDec(pmm.getFreePages());
+        klog.err("\n");
         pmm.freePage(req_phys);
         return false;
     };
-    const req_ptr: [*]u8 = @ptrFromInt(req_phys);
-    const data_ptr: [*]u8 = @ptrFromInt(data_phys);
+    const req_ptr: [*]u8 = paging.physPtr(req_phys);
+    const data_ptr: [*]u8 = paging.physPtr(data_phys);
 
     // Write request header at start of req page
     const hdr: *VirtioBlkReq = @ptrCast(@alignCast(req_ptr));
@@ -153,8 +176,8 @@ pub fn readBlock(block: u64, buf: *[4096]u8) bool {
     req_ptr[16] = 0xFF; // sentinel
 
     // 3-descriptor chain: header (r), data (w), status (w)
-    // All addresses are physical (identity-mapped) — safe for DMA
-    const head = virtio.addBufferChain3(
+    // DMA addresses are physical — device accesses memory directly
+    _ = virtio.addBufferChain3(
         vq,
         req_phys,
         @sizeOf(VirtioBlkReq),
@@ -177,7 +200,18 @@ pub fn readBlock(block: u64, buf: *[4096]u8) bool {
     var spins: u32 = 0;
     while (virtio.pollUsed(vq) == null) : (spins += 1) {
         if (spins > 10_000_000) {
-            klog.err("virtio-blk: read timeout\n");
+            klog.err("virtio-blk: read timeout blk=");
+            klog.errDec(block);
+            klog.err(" avail=");
+            klog.errDec(vq.avail.idx);
+            klog.err(" used=");
+            klog.errDec(vq.used.idx);
+            klog.err(" last=");
+            klog.errDec(vq.last_used_idx);
+            klog.err(" free=");
+            klog.errDec(pmm.getFreePages());
+            klog.err("\n");
+            vq.next_desc = 0;
             pmm.freePage(data_phys);
             pmm.freePage(req_phys);
             return false;
@@ -185,9 +219,8 @@ pub fn readBlock(block: u64, buf: *[4096]u8) bool {
         cpu.spinHint();
     }
 
-    // Reclaim descriptors — synchronous polling means no other requests
-    // are outstanding, so we can reuse from this head index onward.
-    vq.next_desc = head;
+    // Synchronous I/O complete — recycle all descriptors for next request
+    vq.next_desc = 0;
 
     const status = req_ptr[16];
 
@@ -212,14 +245,15 @@ pub fn writeBlock(block: u64, buf: *const [4096]u8) bool {
 
     if (sector + SECTORS_PER_BLOCK > blk_dev.capacity) return false;
 
-    // Allocate DMA-safe pages (identity-mapped physical memory)
+    // Allocate DMA pages. Use higher-half pointers for CPU access — identity-map
+    // may have been modified by user ELF mappings (huge page splits).
     const req_phys = pmm.allocPage() orelse return false;
     const data_phys = pmm.allocPage() orelse {
         pmm.freePage(req_phys);
         return false;
     };
-    const req_ptr: [*]u8 = @ptrFromInt(req_phys);
-    const data_ptr: [*]u8 = @ptrFromInt(data_phys);
+    const req_ptr: [*]u8 = paging.physPtr(req_phys);
+    const data_ptr: [*]u8 = paging.physPtr(data_phys);
 
     // Copy caller's buffer to DMA buffer (caller may be userspace address)
     @memcpy(data_ptr[0..4096], buf);
@@ -258,14 +292,26 @@ pub fn writeBlock(block: u64, buf: *const [4096]u8) bool {
     // Poll for completion
     var spins: u32 = 0;
     while (virtio.pollUsed(vq) == null) : (spins += 1) {
-        if (spins > 10_000_000) {
-            klog.err("virtio-blk: write timeout\n");
+        if (spins > 100_000_000) {
+            klog.err("virtio-blk: write timeout blk=");
+            klog.errDec(block);
+            klog.err(" avail=");
+            klog.errDec(vq.avail.idx);
+            klog.err(" used=");
+            klog.errDec(vq.used.idx);
+            klog.err(" last=");
+            klog.errDec(vq.last_used_idx);
+            klog.err("\n");
+            vq.next_desc = 0;
             pmm.freePage(data_phys);
             pmm.freePage(req_phys);
             return false;
         }
         cpu.spinHint();
     }
+
+    // Synchronous I/O complete — recycle all descriptors for next request
+    vq.next_desc = 0;
 
     const status = req_ptr[16];
     pmm.freePage(data_phys);

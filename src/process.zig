@@ -75,7 +75,7 @@ const RET_SLOT: usize = switch (@import("builtin").cpu.arch) {
 
 pub const MAX_PROCESSES = 128;
 pub const MAX_FDS = 32;
-pub const KERNEL_STACK_PAGES = 4; // 8 KB kernel stack per process
+pub const KERNEL_STACK_PAGES = 8; // 32 KB kernel stack per process
 pub const USER_STACK_PAGES = 64; // 256 KB user stack per process
 
 pub const ProcessState = enum {
@@ -217,6 +217,8 @@ pub const Process = struct {
     thread_group: ?*thread_group.ThreadGroup = null,
     /// Address to clear and futex-wake on thread exit (CLONE_CHILD_CLEARTID).
     ctid_ptr: u64 = 0,
+    /// PID of the client this server thread is currently serving (for IPC reply).
+    ipc_serving_client: u32 = 0,
 
     pub fn initFds(self: *Process) void {
         for (&self.fds) |*fd| {
@@ -442,6 +444,7 @@ pub fn init() void {
         p.ipc_msg = ipc.Message.init(.t_open);
         p.ipc_recv_buf_ptr = 0;
         p.ipc_pending_msg = null;
+        p.ipc_serving_client = 0;
         p.parent_pid = null;
         p.exit_status = 0;
         p.waiting_for_pid = null;
@@ -491,13 +494,9 @@ pub fn create() ?*Process {
     // Allocate address space
     const addr_space = paging.createAddressSpace() orelse return null;
 
-    // Allocate kernel stack — use higher-half address so the kernel stack
-    // is immune to identity-map overwrites by user ELF mappings.
-    var stack_base: u64 = 0;
-    for (0..KERNEL_STACK_PAGES) |i| {
-        const page = pmm.allocPage() orelse return null;
-        if (i == 0) stack_base = page;
-    }
+    // Allocate kernel stack — contiguous physical pages required because the
+    // higher-half mapping is a direct phys→virt translation (no per-page mappings).
+    const stack_base: u64 = pmm.allocContiguousPages(KERNEL_STACK_PAGES) orelse return null;
     const stack_virt = if (paging.isInitialized()) stack_base + mem.KERNEL_VIRT_BASE else stack_base;
 
     // Parent is whoever is currently running (null for kernel-spawned processes)
@@ -520,6 +519,7 @@ pub fn create() ?*Process {
     proc.quotas = .{};
     proc.ipc_recv_buf_ptr = 0;
     proc.ipc_pending_msg = null;
+    proc.ipc_serving_client = 0;
     proc.parent_pid = parent_pid;
     proc.exit_status = 0;
     proc.waiting_for_pid = null;
@@ -584,14 +584,10 @@ pub fn createThread(parent: *Process) ?*Process {
     }
 
     // Allocate kernel stack for the new thread
-    var stack_base: u64 = 0;
-    for (0..KERNEL_STACK_PAGES) |i| {
-        const page = pmm.allocPage() orelse {
-            proc.state = .free;
-            return null;
-        };
-        if (i == 0) stack_base = page;
-    }
+    const stack_base: u64 = pmm.allocContiguousPages(KERNEL_STACK_PAGES) orelse {
+        proc.state = .free;
+        return null;
+    };
     const stack_virt = if (paging.isInitialized()) stack_base + mem.KERNEL_VIRT_BASE else stack_base;
 
     proc.pid = @atomicRmw(u32, &next_pid, .Add, 1, .monotonic);
@@ -611,6 +607,7 @@ pub fn createThread(parent: *Process) ?*Process {
     proc.quotas = .{};
     proc.ipc_recv_buf_ptr = 0;
     proc.ipc_pending_msg = null;
+    proc.ipc_serving_client = 0;
     proc.parent_pid = parent.pid;
     proc.exit_status = 0;
     proc.waiting_for_pid = null;
@@ -1206,6 +1203,9 @@ pub fn freeUserMemory(proc: *Process) void {
     } else if (proc.pml4) |pml4| {
         // Non-threaded process: free address space directly
         tlbShootdown(proc);
+        // Switch to kernel page tables before freeing, so CR3 doesn't
+        // point to the page tables we're about to free.
+        paging.switchToKernel();
         paging.freeAddressSpace(pml4);
         proc.pml4 = null;
         proc.pages_used = 0;

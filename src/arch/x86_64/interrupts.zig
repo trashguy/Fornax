@@ -200,8 +200,31 @@ pub fn handleException(frame: *idt.ExceptionFrame) void {
             serial.putChar('=');
             inlineHex(cpu.readCr2());
         }
+        // Print address of this function for base calculation
+        serial.putChar(' ');
+        serial.putChar('h');
+        serial.putChar('=');
+        inlineHex(@intFromPtr(&handleException));
         serial.putChar('\r');
         serial.putChar('\n');
+        // Dump the 5-QWORD IRETQ frame at frame.rsp (only for #GP on iretq)
+        if (frame.vector == 13 and frame.rsp >= 0xFFFF_8000_0000_0000) {
+            const iret_frame: [*]const u64 = @ptrFromInt(frame.rsp);
+            // iret[0]=RIP iret[1]=CS iret[2]=RFLAGS iret[3]=RSP iret[4]=SS
+            serial.putChar('I');
+            serial.putChar(':');
+            inlineHex(iret_frame[0]); // RIP
+            serial.putChar(' ');
+            inlineHex(iret_frame[1]); // CS
+            serial.putChar(' ');
+            inlineHex(iret_frame[2]); // RFLAGS
+            serial.putChar(' ');
+            inlineHex(iret_frame[3]); // RSP
+            serial.putChar(' ');
+            inlineHex(iret_frame[4]); // SS
+            serial.putChar('\r');
+            serial.putChar('\n');
+        }
         cpu.halt();
     }
 }

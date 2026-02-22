@@ -12,6 +12,7 @@
 ///   T_STAT(handle)         → R_OK(stat_data) or R_ERROR
 ///   T_REMOVE(path)         → R_OK or R_ERROR
 const fx = @import("fornax");
+const Mutex = fx.thread.Mutex;
 
 const BLOCK_SIZE = 4096;
 const MAGIC = "FXFS0001";
@@ -1595,10 +1596,16 @@ fn commitTransaction() bool {
     return true;
 }
 
+
 // ── IPC handlers ───────────────────────────────────────────────────
 
 var msg: fx.IpcMessage linksection(".bss") = undefined;
 var reply: fx.IpcMessage linksection(".bss") = undefined;
+
+/// Protects all B-tree, bitmap, superblock, cache, and IO buffer state.
+var fs_lock: Mutex = .{};
+/// Protects the handles[] array.
+var handle_lock: Mutex = .{};
 
 fn ctlAppendStr(buf: []u8, pos: usize, s: []const u8) usize {
     if (pos + s.len > buf.len) return pos;
@@ -1944,6 +1951,7 @@ fn handleCreate(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
     writeU64LE(inode_data[32..40], now); // ctime
 
     if (!btreeInsert(.{ .inode_nr = new_inode, .item_type = INODE_ITEM, .offset = 0 }, &inode_data)) {
+        _ = fx.write(1, "fxfs: INODE_ITEM insert failed\n");
         resp.* = fx.IpcMessage.init(fx.R_ERROR);
         return;
     }
@@ -1958,6 +1966,7 @@ fn handleCreate(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
     const dir_len: usize = 10 + file_name.len;
 
     if (!btreeInsert(.{ .inode_nr = parent_inode, .item_type = DIR_ENTRY, .offset = name_hash }, dir_data[0..dir_len])) {
+        _ = fx.write(1, "fxfs: DIR_ENTRY insert failed\n");
         resp.* = fx.IpcMessage.init(fx.R_ERROR);
         return;
     }
@@ -1975,6 +1984,100 @@ fn handleCreate(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
     resp.* = fx.IpcMessage.init(fx.R_OK);
     writeU32LE(resp.data[0..4], handle);
     resp.data_len = 4;
+}
+
+/// Allocate blocks for `data`, write them, and insert extent entries starting at `file_offset`.
+fn appendBlocks(inode_nr: u64, file_offset: u64, data: []const u8) bool {
+    if (data.len == 0) return true;
+
+    const num_blocks = (data.len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const MAX_RUNS = 32;
+    const RunInfo = struct { start: u64, count: u32 };
+    var runs: [MAX_RUNS]RunInfo = undefined;
+    var num_runs: usize = 0;
+    var total_allocated: usize = 0;
+
+    while (total_allocated < num_blocks) {
+        const block = allocBlock() orelse {
+            for (runs[0..num_runs]) |run| {
+                var f: u32 = 0;
+                while (f < run.count) : (f += 1) {
+                    freeBlock(run.start + f);
+                }
+            }
+            return false;
+        };
+
+        if (num_runs == 0 or block != runs[num_runs - 1].start + runs[num_runs - 1].count) {
+            if (num_runs >= MAX_RUNS) {
+                freeBlock(block);
+                for (runs[0..num_runs]) |run| {
+                    var f: u32 = 0;
+                    while (f < run.count) : (f += 1) {
+                        freeBlock(run.start + f);
+                    }
+                }
+                return false;
+            }
+            runs[num_runs] = .{ .start = block, .count = 1 };
+            num_runs += 1;
+        } else {
+            runs[num_runs - 1].count += 1;
+        }
+        total_allocated += 1;
+    }
+
+    // Write data to blocks
+    var block_buf: [BLOCK_SIZE]u8 = [_]u8{0} ** BLOCK_SIZE;
+    var data_pos: usize = 0;
+    var block_idx: usize = 0;
+    for (runs[0..num_runs]) |run| {
+        var r: u32 = 0;
+        while (r < run.count) : (r += 1) {
+            @memset(&block_buf, 0);
+            if (data_pos < data.len) {
+                const remaining = data.len - data_pos;
+                const to_copy = @min(remaining, BLOCK_SIZE);
+                @memcpy(block_buf[0..to_copy], data[data_pos..][0..to_copy]);
+                data_pos += to_copy;
+            }
+            if (!writeBlock(run.start + r, &block_buf)) return false;
+            block_idx += 1;
+        }
+    }
+
+    // Insert extent entries
+    var ext_offset: u64 = file_offset;
+    for (runs[0..num_runs]) |run| {
+        var extent_data: [EXTENT_DATA_SIZE]u8 = undefined;
+        writeU64LE(extent_data[0..8], run.start);
+        writeU32LE(extent_data[8..12], run.count);
+        writeU32LE(extent_data[12..16], 0);
+        if (!btreeInsert(.{ .inode_nr = inode_nr, .item_type = EXTENT_DATA, .offset = ext_offset }, &extent_data)) {
+            return false;
+        }
+        ext_offset += @as(u64, run.count) * BLOCK_SIZE;
+    }
+
+    return true;
+}
+
+/// Free a single extent at the given file offset (for CoW replacement of partial blocks).
+fn freeExtentAt(inode_nr: u64, file_offset: u64) void {
+    const key = Key{ .inode_nr = inode_nr, .item_type = EXTENT_DATA, .offset = file_offset };
+    if (btreeSearch(key)) |data| {
+        if (data.len == EXTENT_DATA_SIZE) {
+            const disk_block = readU64LE(data[0..8]);
+            const num_blocks = readU32LE(data[8..12]);
+            if (disk_block > 0) {
+                var i: u32 = 0;
+                while (i < num_blocks) : (i += 1) {
+                    freeBlock(disk_block + i);
+                }
+            }
+        }
+        _ = btreeDelete(key);
+    }
 }
 
 fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
@@ -2004,6 +2107,7 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
     const write_offset: usize = @intCast(h.write_offset);
     const new_end: usize = write_offset + write_data.len;
     const new_size: u64 = @max(inode.size, new_end);
+    const old_size: usize = @intCast(inode.size);
 
     // For small files, store inline in the B-tree
     if (new_end <= 3800) {
@@ -2014,7 +2118,6 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
         // a slice into a cached block buffer that gets invalidated by btreeDelete)
         if (write_offset > 0) {
             if (btreeSearch(.{ .inode_nr = h.inode_nr, .item_type = EXTENT_DATA, .offset = 0 })) |existing| {
-                // Extent items are exactly EXTENT_DATA_SIZE bytes with disk_block > 0
                 const is_extent = existing.len == EXTENT_DATA_SIZE and readU64LE(existing[0..8]) > 0;
                 if (!is_extent) {
                     const copy_len = @min(existing.len, write_offset);
@@ -2026,7 +2129,7 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
         // Place new data at write_offset
         @memcpy(combined[write_offset..][0..write_data.len], write_data);
 
-        // Delete all old extent data (handles both inline and multi-extent)
+        // Delete all old extent data
         freeAllExtents(h.inode_nr);
 
         // Insert combined inline data
@@ -2034,22 +2137,148 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
             resp.* = fx.IpcMessage.init(fx.R_ERROR);
             return;
         }
-    } else {
-        // Large file — allocate blocks in runs (supports non-contiguous allocation)
-        const num_blocks = (new_end + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    } else if (write_offset >= old_size) {
+        // Append path: write_offset is at or past end of file.
+        // Don't rewrite old blocks — just handle the partial last block and add new blocks.
 
+        // If transitioning from inline to block-based, convert first
+        if (old_size > 0 and old_size <= 3800) {
+            // Read old inline data
+            var inline_buf: [3800]u8 = [_]u8{0} ** 3800;
+            var inline_len: usize = 0;
+            if (btreeSearch(.{ .inode_nr = h.inode_nr, .item_type = EXTENT_DATA, .offset = 0 })) |data| {
+                const is_extent = data.len == EXTENT_DATA_SIZE and readU64LE(data[0..8]) > 0;
+                if (!is_extent) {
+                    inline_len = data.len;
+                    @memcpy(inline_buf[0..inline_len], data);
+                }
+            }
+
+            // Free inline extent
+            freeAllExtents(h.inode_nr);
+
+            // Allocate block for old inline data + whatever new data fits
+            const first_block = allocBlock() orelse {
+                resp.* = fx.IpcMessage.init(fx.R_ERROR);
+                return;
+            };
+
+            var block_buf: [BLOCK_SIZE]u8 = [_]u8{0} ** BLOCK_SIZE;
+            // Copy old inline data
+            if (inline_len > 0) {
+                @memcpy(block_buf[0..inline_len], inline_buf[0..inline_len]);
+            }
+            // Copy new data that fits in the first block
+            if (write_offset < BLOCK_SIZE) {
+                const space = BLOCK_SIZE - write_offset;
+                const to_copy = @min(space, write_data.len);
+                @memcpy(block_buf[write_offset..][0..to_copy], write_data[0..to_copy]);
+            }
+
+            if (!writeBlock(first_block, &block_buf)) {
+                freeBlock(first_block);
+                resp.* = fx.IpcMessage.init(fx.R_ERROR);
+                return;
+            }
+
+            // Insert extent for first block
+            var extent_data: [EXTENT_DATA_SIZE]u8 = undefined;
+            writeU64LE(extent_data[0..8], first_block);
+            writeU32LE(extent_data[8..12], 1);
+            writeU32LE(extent_data[12..16], 0);
+            if (!btreeInsert(.{ .inode_nr = h.inode_nr, .item_type = EXTENT_DATA, .offset = 0 }, &extent_data)) {
+                resp.* = fx.IpcMessage.init(fx.R_ERROR);
+                return;
+            }
+
+            // If new data extends beyond first block, handle remaining below
+            if (new_end > BLOCK_SIZE) {
+                const remaining_offset = BLOCK_SIZE - write_offset;
+                if (remaining_offset < write_data.len) {
+                    const remaining_data = write_data[remaining_offset..];
+                    if (!appendBlocks(h.inode_nr, BLOCK_SIZE, remaining_data)) {
+                        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+                        return;
+                    }
+                }
+            }
+        } else {
+            // Already block-based — handle partial last block + append new blocks
+            const last_block_offset = (write_offset / BLOCK_SIZE) * BLOCK_SIZE;
+            const offset_in_block = write_offset % BLOCK_SIZE;
+
+            if (offset_in_block > 0) {
+                // Partial last block: read it, overlay new data, write as new block (CoW)
+                var block_buf: [BLOCK_SIZE]u8 = [_]u8{0} ** BLOCK_SIZE;
+                _ = readFileData(h.inode_nr, @intCast(last_block_offset), &block_buf);
+
+                const space = BLOCK_SIZE - offset_in_block;
+                const to_copy = @min(space, write_data.len);
+                @memcpy(block_buf[offset_in_block..][0..to_copy], write_data[0..to_copy]);
+
+                const new_block = allocBlock() orelse {
+                    resp.* = fx.IpcMessage.init(fx.R_ERROR);
+                    return;
+                };
+                if (!writeBlock(new_block, &block_buf)) {
+                    freeBlock(new_block);
+                    resp.* = fx.IpcMessage.init(fx.R_ERROR);
+                    return;
+                }
+
+                // Replace the extent entry for this block position
+                // Find and delete old extent covering this offset, insert new one
+                freeExtentAt(h.inode_nr, @intCast(last_block_offset));
+
+                var extent_data: [EXTENT_DATA_SIZE]u8 = undefined;
+                writeU64LE(extent_data[0..8], new_block);
+                writeU32LE(extent_data[8..12], 1);
+                writeU32LE(extent_data[12..16], 0);
+                if (!btreeInsert(.{ .inode_nr = h.inode_nr, .item_type = EXTENT_DATA, .offset = @intCast(last_block_offset) }, &extent_data)) {
+                    resp.* = fx.IpcMessage.init(fx.R_ERROR);
+                    return;
+                }
+
+                // Append remaining data as new blocks
+                if (to_copy < write_data.len) {
+                    const next_offset = last_block_offset + BLOCK_SIZE;
+                    if (!appendBlocks(h.inode_nr, @intCast(next_offset), write_data[to_copy..])) {
+                        resp.* = fx.IpcMessage.init(fx.R_ERROR);
+                        return;
+                    }
+                }
+            } else {
+                // write_offset is block-aligned — just append new blocks
+                if (!appendBlocks(h.inode_nr, @intCast(write_offset), write_data)) {
+                    resp.* = fx.IpcMessage.init(fx.R_ERROR);
+                    return;
+                }
+            }
+        }
+    } else {
+        // General overwrite path: rewrite entire file (rare case)
+        // Save old inline data if applicable
+        var inline_buf: [3800]u8 = [_]u8{0} ** 3800;
+        var was_inline = false;
+        if (old_size > 0 and old_size <= 3800) {
+            if (btreeSearch(.{ .inode_nr = h.inode_nr, .item_type = EXTENT_DATA, .offset = 0 })) |data| {
+                const is_extent = data.len == EXTENT_DATA_SIZE and readU64LE(data[0..8]) > 0;
+                if (!is_extent) {
+                    @memcpy(inline_buf[0..data.len], data);
+                    was_inline = true;
+                }
+            }
+        }
+
+        const num_blocks = (new_end + BLOCK_SIZE - 1) / BLOCK_SIZE;
         const MAX_RUNS = 32;
         const RunInfo = struct { start: u64, count: u32 };
         var runs: [MAX_RUNS]RunInfo = undefined;
         var num_runs: usize = 0;
         var total_allocated: usize = 0;
 
-        // Free old extents first to reclaim space
-        freeAllExtents(h.inode_nr);
-
         while (total_allocated < num_blocks) {
             const block = allocBlock() orelse {
-                // Free what we've already allocated
                 for (runs[0..num_runs]) |run| {
                     var f: u32 = 0;
                     while (f < run.count) : (f += 1) {
@@ -2061,7 +2290,6 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
             };
 
             if (num_runs == 0 or block != runs[num_runs - 1].start + runs[num_runs - 1].count) {
-                // Start new run
                 if (num_runs >= MAX_RUNS) {
                     freeBlock(block);
                     for (runs[0..num_runs]) |run| {
@@ -2081,17 +2309,28 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
             total_allocated += 1;
         }
 
-        // Write data to blocks
+        // Write blocks with old + new data merged
         var block_buf: [BLOCK_SIZE]u8 = [_]u8{0} ** BLOCK_SIZE;
         var block_idx: usize = 0;
         for (runs[0..num_runs]) |run| {
             var r: u32 = 0;
             while (r < run.count) : (r += 1) {
                 @memset(&block_buf, 0);
-                const block_start = block_idx * BLOCK_SIZE;
-                if (block_start < new_end) {
-                    const data_start = if (block_start >= write_offset) block_start - write_offset else 0;
-                    const buf_start = if (write_offset > block_start) write_offset - block_start else 0;
+                const blk_start = block_idx * BLOCK_SIZE;
+
+                if (blk_start < old_size) {
+                    if (was_inline) {
+                        const avail = old_size - blk_start;
+                        const to_copy = @min(avail, BLOCK_SIZE);
+                        @memcpy(block_buf[0..to_copy], inline_buf[blk_start..][0..to_copy]);
+                    } else if (old_size > 3800) {
+                        _ = readFileData(h.inode_nr, @intCast(blk_start), &block_buf);
+                    }
+                }
+
+                if (blk_start + BLOCK_SIZE > write_offset and blk_start < new_end) {
+                    const buf_start = if (write_offset > blk_start) write_offset - blk_start else 0;
+                    const data_start = if (blk_start > write_offset) blk_start - write_offset else 0;
                     if (data_start < write_data.len) {
                         const remaining = write_data.len - data_start;
                         const space = BLOCK_SIZE - buf_start;
@@ -2099,6 +2338,7 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
                         @memcpy(block_buf[buf_start..][0..to_copy], write_data[data_start..][0..to_copy]);
                     }
                 }
+
                 if (!writeBlock(run.start + r, &block_buf)) {
                     resp.* = fx.IpcMessage.init(fx.R_ERROR);
                     return;
@@ -2107,13 +2347,14 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
             }
         }
 
-        // Insert extent references — one per contiguous run
+        freeAllExtents(h.inode_nr);
+
         var file_offset: u64 = 0;
         for (runs[0..num_runs]) |run| {
             var extent_data: [EXTENT_DATA_SIZE]u8 = undefined;
             writeU64LE(extent_data[0..8], run.start);
             writeU32LE(extent_data[8..12], run.count);
-            writeU32LE(extent_data[12..16], 0); // reserved
+            writeU32LE(extent_data[12..16], 0);
 
             if (!btreeInsert(.{ .inode_nr = h.inode_nr, .item_type = EXTENT_DATA, .offset = file_offset }, &extent_data)) {
                 resp.* = fx.IpcMessage.init(fx.R_ERROR);
@@ -2583,6 +2824,45 @@ fn formatDisk() bool {
 
 // ── Entry point ────────────────────────────────────────────────────
 
+/// Worker thread entry point (C calling convention for spawnThread).
+fn workerEntry(_: *anyopaque) callconv(.c) void {
+    workerLoop();
+}
+
+/// IPC server loop — each worker has its own msg/reply buffers on stack.
+fn workerLoop() noreturn {
+    var wmsg: fx.IpcMessage = undefined;
+    var wreply: fx.IpcMessage = undefined;
+
+    while (true) {
+        const rc = fx.ipc_recv(SERVER_FD, &wmsg);
+        if (rc < 0) continue;
+
+        // Coarse lock: protects all shared state (B-tree, bitmap, cache, handles, IO buffers)
+        fs_lock.lock();
+
+        switch (wmsg.tag) {
+            fx.T_OPEN => handleOpen(&wmsg, &wreply),
+            fx.T_CREATE => handleCreate(&wmsg, &wreply),
+            fx.T_READ => handleRead(&wmsg, &wreply),
+            fx.T_WRITE => handleWrite(&wmsg, &wreply),
+            fx.T_CLOSE => handleClose(&wmsg, &wreply),
+            fx.T_STAT => handleStat(&wmsg, &wreply),
+            fx.T_REMOVE => handleRemove(&wmsg, &wreply),
+            fx.T_RENAME => handleRename(&wmsg, &wreply),
+            fx.T_TRUNCATE => handleTruncate(&wmsg, &wreply),
+            fx.T_WSTAT => handleWstat(&wmsg, &wreply),
+            else => {
+                wreply = fx.IpcMessage.init(fx.R_ERROR);
+            },
+        }
+
+        fs_lock.unlock();
+
+        _ = fx.ipc_reply(SERVER_FD, &wreply);
+    }
+}
+
 export fn _start() noreturn {
     // Initialize
     cacheInit();
@@ -2603,30 +2883,13 @@ export fn _start() noreturn {
         }
     }
 
-    // Server loop
-    while (true) {
-        const rc = fx.ipc_recv(SERVER_FD, &msg);
-        if (rc < 0) {
-            _ = fx.write(2, "fxfs: ipc_recv error\n");
-            continue;
-        }
-
-        switch (msg.tag) {
-            fx.T_OPEN => handleOpen(&msg, &reply),
-            fx.T_CREATE => handleCreate(&msg, &reply),
-            fx.T_READ => handleRead(&msg, &reply),
-            fx.T_WRITE => handleWrite(&msg, &reply),
-            fx.T_CLOSE => handleClose(&msg, &reply),
-            fx.T_STAT => handleStat(&msg, &reply),
-            fx.T_REMOVE => handleRemove(&msg, &reply),
-            fx.T_RENAME => handleRename(&msg, &reply),
-            fx.T_TRUNCATE => handleTruncate(&msg, &reply),
-            fx.T_WSTAT => handleWstat(&msg, &reply),
-            else => {
-                reply = fx.IpcMessage.init(fx.R_ERROR);
-            },
-        }
-
-        _ = fx.ipc_reply(SERVER_FD, &reply);
+    // Spawn worker threads (3 workers + main thread = 4 total)
+    const NUM_WORKERS = 3;
+    var i: usize = 0;
+    while (i < NUM_WORKERS) : (i += 1) {
+        _ = fx.thread.spawnThread(workerEntry, null) catch {};
     }
+
+    // Main thread enters the same worker loop
+    workerLoop();
 }
