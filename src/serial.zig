@@ -29,6 +29,7 @@ const paging = switch (builtin.cpu.arch) {
 };
 
 const mem = @import("mem.zig");
+const SpinLock = @import("spinlock.zig").SpinLock;
 
 /// Get effective UART MMIO address (higher-half after paging init).
 inline fn uartAddr(offset: u64) u64 {
@@ -38,6 +39,9 @@ inline fn uartAddr(offset: u64) u64 {
 
 var initialized: bool = false;
 
+/// Protects serial output so complete strings appear atomically on SMP.
+var lock: SpinLock = .{};
+
 pub fn init() void {
     switch (builtin.cpu.arch) {
         .x86_64 => {
@@ -46,7 +50,7 @@ pub fn init() void {
             cpu.outb(COM1 + 0, 0x01); // Set divisor to 1 (115200 baud)
             cpu.outb(COM1 + 1, 0x00); //   (hi byte)
             cpu.outb(COM1 + 3, 0x03); // 8 bits, no parity, one stop bit (8N1)
-            cpu.outb(COM1 + 2, 0xC7); // Enable FIFO, clear them, 14-byte threshold
+            cpu.outb(COM1 + 2, 0x07); // Enable FIFO, clear them, 1-byte trigger
             cpu.outb(COM1 + 4, 0x0B); // IRQs enabled, RTS/DSR set
         },
         .riscv64 => {
@@ -56,7 +60,7 @@ pub fn init() void {
             cpu.mmioWrite8(uartAddr(0), 0x01); // Divisor = 1 (115200)
             cpu.mmioWrite8(uartAddr(1), 0x00);
             cpu.mmioWrite8(uartAddr(3), 0x03); // 8N1
-            cpu.mmioWrite8(uartAddr(2), 0xC7); // Enable FIFO
+            cpu.mmioWrite8(uartAddr(2), 0x07); // Enable FIFO, 1-byte trigger
             cpu.mmioWrite8(uartAddr(4), 0x0B); // IRQs enabled, RTS/DSR
         },
         else => return,
@@ -101,22 +105,20 @@ pub fn enableRxInterrupt() void {
 fn handleIrq() bool {
     switch (builtin.cpu.arch) {
         .x86_64 => {
-            const lsr = cpu.inb(COM1 + 5);
-            if (lsr & 0x01 == 0) return false;
-
             const keyboard = @import("keyboard.zig");
+            // Drain any available data from the receive FIFO
             var count: u32 = 0;
             while (cpu.inb(COM1 + 5) & 0x01 != 0 and count < 16) {
                 const byte = cpu.inb(COM1);
                 keyboard.handleChar(byte);
                 count += 1;
             }
-            return count > 0;
+            // Always return true — UART may interrupt for TX empty or
+            // modem status, not just RX data. Returning false prints a
+            // noisy "unhandled" message on the serial console.
+            return true;
         },
         .riscv64 => {
-            const lsr = cpu.mmioRead8(uartAddr(5));
-            if (lsr & 0x01 == 0) return false;
-
             const keyboard = @import("keyboard.zig");
             var count: u32 = 0;
             while (cpu.mmioRead8(uartAddr(5)) & 0x01 != 0 and count < 16) {
@@ -124,10 +126,20 @@ fn handleIrq() bool {
                 keyboard.handleChar(byte);
                 count += 1;
             }
-            return count > 0;
+            return true;
         },
         else => return false,
     }
+}
+
+/// Acquire serial output lock (for multi-character atomic writes by console).
+pub fn lockOutput() void {
+    lock.lock();
+}
+
+/// Release serial output lock.
+pub fn unlockOutput() void {
+    lock.unlock();
 }
 
 pub fn putChar(c: u8) void {
@@ -147,6 +159,8 @@ pub fn putChar(c: u8) void {
 }
 
 pub fn puts(s: []const u8) void {
+    lock.lock();
+    defer lock.unlock();
     for (s) |c| {
         if (c == '\n') putChar('\r');
         putChar(c);
@@ -154,6 +168,8 @@ pub fn puts(s: []const u8) void {
 }
 
 pub fn putDec(val: u64) void {
+    lock.lock();
+    defer lock.unlock();
     if (val == 0) {
         putChar('0');
         return;
@@ -172,7 +188,9 @@ pub fn putDec(val: u64) void {
 }
 
 pub fn putHex(val: u64) void {
-    puts("0x");
+    lock.lock();
+    defer lock.unlock();
+    putsUnlocked("0x");
     const hex = "0123456789ABCDEF";
     var started = false;
     var shift: u6 = 60;
@@ -184,4 +202,12 @@ pub fn putHex(val: u64) void {
         shift -= 4;
     }
     if (!started) putChar('0');
+}
+
+/// Unlocked puts for internal use (caller holds lock).
+fn putsUnlocked(s: []const u8) void {
+    for (s) |c| {
+        if (c == '\n') putChar('\r');
+        putChar(c);
+    }
 }

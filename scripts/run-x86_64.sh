@@ -118,8 +118,9 @@ echo "==> Formatting partition 1 with fxfs (offset=$PART_OFFSET, size=$PART_SIZE
 
 echo "==> Launching QEMU..."
 
-# Check for --nvme/--ahci flags: use alternate block device instead of virtio-blk
+# Check for --nvme/--ahci/--debug flags
 BLK_ARGS="-drive file=$DISK_IMG,format=raw,if=none,id=blk0 -device virtio-blk-pci,drive=blk0"
+GDB_ARGS=""
 EXTRA_ARGS=()
 for arg in "$@"; do
     if [ "$arg" = "--nvme" ]; then
@@ -128,6 +129,14 @@ for arg in "$@"; do
     elif [ "$arg" = "--ahci" ]; then
         BLK_ARGS="-drive file=$DISK_IMG,format=raw,if=none,id=sata0 -device ich9-ahci,id=ahci -device ide-hd,drive=sata0,bus=ahci.0"
         echo "==> Using AHCI/SATA block device"
+    elif [ "$arg" = "--debug" ]; then
+        GDB_ARGS="-gdb tcp::1234"
+        echo "==> GDB server on tcp::1234 (kernel runs immediately)"
+        echo "    Connect with: gdb -x fornax.gdb"
+    elif [ "$arg" = "--debug-wait" ]; then
+        GDB_ARGS="-gdb tcp::1234 -S"
+        echo "==> GDB server on tcp::1234 (frozen, waiting for GDB to continue)"
+        echo "    Connect with: gdb -x fornax.gdb"
     else
         EXTRA_ARGS+=("$arg")
     fi
@@ -145,4 +154,5 @@ exec qemu-system-x86_64 \
     -device usb-kbd,bus=xhci.0 \
     -device usb-mouse,bus=xhci.0 \
     $BLK_ARGS \
+    $GDB_ARGS \
     "${EXTRA_ARGS[@]}"

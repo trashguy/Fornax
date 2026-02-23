@@ -7,6 +7,7 @@
 const console = @import("console.zig");
 const serial = @import("serial.zig");
 const process = @import("process.zig");
+const SpinLock = @import("spinlock.zig").SpinLock;
 
 /// Ring buffer for processed characters.
 const RING_SIZE: usize = 256;
@@ -18,6 +19,7 @@ const NUM_VTS = console.NUM_VTS;
 // ── Per-VT input state ──────────────────────────────────────────
 
 const VtInput = struct {
+    lock: SpinLock = .{},
     ring: [RING_SIZE]u8 = [_]u8{0} ** RING_SIZE,
     ring_head: usize = 0,
     ring_tail: usize = 0,
@@ -48,9 +50,22 @@ pub fn handleCtl(vt: u8, cmd: []const u8) void {
     const input = &vt_inputs[vt];
 
     if (eql(cmd, "rawon")) {
+        input.lock.lock();
+        // Flush any characters accumulated in the line buffer while in
+        // line mode — they would be stranded once we switch to raw mode
+        // (raw reads from the ring, not the line buffer).
+        if (input.line_len > 0) {
+            for (input.line_buf[0..input.line_len]) |c| {
+                pushToRingVt(input, c);
+            }
+            input.line_len = 0;
+        }
         input.raw_mode = true;
+        input.lock.unlock();
     } else if (eql(cmd, "rawoff")) {
+        input.lock.lock();
         input.raw_mode = false;
+        input.lock.unlock();
     } else if (eql(cmd, "echo on")) {
         input.echo_on = true;
     } else if (eql(cmd, "echo off")) {
@@ -65,8 +80,10 @@ pub fn handleCtl(vt: u8, cmd: []const u8) void {
         len += formatDecInto(buf[len..], console.getRows());
         buf[len] = '\n';
         len += 1;
+        input.lock.lock();
         for (buf[0..len]) |c| pushToRingVt(input, c);
         wakeWaiterVt(input);
+        input.lock.unlock();
     } else if (cmd.len >= 4 and cmd[0] == 'v' and cmd[1] == 't' and cmd[2] == ' ') {
         // "vt N" — set calling process's VT
         if (process.getCurrent()) |proc| {
@@ -188,6 +205,9 @@ fn handleCharVt(vt: u8, ascii: u8) void {
     if (vt >= NUM_VTS) return;
     const input = &vt_inputs[vt];
 
+    input.lock.lock();
+    defer input.lock.unlock();
+
     if (input.raw_mode) {
         // Raw mode: push immediately to ring buffer
         pushToRingVt(input, ascii);
@@ -231,6 +251,8 @@ fn handleCharVt(vt: u8, ascii: u8) void {
 pub fn read(vt: u8, buf: [*]u8, max_len: usize) usize {
     if (vt >= NUM_VTS) return 0;
     const input = &vt_inputs[vt];
+    input.lock.lock();
+    defer input.lock.unlock();
     var count: usize = 0;
     while (count < max_len and input.ring_tail != input.ring_head) {
         buf[count] = input.ring[input.ring_tail];
@@ -246,6 +268,8 @@ pub fn read(vt: u8, buf: [*]u8, max_len: usize) usize {
 pub fn dataAvailable(vt: u8) bool {
     if (vt >= NUM_VTS) return false;
     const input = &vt_inputs[vt];
+    input.lock.lock();
+    defer input.lock.unlock();
     if (input.ring_tail == input.ring_head) return false;
     if (input.raw_mode) return true;
     // In line mode, only return true if there's a complete line (contains \n)

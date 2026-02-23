@@ -115,8 +115,10 @@ fn sendToServer(chan: *ipc.Channel, proc: *process.Process) void {
         return;
     }
 
-    // Fast path: if a server thread is waiting for a message, wake it directly
-    if (chan.client.server_waiter_count > 0) {
+    // Fast path: if a server thread is waiting for a message, wake it directly.
+    // Loop to skip stale entries (dead/free processes left by fault recovery).
+    var delivered = false;
+    while (chan.client.server_waiter_count > 0) {
         if (chan.client.popServerWaiter()) |server_pid_u16| {
             const server_pid: u32 = server_pid_u16;
             // Clear legacy fields if they point to this server — prevents
@@ -126,6 +128,11 @@ fn sendToServer(chan: *ipc.Channel, proc: *process.Process) void {
                 chan.client.blocked_pid = 0;
             }
             if (process.getByPid(server_pid)) |server_proc| {
+                // Skip dead/free processes (stale server_waiters entry)
+                if (server_proc.state == .dead or server_proc.state == .free) continue;
+                // Skip processes that are already running or ready (re-enqueued
+                // by fault recovery while still in server_waiters)
+                if (server_proc.state == .running or server_proc.state == .ready) continue;
                 // Dequeue the entry we just enqueued and deliver it
                 if (chan.client.dequeue()) |entry| {
                     if (entry.msg_ptr) |msg_ptr| {
@@ -137,19 +144,28 @@ fn sendToServer(chan: *ipc.Channel, proc: *process.Process) void {
                 // schedule this process immediately after markReady/IPI.
                 server_proc.syscall_ret = 0;
                 process.markReady(server_proc);
+                delivered = true;
+            } else {
+                // PID not found — skip stale entry
+                continue;
             }
         }
-    } else if (chan.client.recv_waiting and chan.client.blocked_pid != 0) {
+        break; // Popped an entry (delivered or not), stop looping
+    }
+
+    if (!delivered and chan.client.recv_waiting and chan.client.blocked_pid != 0) {
         // Legacy single-server fast path (fallback when server_waiters is full)
         if (process.getByPid(chan.client.blocked_pid)) |server_proc| {
-            if (chan.client.dequeue()) |entry| {
-                if (entry.msg_ptr) |msg_ptr| {
-                    server_proc.ipc_pending_msg = msg_ptr;
+            if (server_proc.state != .dead and server_proc.state != .free) {
+                if (chan.client.dequeue()) |entry| {
+                    if (entry.msg_ptr) |msg_ptr| {
+                        server_proc.ipc_pending_msg = msg_ptr;
+                    }
+                    server_proc.ipc_serving_client = entry.pid;
                 }
-                server_proc.ipc_serving_client = entry.pid;
+                server_proc.syscall_ret = 0;
+                process.markReady(server_proc);
             }
-            server_proc.syscall_ret = 0;
-            process.markReady(server_proc);
             chan.client.recv_waiting = false;
             chan.client.blocked_pid = 0;
         }
@@ -595,8 +611,11 @@ pub fn sysExit(status: u64) noreturn {
                         parent.syscall_ret = (child_pid << 32) | ((status & 0xFF) << 8);
                         process.markReady(parent);
                         parent.waiting_for_pid = null;
-                        // Reaped immediately — go to free
-                        proc.state = .free;
+                        // Parent already notified — orphan zombie.
+                        // We can't set .free here because we're still on
+                        // this process's kernel stack. process.create()
+                        // reclaims orphan zombies (.zombie + null parent).
+                        proc.state = .zombie;
                         proc.parent_pid = null;
                         process.scheduleNext();
                     }
@@ -608,8 +627,9 @@ pub fn sysExit(status: u64) noreturn {
         }
     }
 
-    // No parent (kernel-spawned or orphaned) — free immediately
-    proc.state = .free;
+    // No parent (kernel-spawned or orphaned) — orphan zombie.
+    // Same as above: can't set .free while on this kernel stack.
+    proc.state = .zombie;
     proc.parent_pid = null;
     process.scheduleNext();
 }
@@ -679,16 +699,17 @@ pub fn sysWait(pid_arg: u64, flags_arg: u64) u64 {
     // Treat pid==-1 (0xFFFFFFFF truncated) as "any child" like pid==0
     const effective_pid: u32 = if (wait_pid == 0xFFFFFFFF) 0 else wait_pid;
 
-    // Check for an already-exited (zombie) child first
+    // Check for an already-exited (zombie or dead) child first.
+    // .zombie = normal exit via sysExit; .dead = killed by fault handler.
     var found_child = false;
     const processes_slice = process.getProcessTable();
     for (processes_slice) |*p| {
         if (p.parent_pid) |ppid| {
             if (ppid == proc.pid) {
                 found_child = true;
-                if (p.state == .zombie) {
+                if (p.state == .zombie or p.state == .dead) {
                     if (effective_pid == 0 or p.pid == effective_pid) {
-                        // Reap this zombie — free deferred kernel stack
+                        // Reap this child — free deferred kernel stack
                         const exit_code: u64 = p.exit_status;
                         if (p.needs_stack_free) {
                             process.freeKernelStack(p);
@@ -2509,23 +2530,34 @@ pub fn sysCntrOp(op: u64, cntr_id: u64, a0: u64, a1: u64, a2: u64) u64 {
             klog.infoDec(elf_len);
             klog.info("\n");
 
-            // Delegate to container.start which creates process, loads ELF, sets up namespace
+            // Delegate to container.start which creates process, loads ELF, sets up namespace.
+            // NOTE: container.start does NOT markReady — we must set up argv/auxv first
+            // to avoid an SMP race where the process runs before argv is configured.
             const pid = container.start(ct, elf_data, null) orelse {
                 klog.err("[cntr_op] container.start returned null\n");
                 return ENOMEM;
             };
 
-            // Set up argv if provided
-            if (argv_ptr != 0 and argv_ptr < 0x0000_8000_0000_0000) {
-                if (container.getById(@intCast(cntr_id))) |ct2| {
-                    if (ct2.init_pid) |init_pid| {
-                        if (process.getByPid(init_pid)) |init_proc| {
-                            const child_pml4 = init_proc.pml4 orelse return ENOMEM;
-                            setupArgv(child_pml4, argv_ptr, init_proc);
-                        }
-                    }
+            // Get the container's init process for argv/auxv setup
+            const init_proc = blk: {
+                if (ct.init_pid) |init_pid| {
+                    break :blk process.getByPid(init_pid) orelse return ENOMEM;
                 }
+                return ENOMEM;
+            };
+            const child_pml4 = init_proc.pml4 orelse return ENOMEM;
+
+            // Set up argv
+            if (argv_ptr != 0 and argv_ptr < 0x0000_8000_0000_0000) {
+                setupArgv(child_pml4, argv_ptr, init_proc);
+            } else {
+                @memset(argv_layout_buf[0..8], 0);
+                _ = writeToChildMem(child_pml4, mem.ARGV_BASE, argv_layout_buf[0..8]);
+                init_proc.user_rsp = mem.ARGV_BASE - 8;
             }
+
+            // NOW safe to make runnable — argv is configured
+            process.markReady(init_proc);
 
             return pid;
         },

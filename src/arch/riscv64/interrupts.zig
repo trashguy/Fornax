@@ -55,6 +55,18 @@ export fn handleExceptionRv(frame_ptr: u64, scause: u64, stval: u64) callconv(.c
     const from_user = (sstatus & cpu.SSTATUS_SPP) == 0;
 
     if (from_user) {
+        // On SMP, a process that already exited (.zombie/.dead) can still
+        // be on a run queue from a stale push. When scheduled, it resumes
+        // at stale user-mode RIP and faults. Silently discard these.
+        if (process.getCurrent()) |proc| {
+            switch (proc.state) {
+                .zombie, .dead, .free => {
+                    process.scheduleNext();
+                },
+                else => {},
+            }
+        }
+
         const sepc = cpu.csrRead(cpu.CSR_SEPC);
         klog.debug("\n--- USER EXCEPTION ---\n");
         klog.debug("SCAUSE: ");
@@ -68,7 +80,6 @@ export fn handleExceptionRv(frame_ptr: u64, scause: u64, stval: u64) callconv(.c
         if (process.getCurrent()) |proc| {
             const pid = proc.pid;
             _ = supervisor.handleProcessFault(pid);
-            proc.state = .dead;
 
             klog.warn("[Process ");
             klog.warnDec(pid);
@@ -76,13 +87,33 @@ export fn handleExceptionRv(frame_ptr: u64, scause: u64, stval: u64) callconv(.c
             klog.warnHex(scause);
             klog.warn("]\n");
 
+            // Mark dead with exit status. sysWait reaps .dead children.
+            proc.exit_status = 128;
+            proc.state = .dead;
+
+            // Wake parent if it's blocked in wait() for this child
+            if (proc.parent_pid) |ppid| {
+                if (process.getByPid(ppid)) |parent| {
+                    if (parent.state == .blocked) {
+                        if (parent.waiting_for_pid) |wait_pid| {
+                            if (wait_pid == proc.pid or wait_pid == 0) {
+                                const child_pid: u64 = proc.pid;
+                                parent.syscall_ret = (child_pid << 32) | (128 << 8);
+                                process.markReady(parent);
+                                parent.waiting_for_pid = null;
+                            }
+                        }
+                    }
+                }
+            }
+
             process.scheduleNext();
         } else {
             klog.err("[User fault with no current process]\n");
             cpu.halt();
         }
     } else {
-        // Kernel-mode fault — always fatal
+        // Kernel-mode fault — attempt recovery
         serial.putChar('\n');
         serial.putChar('s');
         serial.putChar('=');
@@ -97,7 +128,23 @@ export fn handleExceptionRv(frame_ptr: u64, scause: u64, stval: u64) callconv(.c
         inlineHex(stval);
         serial.putChar('\r');
         serial.putChar('\n');
-        cpu.halt();
+
+        // Try to recover instead of halting.
+        const percpu = @import("../../percpu.zig");
+        const my_core = percpu.getCoreId();
+        if (percpu.percpu_array[my_core].in_fault_recovery) {
+            cpu.halt();
+        }
+        percpu.percpu_array[my_core].in_fault_recovery = true;
+
+        if (process.getCurrent()) |proc| {
+            proc.state = .dead;
+            percpu.percpu_array[my_core].current = null;
+        }
+
+        paging.switchToKernel();
+        percpu.percpu_array[my_core].in_fault_recovery = false;
+        process.scheduleNext();
     }
 }
 

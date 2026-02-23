@@ -7,6 +7,7 @@ const klog = @import("../../klog.zig");
 const cpu = @import("cpu.zig");
 const gdt = @import("gdt.zig");
 const idt = @import("idt.zig");
+const syscall_entry = @import("syscall_entry.zig");
 const percpu = @import("../../percpu.zig");
 const mem = @import("../../mem.zig");
 const pmm = @import("../../pmm.zig");
@@ -357,9 +358,29 @@ fn writeU64(ptr: [*]u8, val: u64) void {
 export fn apEntry() callconv(.{ .x86_64_sysv = .{} }) noreturn {
     const core_id = @atomicLoad(u8, &ap_boot_core_id, .acquire);
 
-    // Load BSP's GDT (replaces trampoline GDT) and IDT
-    gdt.reloadGdtForAp();
+    // Enable SSE/SSE2 on this AP (UEFI only sets these on BSP).
+    // CR4: set OSFXSR (bit 9) + OSXMMEXCPT (bit 10) for SSE support.
+    // CR0: clear EM (bit 2), set MP (bit 1) so SSE instructions don't fault.
+    asm volatile (
+        \\mov %%cr4, %%rax
+        \\bts $9, %%rax
+        \\bts $10, %%rax
+        \\mov %%rax, %%cr4
+        \\mov %%cr0, %%rax
+        \\btr $2, %%rax
+        \\bts $1, %%rax
+        \\mov %%rax, %%cr0
+        :
+        :
+        : .{ .rax = true }
+    );
+
+    // Load GDT with per-core TSS and IDT
+    gdt.initForAp(core_id);
     idt.reloadForAp();
+
+    // Configure SYSCALL/SYSRET MSRs (EFER.SCE, STAR, LSTAR, SFMASK)
+    syscall_entry.init();
 
     // Enable this AP's local APIC
     lapicWrite(LAPIC_SVR, SVR_ENABLE | SVR_SPURIOUS_VECTOR);

@@ -12,11 +12,15 @@ const cpu = switch (@import("builtin").cpu.arch) {
     },
 };
 
-pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, _: ?usize) noreturn {
+pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, ret_addr_opt: ?usize) noreturn {
     // klog.err routes to console.puts which sends to serial first, then framebuffer.
     // Always visible because .err >= any console_level.
     klog.err("\n!!! KERNEL PANIC !!!\n");
     klog.err(msg);
+    // Print return address for post-mortem debugging
+    const ret_addr = ret_addr_opt orelse @returnAddress();
+    klog.err("\naddr=");
+    klog.errHex(ret_addr);
     klog.err("\nSystem halted.\n");
     cpu.halt();
 }

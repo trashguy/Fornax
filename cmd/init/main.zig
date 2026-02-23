@@ -10,10 +10,29 @@ var elf_buf: [4 * 1024 * 1024]u8 linksection(".bss") = undefined;
 
 const out = fx.io.Writer.stdout;
 
-const NUM_VTS = 4;
+const MAX_VTS = 4;
 
 /// Per-VT tracking
-var vt_pids: [NUM_VTS]i32 = .{ -1, -1, -1, -1 };
+var vt_pids: [MAX_VTS]i32 = .{ -1, -1, -1, -1 };
+
+/// Per-VT respawn failure count (rapid-death throttle)
+var vt_fail_count: [MAX_VTS]u8 = .{ 0, 0, 0, 0 };
+var vt_last_spawn: [MAX_VTS]u64 = .{ 0, 0, 0, 0 };
+
+/// Read /etc/vts to determine active VT count (1..MAX_VTS, default MAX_VTS).
+fn readVtCount() usize {
+    const fd = fx.open("/etc/vts");
+    if (fd < 0) return MAX_VTS;
+    var buf: [8]u8 = undefined;
+    const n = fx.read(fd, &buf);
+    _ = fx.close(fd);
+    if (n <= 0) return MAX_VTS;
+    const c = buf[0];
+    if (c >= '1' and c <= '0' + MAX_VTS) {
+        return c - '0';
+    }
+    return MAX_VTS;
+}
 
 /// Load an ELF from /bin/<name> into elf_buf. Returns the slice, or null on failure.
 fn loadBin(name: []const u8) ?[]const u8 {
@@ -238,6 +257,10 @@ export fn _start() noreturn {
     // Spawn crond (cron daemon)
     spawnCrond();
 
+    // Determine how many VTs to use (/etc/vts overrides default)
+    const active_vts = readVtCount();
+    out.print("init: {d} virtual terminals\n", .{@as(u64, active_vts)});
+
     // Load login once
     const elf_data = loadBin("login") orelse {
         // Fall back to fsh if login doesn't exist
@@ -246,7 +269,7 @@ export fn _start() noreturn {
             fx.exit(1);
         };
         // Spawn fsh directly on each VT (fallback mode)
-        for (0..NUM_VTS) |i| {
+        for (0..active_vts) |i| {
             var vt_cmd = [_]u8{ 'v', 't', ' ', '0' + @as(u8, @intCast(i)) };
             _ = fx.write(0, &vt_cmd);
             const pid = fx.spawn(fsh_data, &.{}, null);
@@ -258,21 +281,37 @@ export fn _start() noreturn {
         }
     };
 
-    // Spawn login on each VT
-    for (0..NUM_VTS) |i| {
+    // Spawn login on each active VT
+    const now = fx.getUptime();
+    for (0..active_vts) |i| {
         vt_pids[i] = spawnLogin(elf_data, i);
+        vt_last_spawn[i] = now;
     }
 
     // Respawn loop: when any child exits, check which VT lost its login
     while (true) {
         _ = fx.wait(0); // blocks until a child exits
 
-        for (0..NUM_VTS) |i| {
+        for (0..active_vts) |i| {
             if (vt_pids[i] >= 0 and !isAlive(vt_pids[i])) {
+                // Respawn throttle: if process died within 3 seconds, count as failure
+                const spawn_now = fx.getUptime();
+                if (spawn_now - vt_last_spawn[i] < 3) {
+                    vt_fail_count[i] += 1;
+                    if (vt_fail_count[i] >= 5) {
+                        out.print("init: VT {d} respawn limit reached, disabling\n", .{@as(u64, i)});
+                        vt_pids[i] = -1;
+                        continue;
+                    }
+                } else {
+                    vt_fail_count[i] = 0;
+                }
+
                 out.print("init: respawning login on VT {d}\n", .{i});
                 // Need to reload ELF since elf_buf may have been reused
                 const new_elf = loadBin("login") orelse continue;
                 vt_pids[i] = spawnLogin(new_elf, i);
+                vt_last_spawn[i] = spawn_now;
             }
         }
     }

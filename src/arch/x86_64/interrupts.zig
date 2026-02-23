@@ -137,6 +137,19 @@ pub fn handleException(frame: *idt.ExceptionFrame) void {
     const from_user = (frame.cs & 3) == 3;
 
     if (from_user) {
+        // On SMP, a process that already exited (.zombie/.dead) can still
+        // be on a run queue from a stale push. When scheduled, it resumes
+        // at stale user-mode RIP and faults. Silently discard these —
+        // the process is already dead, no logging or state change needed.
+        if (process.getCurrent()) |proc| {
+            switch (proc.state) {
+                .zombie, .dead, .free => {
+                    process.scheduleNext();
+                },
+                else => {},
+            }
+        }
+
         // User-mode fault — kill the process, don't panic the kernel
         klog.debug("\n--- USER EXCEPTION ---\n");
         klog.debug("Vector: ");
@@ -162,9 +175,6 @@ pub fn handleException(frame: *idt.ExceptionFrame) void {
             // Try supervisor restart for supervised services
             _ = supervisor.handleProcessFault(pid);
 
-            // Whether supervised or not, mark the process dead
-            proc.state = .dead;
-
             klog.warn("[Process ");
             klog.warnDec(pid);
             klog.warn(" faulted: ");
@@ -173,7 +183,29 @@ pub fn handleException(frame: *idt.ExceptionFrame) void {
             }
             klog.warn("]\n");
 
-            // Schedule the next process
+            // Mark dead with exit status. sysWait reaps .dead children.
+            // We avoid calling the full sysExit() to keep stack usage minimal
+            // on the 16 KB kernel stack (exception frame + handler locals).
+            proc.exit_status = @truncate(128 + frame.vector);
+            proc.state = .dead;
+
+            // Wake parent if it's blocked in wait() for this child
+            if (proc.parent_pid) |ppid| {
+                if (process.getByPid(ppid)) |parent| {
+                    if (parent.state == .blocked) {
+                        if (parent.waiting_for_pid) |wait_pid| {
+                            if (wait_pid == proc.pid or wait_pid == 0) {
+                                const child_pid: u64 = proc.pid;
+                                const status: u64 = 128 + frame.vector;
+                                parent.syscall_ret = (child_pid << 32) | ((status & 0xFF) << 8);
+                                process.markReady(parent);
+                                parent.waiting_for_pid = null;
+                            }
+                        }
+                    }
+                }
+            }
+
             process.scheduleNext();
         } else {
             // No current process — shouldn't happen, but handle gracefully
@@ -181,9 +213,8 @@ pub fn handleException(frame: *idt.ExceptionFrame) void {
             cpu.halt();
         }
     } else {
-        // Kernel-mode fault — always fatal
-        // Print RIP first (most critical), then vector, error, rsp.
-        // Pure putChar + arithmetic only — no function calls, no .rodata.
+        // Kernel-mode fault — attempt recovery instead of halting the core.
+        // Print diagnostics via putChar (no locks, no .rodata pointers).
         serial.putChar('\n');
         serial.putChar('r');
         serial.putChar('=');
@@ -231,7 +262,40 @@ pub fn handleException(frame: *idt.ExceptionFrame) void {
             serial.putChar('\r');
             serial.putChar('\n');
         }
-        cpu.halt();
+
+        // Try to recover instead of halting.
+        // Use per-core guard to prevent infinite recursion if the very
+        // next switchTo also faults.
+        const percpu = @import("../../percpu.zig");
+        const my_core = percpu.getCoreId();
+        if (percpu.percpu_array[my_core].in_fault_recovery) {
+            // Already recovering — recursive fault, must halt.
+            cpu.halt();
+        }
+        percpu.percpu_array[my_core].in_fault_recovery = true;
+
+        // Kill the current process (if any). This may be an innocent
+        // process that switchTo was about to resume, but we can't
+        // safely continue its execution after a kernel fault.
+        // sendToServer has guards to skip dead server_waiters entries.
+        if (process.getCurrent()) |proc| {
+            proc.state = .dead;
+            percpu.percpu_array[my_core].current = null;
+        }
+
+        // Switch to kernel page tables (identity + higher-half) so
+        // scheduleNext runs with a known-good CR3.
+        paging.switchToKernel();
+
+        // Leave in_fault_recovery set — it will catch any immediate
+        // recursive fault in the next switchTo. It's cleared by
+        // successful iretq/sysretq (never reached from here) or
+        // will be set back to false if scheduleNext finds a good
+        // process. Since scheduleNext is noreturn, we clear it just
+        // before so the NEXT context switch can attempt recovery too.
+        percpu.percpu_array[my_core].in_fault_recovery = false;
+
+        process.scheduleNext();
     }
 }
 

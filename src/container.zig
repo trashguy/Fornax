@@ -354,9 +354,9 @@ pub fn start(ct: *Container, init_elf: []const u8, console_channel_id: ?ipc.Chan
     klog.infoDec(ct.quotas.max_memory_pages);
     klog.info(" pages)\n");
 
-    // Process is fully initialized — make it runnable
-    process.markReady(proc);
-
+    // NOTE: caller must set up argv/auxv and call process.markReady()
+    // after this function returns. Do NOT markReady here — on SMP,
+    // the process can be scheduled before argv is configured.
     return proc.pid;
 }
 

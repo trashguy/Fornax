@@ -536,6 +536,37 @@ pub fn create() ?*Process {
                 break;
             }
         }
+
+        // If no free slot, try reclaiming orphan zombies whose parent
+        // was already notified in sysExit's fast path. Only reclaim
+        // if no core currently has the zombie as its "current" process
+        // (which would mean that core is still on the zombie's stack).
+        if (slot == null) {
+            for (&processes) |*p| {
+                if (p.state == .zombie and p.parent_pid == null) {
+                    // Safety check: ensure no core is currently on this process
+                    var in_use = false;
+                    for (0..percpu.cores_online) |c| {
+                        if (percpu.percpu_array[c].current) |cur_opaque| {
+                            const cur: *Process = @ptrCast(@alignCast(cur_opaque));
+                            if (cur == p) {
+                                in_use = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!in_use) {
+                        if (p.needs_stack_free) {
+                            freeKernelStack(p);
+                            p.needs_stack_free = false;
+                        }
+                        p.state = .free;
+                        slot = p;
+                        break;
+                    }
+                }
+            }
+        }
         const p = slot orelse {
             // Diagnostic: dump table state counts
             var n_free: u32 = 0;
@@ -671,6 +702,32 @@ pub fn createThread(parent: *Process) ?*Process {
                 break;
             }
         }
+        // If no free slot, try reclaiming orphan zombies (same as create())
+        if (slot == null) {
+            for (&processes) |*p| {
+                if (p.state == .zombie and p.parent_pid == null) {
+                    var in_use = false;
+                    for (0..percpu.cores_online) |c| {
+                        if (percpu.percpu_array[c].current) |cur_opaque| {
+                            const cur: *Process = @ptrCast(@alignCast(cur_opaque));
+                            if (cur == p) {
+                                in_use = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!in_use) {
+                        if (p.needs_stack_free) {
+                            freeKernelStack(p);
+                            p.needs_stack_free = false;
+                        }
+                        p.state = .free;
+                        slot = p;
+                        break;
+                    }
+                }
+            }
+        }
         const p = slot orelse break :blk null;
         p.state = .blocked;
         break :blk p;
@@ -775,10 +832,28 @@ pub fn procIndex(proc: *const Process) u16 {
 }
 
 /// Mark a process as ready and enqueue it on its assigned core's run queue.
+/// Uses CAS to prevent double-push on SMP: only blocked→ready and running→ready
+/// transitions actually enqueue. Already-ready or terminal processes are skipped.
 /// If the target core is different from the current core, sends a schedule IPI.
 pub fn markReady(proc: *Process) void {
-    proc.state = .ready;
+    // Atomically transition state. Only push to run queue if we successfully
+    // changed the state — prevents two cores from pushing the same process.
+    const old = @cmpxchgStrong(ProcessState, &proc.state, .blocked, .ready, .seq_cst, .seq_cst);
+    if (old != null) {
+        // Not blocked — try running→ready (re-enqueue from scheduleNext)
+        const old2 = @cmpxchgStrong(ProcessState, &proc.state, .running, .ready, .seq_cst, .seq_cst);
+        if (old2 != null) {
+            // Already ready, zombie, dead, or free — don't double-push
+            return;
+        }
+    }
+
     const target_core = proc.assigned_core;
+    if (target_core >= percpu.MAX_CORES) {
+        proc.assigned_core = 0;
+        _ = percpu.percpu_array[0].run_queue.push(procIndex(proc));
+        return;
+    }
     _ = percpu.percpu_array[target_core].run_queue.push(procIndex(proc));
 
     // Send IPI if target core is remote (and LAPIC is available)
@@ -881,11 +956,21 @@ pub fn scheduleNext() noreturn {
     while (true) {
         // Try to pop from local run queue
         if (my_queue.pop()) |pid| {
+            if (pid >= MAX_PROCESSES) {
+                klog.err("[SCHED] bad run queue entry: ");
+                klog.errDec(pid);
+                klog.err(" on core ");
+                klog.errDec(my_core);
+                klog.err("\n");
+                continue;
+            }
             const proc = &processes[pid];
-            if (proc.state == .ready) {
+            // Atomically claim: CAS .ready → .running ensures only one core
+            // can schedule a given process, preventing double-scheduling on SMP.
+            if (@cmpxchgStrong(ProcessState, &proc.state, .ready, .running, .seq_cst, .seq_cst) == null) {
                 switchTo(proc);
             }
-            // If the process is no longer ready (e.g., it was killed),
+            // If CAS failed, process is no longer ready (killed, already claimed,
             // just loop and try the next entry.
             continue;
         }
@@ -919,7 +1004,9 @@ pub fn scheduleNext() noreturn {
         // No ready process found — check if any are alive
         var any_alive = false;
         for (&processes) |*p| {
-            if (p.state == .blocked or p.state == .zombie) {
+            if (p.state == .blocked or p.state == .zombie or
+                p.state == .dead or p.state == .running)
+            {
                 any_alive = true;
                 break;
             }
@@ -979,7 +1066,7 @@ extern fn resume_user_mode(rip: u64, rsp: u64, flags: u64, ret_val: u64) callcon
 /// Switch to a specific process and jump to its user mode.
 fn switchTo(proc: *Process) noreturn {
     setCurrentInternal(proc);
-    proc.state = .running;
+    // Note: proc.state is already .running, set by CAS in scheduleNext.
     // Increment per-core context switch counter
     const core_id = percpu.getCoreId();
     percpu.percpu_array[core_id].ctx_switches += 1;

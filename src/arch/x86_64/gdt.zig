@@ -1,5 +1,6 @@
 const klog = @import("../../klog.zig");
 const pmm = @import("../../pmm.zig");
+const percpu = @import("../../percpu.zig");
 
 const GdtEntry = packed struct {
     limit_low: u16,
@@ -102,22 +103,15 @@ var gdt_entries: [7]GdtEntry = .{
 };
 
 var gdt_ptr: GdtPtr = undefined;
-var tss: Tss = .{};
 
-pub fn init() void {
-    // Allocate a kernel stack for the TSS (used when transitioning from Ring 3 → Ring 0)
-    const kernel_stack_page = pmm.allocPage() orelse {
-        klog.err("GDT: failed to alloc TSS kernel stack!\n");
-        return;
-    };
-    // Stack grows down, point to top of page
-    tss.rsp0 = kernel_stack_page + 4096;
+/// Per-core TSS array. Each core gets its own TSS so that interrupt-driven
+/// ring 3 → ring 0 transitions use the correct kernel stack. 104 bytes × 128 = ~13 KB BSS.
+var tss_array: [percpu.MAX_CORES]Tss linksection(".bss") = [_]Tss{.{}} ** percpu.MAX_CORES;
 
-    // Set up TSS descriptor (occupies two GDT entries)
-    const tss_addr = @intFromPtr(&tss);
+/// Write the TSS descriptor in GDT entries 5-6 to point to the given TSS address.
+fn writeTssDescriptor(tss_addr: u64) void {
     const tss_limit: u32 = @bitSizeOf(Tss) / 8 - 1; // 103
 
-    // Low entry (index 5)
     gdt_entries[5] = .{
         .limit_low = @truncate(tss_limit),
         .base_low = @truncate(tss_addr),
@@ -127,11 +121,23 @@ pub fn init() void {
         .base_high = @truncate(tss_addr >> 24),
     };
 
-    // High entry (index 6): upper 32 bits of base address
     const tss_high: u32 = @truncate(tss_addr >> 32);
     gdt_entries[6] = @bitCast(
         @as(u64, tss_high) | (@as(u64, 0) << 32),
     );
+}
+
+pub fn init() void {
+    // Allocate a kernel stack for the BSP TSS (used when transitioning from Ring 3 → Ring 0)
+    const kernel_stack_page = pmm.allocPage() orelse {
+        klog.err("GDT: failed to alloc TSS kernel stack!\n");
+        return;
+    };
+    // Stack grows down, point to top of page
+    tss_array[0].rsp0 = kernel_stack_page + 4096;
+
+    // Set up TSS descriptor (occupies two GDT entries) pointing to BSP's TSS
+    writeTssDescriptor(@intFromPtr(&tss_array[0]));
 
     gdt_ptr = .{
         .limit = @sizeOf(@TypeOf(gdt_entries)) - 1,
@@ -156,10 +162,11 @@ pub fn init() void {
     klog.info("GDT: loaded (7 entries + TSS)\n");
 }
 
-/// Update the kernel stack pointer in the TSS.
+/// Update the kernel stack pointer in the current core's TSS.
 /// Called during context switch so that interrupts from Ring 3 use the correct stack.
 pub fn setKernelStack(stack_top: u64) void {
-    tss.rsp0 = stack_top;
+    const core_id = percpu.getCoreId();
+    tss_array[core_id].rsp0 = stack_top;
 }
 
 fn reloadSegments() void {
@@ -190,11 +197,21 @@ fn reloadSegments() void {
     );
 }
 
-/// Reload GDT + segments on an AP core (reuses BSP's GDT, no TSS setup).
-pub fn reloadGdtForAp() void {
+/// Load GDT, segments, and per-core TSS on an AP. Called during AP boot
+/// (sequentially under BSP control, so modifying the shared GDT TSS descriptor is safe).
+pub fn initForAp(core_id: u8) void {
+    // Point GDT TSS descriptor to this AP's TSS, then load it.
+    // ltr caches the TSS base, so later GDT changes won't affect this core.
+    writeTssDescriptor(@intFromPtr(&tss_array[core_id]));
+
     asm volatile ("lgdt (%[gdt_ptr])"
         :
         : [gdt_ptr] "r" (&gdt_ptr),
     );
     reloadSegments();
+
+    asm volatile ("ltr %[sel]"
+        :
+        : [sel] "r" (TSS_SEL),
+    );
 }

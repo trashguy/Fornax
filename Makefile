@@ -3,6 +3,7 @@
 .PHONY: run-posix run-posix-release run-tcc
 .PHONY: run-containers run-containers-dev
 .PHONY: run-dev run-dev-posix run-nvme run-ahci test unit-test integration-test
+.PHONY: debug debug-smp debug-dev debug-containers
 
 all: x86_64 aarch64
 
@@ -64,6 +65,25 @@ run-containers-dev:
 	zig build x86_64 -Dcontainers=true
 	./scripts/run-x86_64.sh -smp 8 -m 8192
 
+# Debug targets: QEMU with GDB server (connect with: gdb -x fornax.gdb)
+# Auto-generates fornax-syms.gdb from PDB before launching.
+debug: x86_64
+	./scripts/gen-gdb-syms.sh
+	./scripts/run-x86_64.sh --debug
+
+debug-smp: x86_64
+	./scripts/gen-gdb-syms.sh
+	./scripts/run-x86_64.sh --debug -smp 4
+
+debug-dev: x86_64
+	./scripts/gen-gdb-syms.sh
+	./scripts/run-x86_64.sh --debug -smp 8 -m 8192
+
+debug-containers:
+	zig build x86_64 -Dcontainers=true
+	./scripts/gen-gdb-syms.sh
+	./scripts/run-x86_64.sh --debug -smp 4 -m 2048
+
 run-dev:
 	zig build x86_64
 	./scripts/run-x86_64.sh -smp 8 -m 8192
@@ -78,7 +98,7 @@ unit-test:
 	zig build test
 
 integration-test:
-	python3 scripts/test-integration.py
+	python3 -m tests.harness $(INTEGRATION_ARGS)
 
 run-aarch64: aarch64
 	./scripts/run-aarch64.sh
@@ -131,6 +151,10 @@ help:
 	@echo "  make run-posix-release  Run x86_64 with POSIX (ReleaseSafe kernel)"
 	@echo "  make run-containers  Run x86_64 with container support (4 cores, 2GB)"
 	@echo "  make run-containers-dev  Run x86_64 with containers (8 cores, 8GB)"
+	@echo "  make debug           Run x86_64 with GDB server (connect: gdb -x fornax.gdb)"
+	@echo "  make debug-smp       Run x86_64 with GDB server + 4 cores"
+	@echo "  make debug-dev       Run x86_64 with GDB server + 8 cores + 8GB RAM"
+	@echo "  make debug-containers  Run x86_64 with GDB server + containers"
 	@echo "  make run-dev         Run x86_64 with 8 cores and 8GB RAM"
 	@echo "  make run-dev-posix   Run x86_64 with POSIX, 8 cores and 8GB RAM"
 	@echo "  make test            Run unit tests (host-targeted zig test)"

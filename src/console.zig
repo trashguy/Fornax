@@ -166,6 +166,8 @@ pub fn puts(s: []const u8) void {
 
 /// Write string to a specific VT.
 pub fn putsVt(idx: u8, s: []const u8) void {
+    serial.lockOutput();
+    defer serial.unlockOutput();
     for (s) |c| {
         putCharForVt(idx, c);
     }

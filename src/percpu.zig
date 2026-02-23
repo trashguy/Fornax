@@ -139,6 +139,8 @@ pub const PerCpu = struct {
     ctx_switches: u64 = 0,
     syscalls: u64 = 0,
     interrupts: u64 = 0,
+    /// Guard against recursive kernel faults during recovery.
+    in_fault_recovery: bool = false,
 };
 
 /// Array of per-CPU data. Index by core_id.
