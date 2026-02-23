@@ -235,9 +235,9 @@ fn buildPackage(alloc: std.mem.Allocator, ports_dir: []const u8, pkg_name: []con
         }
     }
 
-    // Build env prefix for shell commands
+    // Build env prefix for shell commands — use export+semicolon so $vars expand in args
     const env_prefix = try std.fmt.allocPrint(alloc,
-        "srcdir='{s}' pkgdir='{s}' ARCH='{s}' ", .{ build_dir, pkg_dir, arch });
+        "export srcdir='{s}' pkgdir='{s}' ARCH='{s}'; ", .{ build_dir, pkg_dir, arch });
 
     // Run build commands
     for (fb.build_cmds.items) |cmd| {
@@ -271,10 +271,14 @@ fn buildPackage(alloc: std.mem.Allocator, ports_dir: []const u8, pkg_name: []con
             .cwd = build_dir,
         });
         alloc.free(result.stdout);
+        if (result.stderr.len > 0) {
+            std.debug.print("  stderr: {s}\n", .{result.stderr});
+        }
         alloc.free(result.stderr);
 
         if (result.term != .Exited or result.term.Exited != 0) {
-            std.debug.print("Error: package command failed\n", .{});
+            const code: u8 = if (result.term == .Exited) result.term.Exited else 1;
+            std.debug.print("Error: package command failed with exit code {d}\n", .{code});
             std.process.exit(1);
         }
     }
