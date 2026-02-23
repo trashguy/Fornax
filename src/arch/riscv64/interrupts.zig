@@ -159,6 +159,7 @@ export fn handleInterruptRv(scause: u64, frame_ptr: u64) callconv(.c) void {
         percpu.percpu_array[core_id].interrupts += 1;
     }
     const cause = scause & ~cpu.SCAUSE_INT_BIT;
+    @import("../../trace.zig").trace(.irq_enter, @truncate(cause));
 
     switch (cause) {
         5 => {
@@ -201,6 +202,7 @@ export fn handleInterruptRv(scause: u64, frame_ptr: u64) callconv(.c) void {
             klog.debug("\n");
         },
     }
+    @import("../../trace.zig").trace(.irq_exit, @truncate(cause));
 }
 
 pub fn init() void {

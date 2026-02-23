@@ -96,7 +96,7 @@ pub const ResourceQuotas = struct {
 
 pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, remove, rename, truncate, wstat, console_read, net_read, net_connect, net_listen, dns_query, icmp_read, pipe_read, pipe_write, sleep, ether_read, linux_stat_open, linux_stat_done };
 
-pub const FdType = enum(u8) { ipc, net, pipe, blk, proc, cntr, dev_null, dev_zero, dev_random, dev_pci, dev_usb, dev_mouse, dev_cpu, dev_ether, dev_sysname, dev_osversion, dev_time, dev_kmesg, dev_reboot, dev_drivers, dev_pid, dev_user, dev_consctl, dev_sysstat };
+pub const FdType = enum(u8) { ipc, net, pipe, blk, proc, cntr, dev_null, dev_zero, dev_random, dev_pci, dev_usb, dev_mouse, dev_cpu, dev_ether, dev_sysname, dev_osversion, dev_time, dev_kmesg, dev_reboot, dev_drivers, dev_pid, dev_user, dev_consctl, dev_sysstat, dev_trace };
 
 pub const ProcFdKind = enum(u8) {
     dir,
@@ -675,6 +675,7 @@ pub fn create() ?*Process {
     // after fully initializing the process (ELF load, stack, argv, etc.).
     // This prevents SMP races where another core schedules a half-initialized process.
 
+    @import("trace.zig").trace(.process_create, proc.pid);
     return proc;
 }
 
@@ -1070,6 +1071,7 @@ fn switchTo(proc: *Process) noreturn {
     // Increment per-core context switch counter
     const core_id = percpu.getCoreId();
     percpu.percpu_array[core_id].ctx_switches += 1;
+    @import("trace.zig").trace(.ctx_switch, proc.pid);
     // Track which cores have run this process (for TLB shootdown)
     const core_bit = @as(u128, 1) << @intCast(core_id);
     proc.cores_ran_on |= core_bit;

@@ -878,6 +878,20 @@ const touch_bin = b.addExecutable(.{
     });
     uptime_bin.image_base = user_image_base;
 
+    const ktrace_bin = b.addExecutable(.{
+        .name = "ktrace",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/ktrace/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    ktrace_bin.image_base = user_image_base;
+
     // ── Container support (gated behind -Dcontainers=true) ──────────
     var fnx_bin: ?*std.Build.Step.Compile = null;
     var bridge_bin: ?*std.Build.Step.Compile = null;
@@ -1471,6 +1485,7 @@ const touch_bin = b.addExecutable(.{
         crontab_bin,
         date_bin,
         uptime_bin,
+        ktrace_bin,
     };
     for (disk_programs) |prog| {
         const install = b.addInstallArtifact(prog, .{
@@ -1670,6 +1685,7 @@ const touch_bin = b.addExecutable(.{
         .{ "fay", "cmd/fay/main.zig" },
         .{ "fxfs", "srv/fxfs/main.zig" },
         .{ "partfs", "srv/partfs/main.zig" },
+        .{ "ktrace", "cmd/ktrace/main.zig" },
     };
 
     // Build riscv64 initrd programs (init, partfs, fxfs)

@@ -1186,3 +1186,53 @@ pub fn cntrWrite(entry: process.FdEntry, buf_ptr: u64, count: u64) u64 {
 
     return EINVAL;
 }
+
+pub fn traceRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
+    const trace = @import("trace.zig");
+    const percpu = @import("percpu.zig");
+    const SpinLock = @import("spinlock.zig").SpinLock;
+
+    const text_buf_size = 65536;
+    const S = struct {
+        var text_buf: [text_buf_size]u8 linksection(".bss") = undefined;
+        var text_lock: SpinLock = .{};
+    };
+
+    S.text_lock.lock();
+    defer S.text_lock.unlock();
+
+    var pos: usize = 0;
+
+    // Format entries from all online cores sequentially
+    var core: u8 = 0;
+    while (core < percpu.cores_online) : (core += 1) {
+        const cnt = trace.getCount(core);
+        // Header: "=== Core N (M entries) ===\n"
+        pos = appendStr(&S.text_buf, pos, "=== Core ");
+        var dec_buf: [20]u8 = undefined;
+        pos = appendStr(&S.text_buf, pos, fmtDecimal(core, &dec_buf));
+        pos = appendStr(&S.text_buf, pos, " (");
+        var dec_buf2: [20]u8 = undefined;
+        pos = appendStr(&S.text_buf, pos, fmtDecimal(cnt, &dec_buf2));
+        pos = appendStr(&S.text_buf, pos, " entries) ===\n");
+
+        if (pos >= text_buf_size) break;
+
+        // Format this core's entries
+        const remaining = text_buf_size - pos;
+        const written = trace.formatCoreEntries(core, S.text_buf[pos..][0..remaining]);
+        pos += written;
+        if (pos >= text_buf_size) break;
+    }
+
+    // Standard offset-based delivery
+    const dest: [*]u8 = @ptrFromInt(buf_ptr);
+    const max_bytes: usize = @intCast(@min(count, 4096));
+    const offset: usize = entry_ptr.read_offset;
+    if (offset >= pos) return 0;
+    const available = pos - offset;
+    const to_copy = @min(available, max_bytes);
+    @memcpy(dest[0..to_copy], S.text_buf[offset..][0..to_copy]);
+    entry_ptr.read_offset += @intCast(to_copy);
+    return to_copy;
+}

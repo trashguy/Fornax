@@ -51,6 +51,7 @@ pub fn getTicks() u32 {
 
 fn handleIrq() bool {
     ticks +%= 1;
+    @import("trace.zig").trace(.timer_tick, @truncate(ticks));
 
     // Re-arm timer on riscv64
     if (builtin.cpu.arch == .riscv64) {

@@ -106,6 +106,7 @@ fn sendToServer(chan: *ipc.Channel, proc: *process.Process) void {
     defer chan.lock.unlock();
 
     // Enqueue this client's message in the ring buffer
+    @import("trace.zig").trace(.ipc_send, proc.pid);
     if (!chan.client.enqueue(proc.pid, &proc.ipc_msg)) {
         // Queue full — leave process blocked, it will be retried
         // when a slot opens (on next sysIpcReply)
@@ -185,6 +186,8 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         percpu.percpu_array[core_id].syscalls += 1;
     }
 
+    @import("trace.zig").trace(.syscall_enter, @truncate(nr));
+
     // Linux compat: if process has compat=1, route to Linux syscall translation
     {
         const proc = process.getCurrent() orelse return ENOSYS;
@@ -201,7 +204,7 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         return ENOSYS;
     };
 
-    return switch (sys) {
+    const result = switch (sys) {
         .write => sysWrite(arg0, arg1, arg2),
         .exit => sysExit(arg0),
         .open => sysOpen(arg0, arg1),
@@ -244,6 +247,9 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         .ipc_pair => sysIpcPair(arg0),
         .cntr_op => sysCntrOp(arg0, arg1, arg2, arg3, arg4),
     };
+
+    @import("trace.zig").trace(.syscall_exit, @truncate(nr));
+    return result;
 }
 
 /// write(fd, buf, count) → bytes_written
@@ -413,7 +419,8 @@ pub fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
     if (entry.fd_type == .dev_osversion or
         entry.fd_type == .dev_kmesg or entry.fd_type == .dev_drivers or
         entry.fd_type == .dev_pid or entry.fd_type == .dev_user or
-        entry.fd_type == .dev_sysstat)
+        entry.fd_type == .dev_sysstat or
+        entry.fd_type == .dev_trace)
     {
         return EBADF;
     }
@@ -476,6 +483,8 @@ pub fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
 /// exit(status) — terminate the current process and schedule next.
 pub fn sysExit(status: u64) noreturn {
     const proc = process.getCurrent() orelse process.scheduleNext();
+
+    @import("trace.zig").trace(.process_exit, proc.pid);
 
     klog.debug("[Process ");
     klog.debugDec(proc.pid);
@@ -876,6 +885,9 @@ pub fn sysOpen(path_ptr: u64, path_len: u64) u64 {
         if (strEql(path_slice, "/dev/sysstat")) {
             return proc.allocDevFd(.dev_sysstat) orelse return EMFILE;
         }
+        if (strEql(path_slice, "/dev/trace")) {
+            return proc.allocDevFd(.dev_trace) orelse return EMFILE;
+        }
     }
 
     // Intercept /net/* paths for kernel TCP/DNS — only when no userspace netd is mounted.
@@ -1254,6 +1266,9 @@ pub fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
     if (entry_ptr.fd_type == .dev_consctl) return 0; // write-only
     if (entry_ptr.fd_type == .dev_sysstat) {
         return devfiles.sysstatRead(entry_ptr, buf_ptr, count);
+    }
+    if (entry_ptr.fd_type == .dev_trace) {
+        return devfiles.traceRead(entry_ptr, buf_ptr, count);
     }
 
     const chan = ipc.getChannel(entry_ptr.channel_id) orelse return EBADF;
@@ -2231,6 +2246,7 @@ fn sysIpcRecv(fd: u64, msg_buf_ptr: u64) u64 {
         }
         // Track which client we're serving so sysIpcReply knows who to wake
         proc.ipc_serving_client = pending_entry.pid;
+        @import("trace.zig").trace(.ipc_recv, pending_entry.pid);
         chan.lock.unlock();
         return 0;
     }
@@ -2273,6 +2289,7 @@ fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
 
     // Find the client being served by this server thread
     const serving_pid = proc.ipc_serving_client;
+    @import("trace.zig").trace(.ipc_reply, serving_pid);
     if (serving_pid == 0) return 0;
     const client_proc = process.getByPid(serving_pid) orelse {
         proc.ipc_serving_client = 0;

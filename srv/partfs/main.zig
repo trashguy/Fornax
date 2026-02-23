@@ -305,7 +305,7 @@ fn handleRead(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
             }
 
             // Virtual device entries
-            const vdevs = [_][]const u8{ "null", "zero", "random", "pci", "usb", "mouse", "cpu", "ether0", "sysname", "osversion", "time", "kmesg", "reboot", "drivers", "pid", "user", "consctl", "sysstat" };
+            const vdevs = [_][]const u8{ "null", "zero", "random", "pci", "usb", "mouse", "cpu", "ether0", "sysname", "osversion", "time", "kmesg", "reboot", "drivers", "pid", "user", "consctl", "sysstat", "trace" };
             for (vdevs, 0..) |vname, vi| {
                 const entry_idx: u32 = 1 + part_count + @as(u32, @intCast(vi));
                 if (entry_idx < skip) continue;

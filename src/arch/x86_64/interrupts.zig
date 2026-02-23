@@ -115,6 +115,7 @@ pub fn handleException(frame: *idt.ExceptionFrame) void {
             percpu.percpu_array[core_id].interrupts += 1;
         }
         const irq: u8 = @intCast(frame.vector - 32);
+        @import("../../trace.zig").trace(.irq_enter, irq);
         var handled = false;
 
         for (irq_handlers[irq]) |maybe_handler| {
@@ -129,6 +130,7 @@ pub fn handleException(frame: *idt.ExceptionFrame) void {
             klog.debug(": unhandled\n");
         }
 
+        @import("../../trace.zig").trace(.irq_exit, irq);
         pic.sendEoi(irq);
         return;
     }

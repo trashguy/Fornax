@@ -111,6 +111,9 @@ pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize, rsdp: ?[*]const
     // SMP: Per-CPU data structures (BSP core 0)
     percpu.init();
 
+    // Kernel trace buffer
+    @import("trace.zig").init();
+
     // Phase 23: PIC initialization (remap IRQs before any device init)
     if (builtin.cpu.arch == .x86_64) {
         const pic_mod = @import("pic.zig");
