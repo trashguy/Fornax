@@ -525,6 +525,7 @@ pub fn sysExit(status: u64) noreturn {
                 }
                 p.state = .dead;
                 p.thread_group = null;
+                p.pml4 = null; // Clear dangling shared address space pointer
                 // Release the group ref for this sibling
                 _ = process.thread_group.releaseGroup(tg, p);
             }
@@ -565,13 +566,18 @@ pub fn sysExit(status: u64) noreturn {
                 // pointer aliasing when multiple fds reuse proc.ipc_msg.
                 // The server's reply targets a dead process — sysIpcReply
                 // handles this gracefully (getByPid returns null → returns 0).
+                // NOTE: We only send T_CLOSE for one fd per channel to avoid
+                // pointer aliasing — sendToServer stores &proc.ipc_msg, so a
+                // second send would overwrite the first message before the
+                // server dequeues it.
                 if (entry.server_handle > 0) {
                     if (ipc.getChannel(entry.channel_id)) |chan| {
                         chan.lock.lock();
                         const has_waiter = chan.client.server_waiter_count > 0 or
                             (chan.client.recv_waiting and chan.client.blocked_pid != 0);
+                        const queue_empty = chan.client.pending_count == 0;
                         chan.lock.unlock();
-                        if (has_waiter) {
+                        if (has_waiter and queue_empty) {
                             proc.ipc_msg = ipc.Message.init(.t_close);
                             writeU32LE(proc.ipc_msg.data_buf[0..4], entry.server_handle);
                             proc.ipc_msg.data_len = 4;
@@ -2058,6 +2064,9 @@ pub fn sysClone(stack_top: u64, tls: u64, ctid_ptr: u64, ptid_ptr: u64, flags: u
     klog.debug(" tls=");
     klog.debugHex(tls);
     klog.debug("]\n");
+
+    // Thread is fully initialized — now safe for another core to schedule it.
+    process.markReady(child);
 
     return child.pid;
 }

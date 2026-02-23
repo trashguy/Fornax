@@ -68,7 +68,8 @@ pub const RunQueue = struct {
         if (self.len >= RUN_QUEUE_SIZE) return false;
         self.entries[self.tail % RUN_QUEUE_SIZE] = pid;
         self.tail +%= 1;
-        self.len += 1;
+        // Atomic store so unsynchronized isEmpty() readers see a consistent value
+        @atomicStore(u32, &self.len, self.len + 1, .release);
         return true;
     }
 
@@ -78,7 +79,7 @@ pub const RunQueue = struct {
         if (self.len == 0) return null;
         const pid = self.entries[self.head % RUN_QUEUE_SIZE];
         self.head +%= 1;
-        self.len -= 1;
+        @atomicStore(u32, &self.len, self.len - 1, .release);
         return pid;
     }
 
@@ -89,7 +90,8 @@ pub const RunQueue = struct {
     /// Steal half of victim's queue into self.
     /// Acquires self.lock then tryLock on victim to avoid ABBA deadlock.
     /// Returns number of entries stolen.
-    pub fn stealHalf(self: *RunQueue, victim: *RunQueue) u32 {
+    pub fn stealHalf(self: *RunQueue, victim: *RunQueue, target_core: u8) u32 {
+        const process_mod = @import("process.zig");
         self.lock.lock();
         if (!victim.lock.tryLock()) {
             self.lock.unlock();
@@ -101,17 +103,23 @@ pub const RunQueue = struct {
         const to_steal = victim.len / 2;
         if (to_steal == 0) return 0;
 
+        const table = process_mod.getProcessTable();
         var stolen: u32 = 0;
         while (stolen < to_steal) : (stolen += 1) {
             if (victim.len == 0) break;
             const pid = victim.entries[victim.head % RUN_QUEUE_SIZE];
             victim.head +%= 1;
-            victim.len -= 1;
+            @atomicStore(u32, &victim.len, victim.len - 1, .release);
 
             if (self.len >= RUN_QUEUE_SIZE) break;
             self.entries[self.tail % RUN_QUEUE_SIZE] = pid;
             self.tail +%= 1;
-            self.len += 1;
+            @atomicStore(u32, &self.len, self.len + 1, .release);
+
+            // Update assigned_core under lock so no unlocked read is needed
+            if (pid < process_mod.MAX_PROCESSES) {
+                table[pid].assigned_core = target_core;
+            }
         }
         return stolen;
     }

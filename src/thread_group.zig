@@ -175,6 +175,21 @@ fn shootdownGroup(g: *ThreadGroup) void {
             apic.sendIpi(apic.lapic_ids[core], apic.IPI_TLB_SHOOTDOWN);
         }
     }
+
+    // Wait for all remote cores to complete the TLB flush before returning.
+    core = 0;
+    while (core < percpu.cores_online) : (core += 1) {
+        if (bitmap & (@as(u128, 1) << @intCast(core)) == 0) continue;
+        if (core == my_core) continue;
+        var spins: u32 = 0;
+        while (@atomicLoad(bool, &percpu.percpu_array[core].tlb_flush_pending, .acquire)) {
+            cpu_mod.spinHint();
+            spins += 1;
+            if (spins > 10_000_000) {
+                break;
+            }
+        }
+    }
 }
 
 /// Get the shared fd slice for a process (group-shared or inline).

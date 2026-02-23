@@ -790,7 +790,10 @@ pub fn createThread(parent: *Process) ?*Process {
     proc.core_affinity = -1;
     proc.cores_ran_on = 0;
 
-    markReady(proc);
+    // NOTE: process starts in .blocked state. Caller MUST call markReady()
+    // after fully initializing the thread (user_rip, user_rsp, fs_base, etc.).
+    // This prevents SMP races where another core schedules a half-initialized thread.
+
     return proc;
 }
 
@@ -807,7 +810,7 @@ pub fn setCurrent(proc: ?*Process) void {
 /// Get a process by PID.
 pub fn getByPid(pid: u32) ?*Process {
     for (&processes) |*p| {
-        if (p.state != .free and p.pid == pid) return p;
+        if (@atomicLoad(ProcessState, &p.state, .acquire) != .free and p.pid == pid) return p;
     }
     return null;
 }
@@ -815,10 +818,10 @@ pub fn getByPid(pid: u32) ?*Process {
 /// Pick the online core with the shortest run queue.
 pub fn leastLoadedCore() u8 {
     var best: u8 = 0;
-    var best_len: u32 = percpu.percpu_array[0].run_queue.len;
+    var best_len: u32 = @atomicLoad(u32, &percpu.percpu_array[0].run_queue.len, .monotonic);
     var i: u8 = 1;
     while (i < percpu.cores_online) : (i += 1) {
-        const len = percpu.percpu_array[i].run_queue.len;
+        const len = @atomicLoad(u32, &percpu.percpu_array[i].run_queue.len, .monotonic);
         if (len < best_len) {
             best = i;
             best_len = len;
@@ -876,18 +879,39 @@ pub fn tlbShootdown(proc: *const Process) void {
     const my_core = percpu.getCoreId();
     const bitmap = proc.cores_ran_on;
     const apic = @import("arch/x86_64/apic.zig");
+    const cpu_mod = @import("arch/x86_64/cpu.zig");
 
     var core: u8 = 0;
     while (core < percpu.cores_online) : (core += 1) {
         if (bitmap & (@as(u128, 1) << @intCast(core)) == 0) continue;
         if (core == my_core) {
             // Flush own TLB by reloading CR3
-            const cpu_mod = @import("arch/x86_64/cpu.zig");
             cpu_mod.flushTlb();
         } else {
             // Set pending flag and send IPI
             @atomicStore(bool, &percpu.percpu_array[core].tlb_flush_pending, true, .release);
             apic.sendIpi(apic.lapic_ids[core], apic.IPI_TLB_SHOOTDOWN);
+        }
+    }
+
+    // Wait for all remote cores to complete the TLB flush before returning.
+    // This ensures page tables are not freed while another core still uses them.
+    core = 0;
+    while (core < percpu.cores_online) : (core += 1) {
+        if (bitmap & (@as(u128, 1) << @intCast(core)) == 0) continue;
+        if (core == my_core) continue;
+        // Spin until the remote core clears the flag
+        var spins: u32 = 0;
+        while (@atomicLoad(bool, &percpu.percpu_array[core].tlb_flush_pending, .acquire)) {
+            cpu_mod.spinHint();
+            spins += 1;
+            if (spins > 10_000_000) {
+                // Safety valve — don't hang forever if core is stuck
+                klog.err("[TLB shootdown timeout on core ");
+                klog.errDec(core);
+                klog.err("]\n");
+                break;
+            }
         }
     }
 }
@@ -911,11 +935,37 @@ pub fn killChildren(parent_pid: u32) void {
                 if (p.thread_group != null) continue;
                 // Recurse first (kill grandchildren before child)
                 killChildren(p.pid);
-                // Free all process resources (safe — runs in parent's context)
-                freeUserMemory(p);
-                freeKernelStack(p);
-                p.state = .free;
-                p.parent_pid = null;
+                // Use CAS to safely transition the process state.
+                // Only free resources if we successfully transitioned from a
+                // non-running state. If the process is .running on another core,
+                // mark it as zombie and let that core's scheduler handle cleanup.
+                const state = @atomicLoad(ProcessState, &p.state, .acquire);
+                switch (state) {
+                    .blocked, .ready => {
+                        // Safe to free — process is not executing on any core.
+                        // CAS ensures another core doesn't start it between our check and free.
+                        if (@cmpxchgStrong(ProcessState, &p.state, state, .free, .seq_cst, .seq_cst) == null) {
+                            freeUserMemory(p);
+                            freeKernelStack(p);
+                            p.parent_pid = null;
+                        } else {
+                            // State changed — mark as orphan zombie for safe reclamation
+                            p.parent_pid = null;
+                        }
+                    },
+                    .running => {
+                        // Process is executing on another core — cannot free its
+                        // memory or stack. Mark as zombie orphan; create() will
+                        // reclaim the slot once no core has it as current.
+                        p.state = .zombie;
+                        p.parent_pid = null;
+                    },
+                    .zombie, .dead => {
+                        // Already dying — just orphan it for reclamation
+                        p.parent_pid = null;
+                    },
+                    .free => {},
+                }
                 klog.debug("[killed orphan pid=");
                 klog.debugDec(p.pid);
                 klog.debug("]\n");
@@ -982,17 +1032,9 @@ pub fn scheduleNext() noreturn {
             var attempts: u8 = 0;
             while (attempts < percpu.cores_online - 1) : (attempts += 1) {
                 if (victim != my_core) {
-                    const stolen = my_queue.stealHalf(&percpu.percpu_array[victim].run_queue);
+                    // stealHalf updates assigned_core under lock
+                    const stolen = my_queue.stealHalf(&percpu.percpu_array[victim].run_queue, my_core);
                     if (stolen > 0) {
-                        // Update assigned_core for stolen processes
-                        var peek: u32 = 0;
-                        while (peek < stolen) : (peek += 1) {
-                            const idx = (my_queue.head +% peek) % percpu.RUN_QUEUE_SIZE;
-                            const spid = my_queue.entries[idx];
-                            if (spid < MAX_PROCESSES) {
-                                processes[spid].assigned_core = my_core;
-                            }
-                        }
                         break; // Got work, will pop on next iteration
                     }
                 }
