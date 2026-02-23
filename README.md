@@ -1,24 +1,28 @@
 # Fornax
 
+<p align="center">
+  <img src="docs/const.png" alt="Fornax" width="50%">
+</p>
+
 A microkernel operating system written in Zig. Plan 9's "everything is a file" design meets VMS-style fault tolerance — clean interfaces with the durability to match.
 
 ## Why Fornax?
 
-**Everything is a file.** GPU drivers, network stacks, block devices — they all run as userspace file servers. Write `"resolution 1920 1080"` to `/dev/gpu/ctl`. Read your ARP table from `/net/arp`. No `ioctl`, no magic numbers, no binary protocols. Every device speaks plain text over the same file interface.
+**Everything is a file.** Drivers, network stacks, and block devices all run as userspace file servers speaking plain text. Write to `/dev/gpu/ctl`, read from `/net/arp` — no `ioctl`, no binary protocols.
 
-**VMS-grade durability.** Your GPU driver segfaults? The kernel restarts it. Your network stack panics? It comes back. Inspired by OpenVMS — which ran phone networks and stock exchanges for decades without rebooting — Fornax's fault supervisor monitors every userspace server and transparently restarts crashed services from their saved ELF. A buggy driver never takes down the system. The microkernel itself is the only code that *must* be correct; everything else is recoverable.
+**VMS-grade durability.** The fault supervisor monitors every userspace server and restarts crashed services transparently. A buggy driver never takes down the system — only the microkernel must be correct.
 
-**Containers without containers.** In Fornax, a container is just `rfork` + `bind` + `mount` — existing kernel primitives. Each process already has its own namespace (file tree), so isolation is the default, not an afterthought bolted on with cgroups and seccomp filters.
+**Containers without containers.** A container is just `rfork` + `bind` + `mount`. Each process already has its own namespace, so isolation is the default.
 
-**Run POSIX software without compromising the kernel.** The kernel speaks only Plan 9-style syscalls — no `socket()`, no `ioctl()`, no signals. Native Fornax programs are clean and simple. POSIX software runs via a userspace shim that translates Linux syscalls to Fornax equivalents at the crt0 level. `socket() + connect()` becomes `open("/net/tcp/clone")`. CLI tools get ephemeral POSIX realms (namespace-isolated via `rfork`, gone on exit). Daemons like nginx get full containers with their own rootfs and resource quotas. POSIX complexity lives in userspace where bugs can't crash the system.
+**POSIX without compromise.** The kernel speaks only Plan 9-style syscalls. POSIX software runs via a userspace shim that translates Linux syscalls at the crt0 level — `socket()` becomes `open("/net/tcp/clone")`.
 
-**Orchestration without the orchestrator.** Kubernetes exists because Linux can't express "this service's `/db` is a TCP mount to that machine's postgres." So you need kube-proxy to fake routing with iptables, CoreDNS to fake service discovery, etcd to fake distributed state, and an API server to glue it together — ~100 binaries and a million lines of Go papering over a missing OS primitive. Fornax has the primitive: `mount("tcp!10.0.0.3!564", "/svc/db", "")`. Service discovery is `ls /svc/`. Health checks are `read /svc/web/health`. Deployment is writing a text file. The entire orchestration layer — deployment, health checks, rolling updates, routing, secrets, observability — is a handful of small file servers doing what Plan 9 showed was possible in 1992. Build with `-Dviceroy=true` to include it, or leave it off for zero overhead. *(Planned — see [Phase 3003+](docs/TODO/00-overview.md))*
+**Orchestration without the orchestrator.** Service discovery is `ls /svc/`. Health checks are `read /svc/web/health`. Deployment is writing a text file. Build with `-Dviceroy=true` to include it. *(Planned — see [Phase 3003+](docs/TODO/00-overview.md))*
 
-**Optional clustering.** Build with `-Dcluster=true` to enable multi-node support. Nodes discover each other via UDP gossip and import remote namespaces over 9P. Mount another machine's `/dev/` into your local tree. Schedule containers across a cluster. Disabled by default — zero overhead when you don't need it. Add `-Dviceroy=true` to layer production deployment tooling on top. *(Planned — see [Phase 3000+](docs/TODO/00-overview.md))*
+**Optional clustering.** Nodes discover each other via UDP gossip and import remote namespaces over 9P. Mount another machine's `/dev/` into your local tree. *(Planned — see [Phase 3000+](docs/TODO/00-overview.md))*
 
-**One language, top to bottom.** Kernel, drivers, userspace, and build system — all Zig. Memory-safe where it matters, bare-metal where it counts.
+**One language, top to bottom.** Kernel, drivers, userspace, and build system — all Zig.
 
-**Built with AI.** Fornax is developed collaboratively between a human and Claude Code. Architecture decisions, code, documentation, and debugging — all done in conversation. AI-assisted development taken to its logical conclusion: an entire operating system.
+**Built with AI.** Developed collaboratively between a human and [Claude Code](https://claude.com/claude-code). Architecture, code, docs, and debugging — all done in conversation.
 
 ## Design
 
