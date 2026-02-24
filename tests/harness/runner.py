@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 
+from . import config
 from .config import PROJECT_DIR, GREEN, RED, YELLOW, RESET, BOLD, log, find_ovmf
 from .qemu import QemuDriver
 from .disk import create_test_disk, prepare_rootfs, create_linux_hello_elf
@@ -24,6 +25,7 @@ from .test_containers import (
     test_container_pull_dockerhub,
 )
 from .test_smp import test_smp_stress
+from .test_supervisor import test_supervisor_status
 from .test_packages import test_fay_install_xxd
 from .registry import (
     start_mock_registry,
@@ -37,7 +39,7 @@ from .registry import (
 
 def run_test_session(session_name, ovmf, build_flags, tests, tmpdir,
                      pre_disk_hook=None, pre_test_hook=None,
-                     smp=1, memory="4G"):
+                     smp=1, memory="4G", arch="x86_64"):
     """Build Fornax, create disk, boot QEMU, run tests, shutdown.
 
     Args:
@@ -50,6 +52,7 @@ def run_test_session(session_name, ovmf, build_flags, tests, tmpdir,
         pre_test_hook: Called with (qemu) before tests run (e.g. start HTTP server)
         smp: Number of QEMU vCPUs (default 1, use 4 for container tests)
         memory: QEMU memory (default "1G")
+        arch: Target architecture (default "x86_64")
 
     Returns:
         (passed, failed, full_log_bytes)
@@ -59,12 +62,16 @@ def run_test_session(session_name, ovmf, build_flags, tests, tmpdir,
     qemu = None
     full_log = b""
 
+    # Set arch/session for test log output
+    config.CURRENT_ARCH = arch
+    config.CURRENT_SESSION = session_name
+
     try:
         # Show session header with arch/features/config
         features = [f.replace("-D", "") for f in build_flags]
         feat_str = ", ".join(features) if features else "none"
         header = f"Session: {session_name}"
-        details = f"arch=x86_64  smp={smp}  ram={memory}  features=[{feat_str}]"
+        details = f"arch={arch}  smp={smp}  ram={memory}  features=[{feat_str}]"
         sep = "=" * max(len(header), len(details))
         log("SESSION", sep, BOLD)
         log("SESSION", header, BOLD)
@@ -150,6 +157,7 @@ def run_test_session(session_name, ovmf, build_flags, tests, tmpdir,
 ALL_TESTS = {
     "boot": test_boot_login,
     "basic": test_basic_commands,
+    "supervisor": test_supervisor_status,
     "time": test_time_subsystem,
     "networking": test_host_networking,
     "filesystem": test_filesystem,
@@ -269,6 +277,7 @@ def main():
             core_tests_list = [
                 test_boot_login,
                 test_basic_commands,
+                test_supervisor_status,
                 test_time_subsystem,
                 test_host_networking,
                 test_filesystem,
@@ -287,6 +296,7 @@ def main():
             posix_tests_list = [
                 test_boot_login,
                 test_basic_commands,
+                test_supervisor_status,
                 test_time_subsystem,
                 test_host_networking,
                 test_fay_install_xxd,

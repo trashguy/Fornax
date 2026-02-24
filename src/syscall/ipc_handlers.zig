@@ -250,6 +250,9 @@ pub fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
     process.markReady(client_proc);
     proc.ipc_serving_client = 0;
 
+    // Track IPC activity for supervisor health probes
+    @import("../supervisor.zig").updateActivity(proc.pid);
+
     return 0;
 }
 

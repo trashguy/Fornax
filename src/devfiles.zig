@@ -169,6 +169,15 @@ pub fn procRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
                 pos += @sizeOf(ProcDirEntry);
             }
 
+            // Add "supervisor" entry (directory)
+            if (pos + @sizeOf(ProcDirEntry) <= proc_dir_buf.len) {
+                var de_sv: ProcDirEntry = .{ .name = [_]u8{0} ** 64, .file_type = 1, .size = 0 };
+                @memcpy(de_sv.name[0..10], "supervisor");
+                const sv_bytes: *const [@sizeOf(ProcDirEntry)]u8 = @ptrCast(&de_sv);
+                @memcpy(proc_dir_buf[pos..][0..@sizeOf(ProcDirEntry)], sv_bytes);
+                pos += @sizeOf(ProcDirEntry);
+            }
+
             // Apply read offset
             const offset: usize = entry_ptr.read_offset;
             if (offset >= pos) return 0;
@@ -287,12 +296,21 @@ pub fn procRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
             entry_ptr.read_offset += @intCast(to_copy);
             return to_copy;
         },
+        .supervisor => {
+            return supervisorRead(entry_ptr, dest, max_bytes);
+        },
+        .supervisor_ctl => {
+            return 0; // ctl is write-only
+        },
     }
 }
 
 // ---------- /proc write ----------
 
 pub fn procWrite(entry: process.FdEntry, buf_ptr: u64, count: u64) u64 {
+    if (entry.proc_kind == .supervisor_ctl) {
+        return supervisorWrite(buf_ptr, count);
+    }
     if (entry.proc_kind != .ctl) return EBADF;
 
     const buf: [*]const u8 = @ptrFromInt(buf_ptr);
@@ -1235,4 +1253,200 @@ pub fn traceRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
     @memcpy(dest[0..to_copy], S.text_buf[offset..][0..to_copy]);
     entry_ptr.read_offset += @intCast(to_copy);
     return to_copy;
+}
+
+// ---------- /proc/supervisor ----------
+
+const supervisor = @import("supervisor.zig");
+
+/// Read handler for /proc/supervisor — table of supervised services.
+fn supervisorRead(entry_ptr: *process.FdEntry, dest: [*]u8, max_bytes: usize) u64 {
+    const svcs = supervisor.getServices();
+    var text_buf: [2048]u8 = undefined;
+    var pos: usize = 0;
+
+    // Header
+    pos = appendStr(&text_buf, pos, "NAME        PID  STATE            RESTARTS  BACKOFF  DEPS\n");
+
+    for (svcs) |*s| {
+        if (!s.active) continue;
+
+        // Name (left-padded to 12 chars)
+        const name = s.name[0..s.name_len];
+        pos = appendStr(&text_buf, pos, name);
+        if (name.len < 12) {
+            var pad: usize = 12 - name.len;
+            while (pad > 0 and pos < text_buf.len) : (pad -= 1) {
+                text_buf[pos] = ' ';
+                pos += 1;
+            }
+        }
+
+        // PID
+        if (s.pid) |pid| {
+            var dec_buf: [20]u8 = undefined;
+            const pid_str = fmtDecimal(pid, &dec_buf);
+            // Right-align in 4 chars
+            if (pid_str.len < 4) {
+                var p: usize = 4 - pid_str.len;
+                while (p > 0 and pos < text_buf.len) : (p -= 1) {
+                    text_buf[pos] = ' ';
+                    pos += 1;
+                }
+            }
+            pos = appendStr(&text_buf, pos, pid_str);
+        } else {
+            pos = appendStr(&text_buf, pos, "   -");
+        }
+
+        // State
+        pos = appendStr(&text_buf, pos, "  ");
+        const state_str = switch (s.state) {
+            .running => "running         ",
+            .stopped => "stopped         ",
+            .dead => "dead            ",
+            .pending_restart => "pending_restart ",
+        };
+        pos = appendStr(&text_buf, pos, state_str);
+
+        // Restarts
+        {
+            var dec_buf: [20]u8 = undefined;
+            const r_str = fmtDecimal(s.restart_count, &dec_buf);
+            // Right-align in 8 chars
+            if (r_str.len < 8) {
+                var p: usize = 8 - r_str.len;
+                while (p > 0 and pos < text_buf.len) : (p -= 1) {
+                    text_buf[pos] = ' ';
+                    pos += 1;
+                }
+            }
+            pos = appendStr(&text_buf, pos, r_str);
+        }
+
+        // Backoff
+        pos = appendStr(&text_buf, pos, "  ");
+        {
+            var dec_buf: [20]u8 = undefined;
+            const b_str = fmtDecimal(s.backoff_ticks, &dec_buf);
+            if (b_str.len < 6) {
+                var p: usize = 6 - b_str.len;
+                while (p > 0 and pos < text_buf.len) : (p -= 1) {
+                    text_buf[pos] = ' ';
+                    pos += 1;
+                }
+            }
+            pos = appendStr(&text_buf, pos, b_str);
+        }
+
+        // Dependencies
+        pos = appendStr(&text_buf, pos, "  ");
+        if (s.depends_on_len == 0) {
+            pos = appendStr(&text_buf, pos, "-");
+        } else {
+            for (0..s.depends_on_len) |di| {
+                if (di > 0) pos = appendStr(&text_buf, pos, ",");
+                const dep_idx = s.depends_on[di];
+                if (dep_idx < supervisor.MAX_SERVICES) {
+                    const dep = &svcs[dep_idx];
+                    if (dep.active) {
+                        pos = appendStr(&text_buf, pos, dep.name[0..dep.name_len]);
+                    } else {
+                        pos = appendStr(&text_buf, pos, "?");
+                    }
+                }
+            }
+        }
+
+        if (pos < text_buf.len) {
+            text_buf[pos] = '\n';
+            pos += 1;
+        }
+    }
+
+    const offset: usize = entry_ptr.read_offset;
+    if (offset >= pos) return 0;
+    const available = pos - offset;
+    const to_copy = @min(available, max_bytes);
+    @memcpy(dest[0..to_copy], text_buf[offset..][0..to_copy]);
+    entry_ptr.read_offset += @intCast(to_copy);
+    return to_copy;
+}
+
+/// Write handler for /proc/supervisor/ctl.
+/// Commands: "restart <name>", "stop <name>", "start <name>", "reset <name>"
+fn supervisorWrite(buf_ptr: u64, count: u64) u64 {
+    const buf: [*]const u8 = @ptrFromInt(buf_ptr);
+    const len: usize = @intCast(@min(count, 128));
+
+    // Strip trailing whitespace/newline
+    var cmd_len = len;
+    while (cmd_len > 0 and (buf[cmd_len - 1] == '\n' or buf[cmd_len - 1] == ' ')) {
+        cmd_len -= 1;
+    }
+    if (cmd_len == 0) return EINVAL;
+
+    // Find space separator between command and service name
+    var sep: usize = 0;
+    while (sep < cmd_len and buf[sep] != ' ') : (sep += 1) {}
+    if (sep >= cmd_len) return EINVAL; // no service name
+
+    const cmd = buf[0..sep];
+    var name_start = sep + 1;
+    while (name_start < cmd_len and buf[name_start] == ' ') : (name_start += 1) {}
+    if (name_start >= cmd_len) return EINVAL;
+    const name = buf[name_start..cmd_len];
+
+    const svc = supervisor.findByName(name) orelse return ENOENT;
+
+    // "restart"
+    if (cmd.len == 7 and cmd[0] == 'r' and cmd[1] == 'e' and cmd[2] == 's' and
+        cmd[3] == 't' and cmd[4] == 'a' and cmd[5] == 'r' and cmd[6] == 't')
+    {
+        klog.info("[supervisor/ctl] Force restart '");
+        klog.info(name);
+        klog.info("'\n");
+        // Kill old process
+        if (svc.pid) |pid| {
+            if (process.getByPid(pid)) |proc| {
+                process.killChildren(proc.pid);
+                proc.state = .dead;
+            }
+        }
+        svc.restart_count += 1;
+        svc.state = .pending_restart;
+        svc.last_restart_tick = 0; // Allow immediate restart
+        supervisor.startService(svc);
+        return len;
+    }
+
+    // "stop"
+    if (cmd.len == 4 and cmd[0] == 's' and cmd[1] == 't' and cmd[2] == 'o' and cmd[3] == 'p') {
+        klog.info("[supervisor/ctl] Stopping '");
+        klog.info(name);
+        klog.info("'\n");
+        supervisor.stopService(svc);
+        return len;
+    }
+
+    // "start"
+    if (cmd.len == 5 and cmd[0] == 's' and cmd[1] == 't' and cmd[2] == 'a' and
+        cmd[3] == 'r' and cmd[4] == 't')
+    {
+        klog.info("[supervisor/ctl] Starting '");
+        klog.info(name);
+        klog.info("'\n");
+        supervisor.startService(svc);
+        return len;
+    }
+
+    // "reset"
+    if (cmd.len == 5 and cmd[0] == 'r' and cmd[1] == 'e' and cmd[2] == 's' and
+        cmd[3] == 'e' and cmd[4] == 't')
+    {
+        supervisor.resetService(svc);
+        return len;
+    }
+
+    return EINVAL;
 }

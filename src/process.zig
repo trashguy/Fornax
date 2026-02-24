@@ -105,6 +105,8 @@ pub const ProcFdKind = enum(u8) {
     status,
     ctl,
     meminfo,
+    supervisor,
+    supervisor_ctl,
 };
 
 pub const CntrFdKind = enum(u8) {

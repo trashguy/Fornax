@@ -12,17 +12,23 @@ CYAN = "\033[36m"
 RESET = "\033[0m"
 BOLD = "\033[1m"
 
+# Set by runner before each session
+CURRENT_ARCH = "x86_64"
+CURRENT_SESSION = ""
+
 
 def log(tag, msg, color=CYAN):
     print(f"{color}[{tag}]{RESET} {msg}", file=sys.stderr, flush=True)
 
 
 def log_pass(name):
-    print(f"{GREEN}[TEST]{RESET} {name}... {GREEN}PASS{RESET}", file=sys.stderr, flush=True)
+    tag = f"TEST {CURRENT_ARCH}"
+    print(f"{GREEN}[{tag}]{RESET} {name}... {GREEN}PASS{RESET}", file=sys.stderr, flush=True)
 
 
 def log_fail(name, reason):
-    print(f"{RED}[TEST]{RESET} {name}... {RED}FAIL{RESET}: {reason}", file=sys.stderr, flush=True)
+    tag = f"TEST {CURRENT_ARCH}"
+    print(f"{RED}[{tag}]{RESET} {name}... {RED}FAIL{RESET}: {reason}", file=sys.stderr, flush=True)
 
 
 # ── OVMF firmware discovery ──────────────────────────────────────────

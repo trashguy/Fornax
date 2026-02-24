@@ -169,6 +169,9 @@ pub fn sysExit(status: u64) noreturn {
 
     proc.exit_status = @truncate(status);
 
+    // Check if this is a supervised service exiting
+    _ = @import("../supervisor.zig").handleProcessExit(proc.pid);
+
     // Decrement container process count + update state if init exits
     if (proc.container_id != 0xFF) {
         const container = @import("../container.zig");

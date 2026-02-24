@@ -321,6 +321,21 @@ fn spawnPartfs() void {
     // Process is fully initialized — make it runnable
     process.markReady(proc);
 
+    // Register with supervisor for crash/exit monitoring
+    if (supervisor.register("partfs", partfs_elf, "/dev/")) |svc| {
+        svc.extra_fd = .{
+            .fd_num = 4,
+            .entry = .{
+                .fd_type = .blk,
+                .channel_id = 0,
+                .is_server = false,
+                .read_offset = 0,
+                .server_handle = 0,
+            },
+        };
+        supervisor.setServicePid(svc, proc.pid);
+    }
+
     klog.info("Spawned partfs (PID ");
     klog.infoDec(proc.pid);
     klog.info(")\n");
@@ -423,6 +438,44 @@ fn spawnFxfs() void {
 
     // Process is fully initialized — make it runnable
     process.markReady(proc);
+
+    // Register with supervisor for crash/exit monitoring
+    if (supervisor.register("fxfs", fxfs_elf, "/")) |svc| {
+        // Set blk fd matching what we gave the process
+        if (gpt.isInitialized() and gpt.getPartitionCount() > 0) {
+            const svc_part = gpt.getPartition(0).?;
+            svc.extra_fd = .{
+                .fd_num = 4,
+                .entry = .{
+                    .fd_type = .blk,
+                    .channel_id = 0,
+                    .is_server = false,
+                    .read_offset = 0,
+                    .server_handle = 0,
+                    .blk_offset = svc_part.first_lba * 512,
+                    .blk_size = (svc_part.last_lba - svc_part.first_lba + 1) * 512,
+                },
+            };
+        } else {
+            svc.extra_fd = .{
+                .fd_num = 4,
+                .entry = .{
+                    .fd_type = .blk,
+                    .channel_id = 0,
+                    .is_server = false,
+                    .read_offset = 0,
+                    .server_handle = 0,
+                },
+            };
+        }
+        // fxfs depends on partfs
+        if (supervisor.findByName("partfs")) |partfs_svc| {
+            svc.depends_on[0] = supervisor.serviceIndex(partfs_svc);
+            svc.depends_on_len = 1;
+            svc.restart_on_dep = true;
+        }
+        supervisor.setServicePid(svc, proc.pid);
+    }
 
     klog.info("Spawned fxfs (PID ");
     klog.infoDec(proc.pid);

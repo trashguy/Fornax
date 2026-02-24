@@ -460,6 +460,25 @@ pub fn sysOpen(path_ptr: u64, path_len: u64) u64 {
             return proc.allocProcFd(.meminfo, 0) orelse return EMFILE;
         }
 
+        // "/proc/supervisor"
+        if (suffix.len == 10 and suffix[0] == 's' and suffix[1] == 'u' and
+            suffix[2] == 'p' and suffix[3] == 'e' and suffix[4] == 'r' and
+            suffix[5] == 'v' and suffix[6] == 'i' and suffix[7] == 's' and
+            suffix[8] == 'o' and suffix[9] == 'r')
+        {
+            return proc.allocProcFd(.supervisor, 0) orelse return EMFILE;
+        }
+
+        // "/proc/supervisor/ctl"
+        if (suffix.len == 14 and suffix[0] == 's' and suffix[1] == 'u' and
+            suffix[2] == 'p' and suffix[3] == 'e' and suffix[4] == 'r' and
+            suffix[5] == 'v' and suffix[6] == 'i' and suffix[7] == 's' and
+            suffix[8] == 'o' and suffix[9] == 'r' and suffix[10] == '/' and
+            suffix[11] == 'c' and suffix[12] == 't' and suffix[13] == 'l')
+        {
+            return proc.allocProcFd(.supervisor_ctl, 0) orelse return EMFILE;
+        }
+
         // Parse PID: digits until '/' or end
         var pid: u32 = 0;
         var i: usize = 0;
@@ -542,7 +561,18 @@ pub fn sysCreate(path_ptr: u64, path_len: u64, flags: u64) u64 {
     if (path_len == 0 or path_len > 256) return ENOENT;
 
     const path: [*]const u8 = @ptrFromInt(path_ptr);
-    const resolved = proc.getNs().resolve(path[0..@intCast(path_len)]) orelse return ENOENT;
+    const path_slice = path[0..@intCast(path_len)];
+
+    // Writable virtual files: redirect create to open so shell ">" works.
+    // /proc/* paths are all kernel-intercepted — create == open.
+    if (path_len >= 6 and path_slice[0] == '/' and path_slice[1] == 'p' and
+        path_slice[2] == 'r' and path_slice[3] == 'o' and path_slice[4] == 'c' and
+        (path_len == 5 or path_slice[5] == '/'))
+    {
+        return sysOpen(path_ptr, path_len);
+    }
+
+    const resolved = proc.getNs().resolve(path_slice) orelse return ENOENT;
 
     const chan = ipc.getChannel(resolved.channel_id) orelse return ENOENT;
 

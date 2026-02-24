@@ -77,5 +77,8 @@ fn handleIrq() bool {
         xhci.pollUsbHid();
     }
 
+    // Check supervisor pending restarts and stability resets
+    @import("supervisor.zig").timerTick(ticks);
+
     return true;
 }
