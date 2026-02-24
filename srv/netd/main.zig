@@ -340,13 +340,15 @@ fn handleRead(msg: *fx.IpcMessage, reply: *fx.IpcMessage) void {
             h.read_done = true;
         },
         .tcp_data => {
+            // Respect the caller's requested read count (offset 8 in T_READ msg)
+            const requested: u16 = if (msg.data_len >= 12) @intCast(@min(readU32LE(msg.data[8..12]), 4092)) else 4092;
             // Poll for data with sleep
             var iters: u32 = 0;
             while (iters < MAX_POLL_ITERS) : (iters += 1) {
                 net_lock.lock();
                 if (tcp_stack.hasData(h.conn)) {
                     var buf: [4092]u8 = undefined;
-                    const n = tcp_stack.recvData(h.conn, &buf);
+                    const n = @min(tcp_stack.recvData(h.conn, buf[0..requested]), requested);
                     net_lock.unlock();
                     reply.* = fx.IpcMessage.init(fx.R_OK);
                     @memcpy(reply.data[0..n], buf[0..n]);
@@ -751,8 +753,17 @@ fn handleWrite(msg: *fx.IpcMessage, reply: *fx.IpcMessage) void {
                     if (state.? == .closed) break;
                     fx.sleep(POLL_SLEEP_MS);
                 }
+                // Check if connection actually established
+                net_lock.lock();
+                const final_state = tcp_stack.getState(h.conn);
+                net_lock.unlock();
                 reply.* = fx.IpcMessage.init(fx.R_OK);
-                setReplyLen(reply, @intCast(data.len));
+                if (final_state != null and final_state.? == .established) {
+                    setReplyLen(reply, @intCast(data.len));
+                } else {
+                    // Connect failed or timed out
+                    setReplyLen(reply, 0);
+                }
             }
         },
         .tcp_data => {
@@ -966,12 +977,14 @@ fn handleDnsWrite(data: []const u8) ?u16 {
         const name = trimmed[6..];
         if (name.len == 0) return 0;
 
-        if (dns_resolver.cacheLookup(name)) |_| {
+        if (dns_resolver.cacheLookup(name)) |ip| {
+            // Cache hit — store result so subsequent read returns correct IP
+            dns_resolver.pending_result = ip;
             return @intCast(data.len);
         }
 
-        if (!dns_resolver.query(name)) return 0;
-        return null; // Block until response
+        _ = dns_resolver.query(name);
+        return null; // Block until response arrives
     }
 
     return 0;

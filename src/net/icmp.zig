@@ -235,15 +235,14 @@ fn matchEchoReply(payload: []const u8, ip_hdr: ipv4.Header) void {
     }
 }
 
+/// No .blocked guard: markReady CAS handles any state safely.
 fn wakeWaiter(waiter_pid: *u16) void {
     if (waiter_pid.* == 0) return;
     const pid = waiter_pid.*;
     waiter_pid.* = 0;
 
     if (process.getByPid(pid)) |proc| {
-        if (proc.state == .blocked) {
-            process.markReady(proc);
-        }
+        process.markReady(proc);
     }
 }
 

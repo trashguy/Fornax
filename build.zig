@@ -7,6 +7,7 @@ pub fn build(b: *std.Build) void {
     const posix = b.option(bool, "posix", "Enable C/POSIX realm support") orelse false;
     const tcc_enabled = b.option(bool, "tcc", "Build TCC C compiler (requires -Dposix=true)") orelse false;
     const containers = b.option(bool, "containers", "Enable container support (fnx CLI, Linux compat, bridge)") orelse false;
+    const tls_enabled = b.option(bool, "tls", "Enable TLS support (BearSSL)") orelse false;
     const test_packages = b.option(bool, "test-packages", "Build test packages (xxd) for integration tests") orelse false;
     const user_strip = b.option(bool, "strip", "Strip debug info from userspace binaries") orelse
         (optimize != .Debug); // strip by default on release builds
@@ -766,19 +767,8 @@ const touch_bin = b.addExecutable(.{
     });
     tar_bin.image_base = user_image_base;
 
-    const fay_bin = b.addExecutable(.{
-        .name = "fay",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("cmd/fay/main.zig"),
-            .target = x86_64_freestanding,
-            .optimize = user_optimize,
-            .strip = if (user_strip) true else null,
-            .imports = &.{
-                .{ .name = "fornax", .module = fornax_module },
-            },
-        }),
-    });
-    fay_bin.image_base = user_image_base;
+    // fay_bin defined after TLS section so it can conditionally import TLS
+    var fay_bin: *std.Build.Step.Compile = undefined;
 
     const fxfs_bin = b.addExecutable(.{
         .name = "fxfs",
@@ -892,10 +882,155 @@ const touch_bin = b.addExecutable(.{
     });
     ktrace_bin.image_base = user_image_base;
 
+    const smp_test_bin = b.addExecutable(.{
+        .name = "smp-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/smp-test/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    smp_test_bin.image_base = user_image_base;
+
+    // ── TLS support (gated behind -Dtls=true) ─────────────────────────
+    // BearSSL compiled as static library, linked into TLS-capable programs.
+    var bearssl_lib: ?*std.Build.Step.Compile = null;
+    var tls_module: ?*std.Build.Module = null;
+    if (tls_enabled) {
+        if (b.lazyDependency("bearssl", .{})) |bearssl_dep| {
+            const lib = b.addLibrary(.{
+                .linkage = .static,
+                .name = "bearssl",
+                .root_module = b.createModule(.{
+                    .target = x86_64_freestanding,
+                    .optimize = user_optimize,
+                }),
+            });
+
+            const bearssl_flags: []const []const u8 = &.{
+                "-std=c99",
+                "-ffreestanding",
+                "-nostdinc",
+                "-fno-sanitize=all",
+                "-DBR_LE_UNALIGNED=0",
+                "-DBR_USE_URANDOM=0",
+                "-DBR_USE_WIN32_RAND=0",
+                "-DBR_64=1",
+                "-DBR_RDRAND=0",
+                b.fmt("-I{s}", .{bearssl_dep.path("inc").getPath(b)}),
+                b.fmt("-I{s}", .{bearssl_dep.path("src").getPath(b)}),
+                b.fmt("-I{s}", .{b.path("lib/tls/include").getPath(b)}),
+            };
+
+            // Add BearSSL source files by walking subdirectories
+            addBearsslSources(b, lib, bearssl_dep, bearssl_flags);
+
+            // Add Fornax stubs (strlen for freestanding)
+            lib.addCSourceFile(.{
+                .file = b.path("lib/tls/stubs.c"),
+                .flags = bearssl_flags,
+            });
+
+            bearssl_lib = lib;
+
+            // Create TLS module (separate from fornax, uses @cImport for bearssl.h)
+            const tmod = b.createModule(.{
+                .root_source_file = b.path("lib/tls.zig"),
+                .target = x86_64_freestanding,
+                .optimize = user_optimize,
+                .imports = &.{
+                    .{ .name = "fornax", .module = fornax_module },
+                },
+            });
+            tmod.addIncludePath(bearssl_dep.path("inc"));
+            tmod.addIncludePath(bearssl_dep.path("src"));
+            tmod.addIncludePath(b.path("lib/tls/include"));
+            tls_module = tmod;
+        }
+    }
+
+    // ── fay package manager (conditionally TLS-capable) ──────────────
+    {
+        var fay_imports: [2]std.Build.Module.Import = .{
+            .{ .name = "fornax", .module = fornax_module },
+            undefined,
+        };
+        var fay_import_count: usize = 1;
+        if (tls_module) |tmod| {
+            fay_imports[fay_import_count] = .{ .name = "tls", .module = tmod };
+            fay_import_count += 1;
+        }
+
+        fay_bin = b.addExecutable(.{
+            .name = "fay",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("cmd/fay/main.zig"),
+                .target = x86_64_freestanding,
+                .optimize = user_optimize,
+                .strip = if (user_strip) true else null,
+                .imports = fay_imports[0..fay_import_count],
+            }),
+        });
+        fay_bin.image_base = user_image_base;
+        if (bearssl_lib) |bssl| fay_bin.root_module.linkLibrary(bssl);
+    }
+
+    // ── curl HTTP client (conditionally TLS-capable) ──────────────
+    var curl_bin: *std.Build.Step.Compile = undefined;
+    {
+        const curl_options = b.addOptions();
+        curl_options.addOption(bool, "has_tls", tls_module != null);
+
+        var curl_imports: [4]std.Build.Module.Import = .{
+            .{ .name = "fornax", .module = fornax_module },
+            .{ .name = "curl_options", .module = curl_options.createModule() },
+            undefined,
+            undefined,
+        };
+        var curl_import_count: usize = 2;
+        if (tls_module) |tmod| {
+            curl_imports[curl_import_count] = .{ .name = "tls", .module = tmod };
+            curl_import_count += 1;
+        }
+
+        curl_bin = b.addExecutable(.{
+            .name = "curl",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("cmd/curl/main.zig"),
+                .target = x86_64_freestanding,
+                .optimize = user_optimize,
+                .strip = if (user_strip) true else null,
+                .imports = curl_imports[0..curl_import_count],
+            }),
+        });
+        curl_bin.image_base = user_image_base;
+        if (bearssl_lib) |bssl| curl_bin.root_module.linkLibrary(bssl);
+    }
+
     // ── Container support (gated behind -Dcontainers=true) ──────────
     var fnx_bin: ?*std.Build.Step.Compile = null;
     var bridge_bin: ?*std.Build.Step.Compile = null;
     if (containers) {
+        // Build options for fnx (compile-time feature flags)
+        const fnx_options = b.addOptions();
+        fnx_options.addOption(bool, "has_tls", tls_module != null);
+
+        var fnx_imports: [4]std.Build.Module.Import = .{
+            .{ .name = "fornax", .module = fornax_module },
+            .{ .name = "fnx_options", .module = fnx_options.createModule() },
+            undefined,
+            undefined,
+        };
+        var fnx_import_count: usize = 2;
+        if (tls_module) |tmod| {
+            fnx_imports[fnx_import_count] = .{ .name = "tls", .module = tmod };
+            fnx_import_count += 1;
+        }
+
         const fnx_exe = b.addExecutable(.{
             .name = "fnx",
             .root_module = b.createModule(.{
@@ -903,12 +1038,11 @@ const touch_bin = b.addExecutable(.{
                 .target = x86_64_freestanding,
                 .optimize = user_optimize,
                 .strip = if (user_strip) true else null,
-                .imports = &.{
-                    .{ .name = "fornax", .module = fornax_module },
-                },
+                .imports = fnx_imports[0..fnx_import_count],
             }),
         });
         fnx_exe.image_base = user_image_base;
+        if (bearssl_lib) |bssl| fnx_exe.root_module.linkLibrary(bssl);
         fnx_bin = fnx_exe;
 
         const bridge_exe = b.addExecutable(.{
@@ -1480,12 +1614,14 @@ const touch_bin = b.addExecutable(.{
         unzip_bin,
         tar_bin,
         fay_bin,
+        curl_bin,
         netd_bin,
         crond_bin,
         crontab_bin,
         date_bin,
         uptime_bin,
         ktrace_bin,
+        smp_test_bin,
     };
     for (disk_programs) |prog| {
         const install = b.addInstallArtifact(prog, .{
@@ -1686,11 +1822,12 @@ const touch_bin = b.addExecutable(.{
         .{ "fxfs", "srv/fxfs/main.zig" },
         .{ "partfs", "srv/partfs/main.zig" },
         .{ "ktrace", "cmd/ktrace/main.zig" },
+        .{ "smp-test", "cmd/smp-test/main.zig" },
     };
 
     // Build riscv64 initrd programs (init, partfs, fxfs)
     var rv_initrd_bins: [3]*std.Build.Step.Compile = undefined;
-    var rv_disk_bin_buf: [50]*std.Build.Step.Compile = undefined;
+    var rv_disk_bin_buf: [64]*std.Build.Step.Compile = undefined;
     var rv_disk_bin_count: usize = 0;
 
     inline for (rv_user_programs) |prog_info| {
@@ -1869,4 +2006,43 @@ fn addInitrdStep(
     } else |_| {}
 
     return b.addInstallFileWithDir(output, .{ .custom = esp_subdir }, "INITRD");
+}
+
+/// Walk BearSSL src/ subdirectories and add all .c files to the compile step.
+fn addBearsslSources(
+    b: *std.Build,
+    lib: *std.Build.Step.Compile,
+    bearssl_dep: *std.Build.Dependency,
+    flags: []const []const u8,
+) void {
+    const subdirs: []const []const u8 = &.{
+        "src/aead",     "src/codec", "src/ec",  "src/hash",
+        "src/int",      "src/kdf",   "src/mac", "src/rand",
+        "src/rsa",      "src/ssl",   "src/symcipher",
+        "src/x509",
+    };
+    for (subdirs) |subdir| {
+        const abs_path = bearssl_dep.path(subdir).getPath(b);
+        var dir = std.fs.cwd().openDir(abs_path, .{ .iterate = true }) catch continue;
+        defer dir.close();
+        var iter = dir.iterate();
+        while (iter.next() catch null) |entry| {
+            if (entry.kind == .file and endsWith(entry.name, ".c")) {
+                lib.addCSourceFile(.{
+                    .file = bearssl_dep.path(b.fmt("{s}/{s}", .{ subdir, entry.name })),
+                    .flags = flags,
+                });
+            }
+        }
+    }
+    // Top-level settings.c
+    lib.addCSourceFile(.{
+        .file = bearssl_dep.path("src/settings.c"),
+        .flags = flags,
+    });
+}
+
+fn endsWith(s: []const u8, suffix: []const u8) bool {
+    if (s.len < suffix.len) return false;
+    return std.mem.eql(u8, s[s.len - suffix.len ..], suffix);
 }

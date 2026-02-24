@@ -499,8 +499,12 @@ pub fn sysExit(status: u64) noreturn {
         const container = @import("container.zig");
         if (container.getById(proc.container_id)) |ct| {
             container.removeProcess(ct);
-            // If this is the container's init process, mark container stopped/failed
+            // If this is the container's init process, kill all other
+            // container processes (netd + threads) and mark stopped/failed.
+            // Must happen BEFORE killChildren so thread-grouped processes
+            // (which killChildren would skip) are properly terminated.
             if (ct.init_pid != null and ct.init_pid.? == proc.pid) {
+                container.killAllProcessesExcept(ct, proc.pid);
                 ct.state = if (status == 0) .stopped else .failed;
                 ct.init_pid = null;
             }
@@ -2691,6 +2695,9 @@ pub fn sysCntrOp(op: u64, cntr_id: u64, a0: u64, a1: u64, a2: u64) u64 {
             child.compat = @intFromEnum(ct.compat);
             child.uid = 0; // Container exec runs as root inside container
             child.gid = 0;
+            // Re-parent: exec'd process belongs to the container init, not the
+            // management tool (fnx exec), so it survives detached mode.
+            child.parent_pid = ct.init_pid;
             container.addProcess(ct);
 
             klog.info("[cntr_exec] container=");
@@ -2787,6 +2794,9 @@ pub fn sysCntrOp(op: u64, cntr_id: u64, a0: u64, a1: u64, a2: u64) u64 {
             child.compat = 0; // Native Fornax
             child.uid = 0;
             child.gid = 0;
+            // Re-parent: netd belongs to the container init, not the
+            // management tool (fnx run), so it survives detached mode.
+            child.parent_pid = ct.init_pid;
             container.addProcess(ct);
 
             ct.netd_pid = child.pid;
@@ -3135,10 +3145,18 @@ fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64, argv_p
     }
 
     // Create child process
-    const child = process.create() orelse return ENOMEM;
+    const child = process.create() orelse {
+        klog.warn("[spawn: process.create() failed]\n");
+        return ENOMEM;
+    };
 
     // Load ELF into child's address space
-    const load_result = elf.load(child.pml4.?, elf_data) catch {
+    const load_result = elf.load(child.pml4.?, elf_data) catch |e| {
+        klog.warn("[spawn: elf.load failed: ");
+        klog.warn(@errorName(e));
+        klog.warn(" elf_len=");
+        klog.warnDec(@intCast(elf_len));
+        klog.warn("]\n");
         child.state = .dead;
         return ENOMEM;
     };

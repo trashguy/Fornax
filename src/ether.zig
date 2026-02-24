@@ -87,15 +87,14 @@ pub fn freeClient(idx: u8) void {
     }
     c.active = false;
     c.refcount = 0;
-    // Wake any blocked readers with EOF
+    // Wake all readers with EOF — no .blocked guard needed,
+    // markReady CAS handles any state safely.
     for (&c.read_waiters) |*w| {
         if (w.*) |pid| {
             w.* = null;
             if (process.getByPid(pid)) |proc| {
-                if (proc.state == .blocked) {
-                    proc.syscall_ret = 0; // EOF
-                    process.markReady(proc);
-                }
+                proc.syscall_ret = 0; // EOF
+                process.markReady(proc);
             }
         }
     }
@@ -127,14 +126,13 @@ pub fn deliverFrame(frame: []const u8) bool {
             c.head = (c.head + 1) % FRAME_RING_SIZE;
             c.count += 1;
 
-            // Wake blocked readers
+            // Wake all readers — no .blocked guard needed,
+            // markReady CAS handles any state safely.
             for (&c.read_waiters) |*w| {
                 if (w.*) |pid| {
                     w.* = null;
                     if (process.getByPid(pid)) |proc| {
-                        if (proc.state == .blocked) {
-                            process.markReady(proc);
-                        }
+                        process.markReady(proc);
                     }
                 }
             }

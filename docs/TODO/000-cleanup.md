@@ -42,12 +42,3 @@ Suggested docs:
 
 ### When to document
 If you find yourself writing a comment thread to explain something, that's a signal it should be in the docs.
-
-## Tracing and Debugging
-
-Post-mortem crash analysis is limited with just panic output. Consider adding a lightweight in-memory trace buffer that captures:
-- Last N events (syscalls, interrupts, context switches)
-- Timestamp for each event
-- Wrap-around ring buffer in a dedicated section
-
-This helps debug issues that are hard to reproduce. Keep it minimal to avoid performance impact.

@@ -10,24 +10,40 @@ pub const HeaderEntry = struct {
     value: []const u8,
 };
 
+/// I/O function table for transport abstraction (e.g. TLS).
+/// When set on a Connection, all reads/writes go through these
+/// instead of raw fx.read/fx.write on the data fd.
+pub const IoFns = struct {
+    read: *const fn (ctx: *anyopaque, buf: []u8) isize,
+    write: *const fn (ctx: *anyopaque, data: []const u8) isize,
+    ctx: *anyopaque,
+};
+
 pub const Connection = struct {
     data_fd: i32,
     ctl_fd: i32,
     conn_num: []const u8,
     conn_num_buf: [16]u8,
     conn_num_len: usize,
+    io: ?IoFns,
 
     /// Open a TCP connection. `header_buf` is scratch for path building.
     pub fn connect(host_ip: []const u8, port: u16, header_buf: []u8) ?Connection {
         // Open clone to allocate connection
         const clone_fd = fx.open("/net/tcp/clone");
-        if (clone_fd < 0) return null;
+        if (clone_fd < 0) {
+            _ = fx.write(2, "http: clone open failed\n");
+            return null;
+        }
 
         // Read connection number
         var conn_buf: [16]u8 = undefined;
         const conn_n = fx.read(clone_fd, &conn_buf);
         _ = fx.close(clone_fd);
-        if (conn_n <= 0) return null;
+        if (conn_n <= 0) {
+            _ = fx.write(2, "http: clone read failed\n");
+            return null;
+        }
 
         var conn_num_len: usize = @intCast(conn_n);
         if (conn_num_len > 0 and conn_buf[conn_num_len - 1] == '\n') {
@@ -40,8 +56,10 @@ pub const Connection = struct {
         _ = path.appendRaw("/ctl");
 
         const ctl_fd = fx.open(path.slice());
-        if (ctl_fd < 0) return null;
-
+        if (ctl_fd < 0) {
+            _ = fx.write(2, "http: ctl open failed\n");
+            return null;
+        }
         // Write connect command: "connect IP!PORT\n"
         var cmd_pos: usize = 0;
         const prefix = "connect ";
@@ -68,6 +86,7 @@ pub const Connection = struct {
 
         const data_fd = fx.open(dpath.slice());
         if (data_fd < 0) {
+            _ = fx.write(2, "http: data open failed\n");
             _ = fx.close(ctl_fd);
             return null;
         }
@@ -78,10 +97,24 @@ pub const Connection = struct {
             .conn_num = undefined,
             .conn_num_buf = undefined,
             .conn_num_len = conn_num_len,
+            .io = null,
         };
         @memcpy(result.conn_num_buf[0..conn_num_len], conn_buf[0..conn_num_len]);
         result.conn_num = result.conn_num_buf[0..conn_num_len];
         return result;
+    }
+
+    /// Write data through IoFns or raw fd.
+    pub fn writeData(self: *const Connection, data: []const u8) isize {
+        if (self.io) |io| return io.write(io.ctx, data);
+        const n = fx.write(self.data_fd, data);
+        return @intCast(n);
+    }
+
+    /// Read data through IoFns or raw fd.
+    pub fn readData(self: *const Connection, buf: []u8) isize {
+        if (self.io) |io| return io.read(io.ctx, buf);
+        return fx.read(self.data_fd, buf);
     }
 
     pub fn close(self: *Connection) void {
@@ -108,6 +141,7 @@ pub const Response = struct {
     body_read: u64,
     chunk_remaining: u64,
     chunk_done: bool,
+    io: ?IoFns,
 
     pub fn getHeader(self: *const Response, name: []const u8) ?[]const u8 {
         for (0..self.header_count) |i| {
@@ -116,6 +150,12 @@ pub const Response = struct {
             }
         }
         return null;
+    }
+
+    /// Internal: read from network (through IoFns if set, else raw fd).
+    fn netRead(self: *const Response, buf: []u8) isize {
+        if (self.io) |io| return io.read(io.ctx, buf);
+        return fx.read(self.data_fd, buf);
     }
 
     /// Read body data into buf. Returns bytes read (0 on EOF).
@@ -141,7 +181,7 @@ pub const Response = struct {
                 return @intCast(take);
             }
 
-            const n = fx.read(self.data_fd, buf[0..max]);
+            const n = self.netRead(buf[0..max]);
             if (n > 0) self.body_read += @intCast(n);
             return n;
         }
@@ -156,7 +196,7 @@ pub const Response = struct {
             return @intCast(take);
         }
 
-        return fx.read(self.data_fd, buf);
+        return self.netRead(buf);
     }
 
     fn readChunked(self: *Response, buf: []u8) isize {
@@ -174,7 +214,7 @@ pub const Response = struct {
                 self.chunk_remaining -= take;
                 return @intCast(take);
             }
-            const n = fx.read(self.data_fd, buf[0..max]);
+            const n = self.netRead(buf[0..max]);
             if (n > 0) self.chunk_remaining -= @intCast(n);
             return n;
         }
@@ -220,7 +260,7 @@ pub const Response = struct {
             return b;
         }
         var tmp: [1]u8 = undefined;
-        const n = fx.read(self.data_fd, &tmp);
+        const n = self.netRead(&tmp);
         if (n <= 0) return null;
         return tmp[0];
     }
@@ -243,13 +283,23 @@ pub const Response = struct {
         }
         return total;
     }
+
+    /// Read and discard remaining body data.
+    pub fn drainBody(self: *Response) void {
+        var discard: [512]u8 = undefined;
+        while (true) {
+            const n = self.readBody(&discard);
+            if (n <= 0) break;
+        }
+    }
 };
 
 /// Parse HTTP response headers from the data fd.
 /// `header_buf` is used to buffer the initial read.
-pub fn parseResponse(data_fd: i32, header_buf: []u8) ?Response {
+/// `io` is optional transport I/O (e.g. TLS); null for raw fd.
+pub fn parseResponse(data_fd: i32, header_buf: []u8, io: ?IoFns) ?Response {
     // Read initial data
-    const n = fx.read(data_fd, header_buf);
+    const n = if (io) |i| i.read(i.ctx, header_buf) else fx.read(data_fd, header_buf);
     if (n <= 0) return null;
     const nbytes: usize = @intCast(n);
 
@@ -312,6 +362,7 @@ pub fn parseResponse(data_fd: i32, header_buf: []u8) ?Response {
         .body_read = 0,
         .chunk_remaining = 0,
         .chunk_done = false,
+        .io = io,
     };
 
     // Set body start past headers
@@ -424,7 +475,7 @@ pub fn download(host: []const u8, url_path: []const u8, port: u16, out_fd: i32, 
 
     _ = fx.write(conn.data_fd, header_buf[0..req_pos]);
 
-    var resp = parseResponse(conn.data_fd, header_buf) orelse {
+    var resp = parseResponse(conn.data_fd, header_buf, null) orelse {
         conn.close();
         return null;
     };
@@ -437,6 +488,421 @@ pub fn download(host: []const u8, url_path: []const u8, port: u16, out_fd: i32, 
     const total = resp.readBodyToFd(out_fd, buf);
     conn.close();
     return total;
+}
+
+pub const RequestOptions = struct {
+    headers: []const HeaderEntry = &.{},
+    /// Called after TCP connect, before HTTP exchange. Returns IoFns for
+    /// encrypted I/O (e.g. TLS), or null for plain TCP.
+    on_connect: ?*const fn (data_fd: i32, host: []const u8) ?IoFns = null,
+    /// Optional request body (for POST/PUT). Content-Length auto-generated.
+    body: ?[]const u8 = null,
+    /// Content-Type for body. Defaults to application/x-www-form-urlencoded.
+    content_type: ?[]const u8 = null,
+};
+
+pub const UrlParts = struct {
+    host: []const u8,
+    port: u16,
+    path: []const u8,
+    tls: bool,
+};
+
+/// Parse "http://host:port/path" or "https://host:port/path" into components.
+pub fn parseUrl(url: []const u8, path_buf: []u8) ?UrlParts {
+    var s = url;
+    var use_tls = false;
+    var default_port: u16 = 80;
+
+    // Check for https:// prefix
+    const https_prefix = "https://";
+    if (s.len >= https_prefix.len and prefixMatchCI(s, https_prefix)) {
+        s = s[https_prefix.len..];
+        use_tls = true;
+        default_port = 443;
+    } else {
+        // Check for http:// prefix
+        const http_prefix = "http://";
+        if (s.len >= http_prefix.len and prefixMatchCI(s, http_prefix)) {
+            s = s[http_prefix.len..];
+        }
+    }
+
+    // Find end of host:port (first '/')
+    var host_end: usize = 0;
+    while (host_end < s.len and s[host_end] != '/') : (host_end += 1) {}
+
+    const host_port = s[0..host_end];
+    const url_path = if (host_end < s.len) s[host_end..] else "/";
+
+    // Copy path into buffer
+    if (url_path.len > path_buf.len) return null;
+    @memcpy(path_buf[0..url_path.len], url_path);
+
+    // Split host:port
+    var colon_pos: usize = host_port.len;
+    var i: usize = 0;
+    while (i < host_port.len) : (i += 1) {
+        if (host_port[i] == ':') colon_pos = i;
+    }
+
+    var port: u16 = default_port;
+    if (colon_pos < host_port.len) {
+        port = @intCast(parseInt(host_port[colon_pos + 1 ..]));
+        if (port == 0) port = default_port;
+    }
+
+    return UrlParts{
+        .host = host_port[0..colon_pos],
+        .port = port,
+        .path = path_buf[0..url_path.len],
+        .tls = use_tls,
+    };
+}
+
+pub const RequestResult = struct {
+    conn: Connection,
+    resp: Response,
+};
+
+/// Result of parsing a WWW-Authenticate: Bearer header.
+pub const AuthChallenge = struct {
+    realm: []const u8, // token endpoint URL
+    service: []const u8, // registry service name
+    scope: []const u8, // e.g. "repository:library/alpine:pull"
+};
+
+/// Parse WWW-Authenticate: Bearer realm="...",service="...",scope="..." header.
+/// Returns true if a valid Bearer challenge was extracted.
+pub fn parseWwwAuthenticate(header_value: []const u8, challenge: *AuthChallenge) bool {
+    // Skip leading whitespace
+    var s = header_value;
+    while (s.len > 0 and s[0] == ' ') s = s[1..];
+
+    // Must start with "Bearer " (case-insensitive)
+    const bearer = "Bearer ";
+    if (s.len < bearer.len) return false;
+    if (!prefixMatchCI(s, bearer)) return false;
+    s = s[bearer.len..];
+
+    challenge.realm = "";
+    challenge.service = "";
+    challenge.scope = "";
+
+    // Parse comma-separated key="value" pairs
+    while (s.len > 0) {
+        // Skip whitespace and commas
+        while (s.len > 0 and (s[0] == ' ' or s[0] == ',')) s = s[1..];
+        if (s.len == 0) break;
+
+        // Find '='
+        var eq: usize = 0;
+        while (eq < s.len and s[eq] != '=') : (eq += 1) {}
+        if (eq >= s.len) break;
+
+        const key = s[0..eq];
+        s = s[eq + 1 ..];
+
+        // Value may be quoted
+        if (s.len > 0 and s[0] == '"') {
+            s = s[1..]; // skip opening quote
+            var end: usize = 0;
+            while (end < s.len and s[end] != '"') : (end += 1) {}
+            const val = s[0..end];
+            if (end < s.len) s = s[end + 1 ..] else s = s[end..];
+
+            if (caseInsensitiveEql(key, "realm")) {
+                challenge.realm = val;
+            } else if (caseInsensitiveEql(key, "service")) {
+                challenge.service = val;
+            } else if (caseInsensitiveEql(key, "scope")) {
+                challenge.scope = val;
+            }
+        } else {
+            // Unquoted value — up to comma or end
+            var end: usize = 0;
+            while (end < s.len and s[end] != ',' and s[end] != ' ') : (end += 1) {}
+            const val = s[0..end];
+            s = s[end..];
+
+            if (caseInsensitiveEql(key, "realm")) {
+                challenge.realm = val;
+            } else if (caseInsensitiveEql(key, "service")) {
+                challenge.service = val;
+            } else if (caseInsensitiveEql(key, "scope")) {
+                challenge.scope = val;
+            }
+        }
+    }
+
+    return challenge.realm.len > 0;
+}
+
+/// URL percent-encode a string (RFC 3986 unreserved chars pass through).
+/// Returns the encoded slice within buf.
+pub fn percentEncode(input: []const u8, buf: []u8) []const u8 {
+    const hex = "0123456789ABCDEF";
+    var pos: usize = 0;
+    for (input) |ch| {
+        if (isUnreserved(ch)) {
+            if (pos >= buf.len) break;
+            buf[pos] = ch;
+            pos += 1;
+        } else {
+            if (pos + 3 > buf.len) break;
+            buf[pos] = '%';
+            buf[pos + 1] = hex[ch >> 4];
+            buf[pos + 2] = hex[ch & 0x0F];
+            pos += 3;
+        }
+    }
+    return buf[0..pos];
+}
+
+/// Build a query string from key=value pairs (values percent-encoded).
+/// Returns the encoded slice within buf (e.g. "key1=value1&key2=value2").
+pub fn buildQueryString(params: []const HeaderEntry, buf: []u8) []const u8 {
+    var pos: usize = 0;
+    for (params, 0..) |param, idx| {
+        if (idx > 0) {
+            if (pos >= buf.len) break;
+            buf[pos] = '&';
+            pos += 1;
+        }
+        // Copy key as-is (should already be safe)
+        const klen = @min(param.name.len, buf.len - pos);
+        @memcpy(buf[pos..][0..klen], param.name[0..klen]);
+        pos += klen;
+        if (pos >= buf.len) break;
+        buf[pos] = '=';
+        pos += 1;
+        // Percent-encode value
+        const encoded = percentEncode(param.value, buf[pos..]);
+        pos += encoded.len;
+    }
+    return buf[0..pos];
+}
+
+/// Base64 encode (RFC 4648 standard encoding).
+/// Returns the encoded slice within buf.
+pub fn base64Encode(input: []const u8, buf: []u8) []const u8 {
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    var pos: usize = 0;
+    var i: usize = 0;
+    while (i + 3 <= input.len) : (i += 3) {
+        if (pos + 4 > buf.len) break;
+        const b0 = input[i];
+        const b1 = input[i + 1];
+        const b2 = input[i + 2];
+        buf[pos] = alphabet[b0 >> 2];
+        buf[pos + 1] = alphabet[((b0 & 0x03) << 4) | (b1 >> 4)];
+        buf[pos + 2] = alphabet[((b1 & 0x0F) << 2) | (b2 >> 6)];
+        buf[pos + 3] = alphabet[b2 & 0x3F];
+        pos += 4;
+    }
+    // Handle remaining bytes
+    const rem = input.len - i;
+    if (rem == 1 and pos + 4 <= buf.len) {
+        const b0 = input[i];
+        buf[pos] = alphabet[b0 >> 2];
+        buf[pos + 1] = alphabet[(b0 & 0x03) << 4];
+        buf[pos + 2] = '=';
+        buf[pos + 3] = '=';
+        pos += 4;
+    } else if (rem == 2 and pos + 4 <= buf.len) {
+        const b0 = input[i];
+        const b1 = input[i + 1];
+        buf[pos] = alphabet[b0 >> 2];
+        buf[pos + 1] = alphabet[((b0 & 0x03) << 4) | (b1 >> 4)];
+        buf[pos + 2] = alphabet[(b1 & 0x0F) << 2];
+        buf[pos + 3] = '=';
+        pos += 4;
+    }
+    return buf[0..pos];
+}
+
+fn isUnreserved(ch: u8) bool {
+    return (ch >= 'A' and ch <= 'Z') or
+        (ch >= 'a' and ch <= 'z') or
+        (ch >= '0' and ch <= '9') or
+        ch == '-' or ch == '.' or ch == '_' or ch == '~';
+}
+
+/// Lower-level HTTP request that returns Connection + Response for streaming.
+/// Caller must close the connection when done.
+pub fn request(
+    host: []const u8,
+    port: u16,
+    method: []const u8,
+    url_path: []const u8,
+    options: RequestOptions,
+    header_buf: []u8,
+) ?RequestResult {
+    return requestWithRedirects(host, port, method, url_path, options, header_buf, 0);
+}
+
+fn requestWithRedirects(
+    host: []const u8,
+    port: u16,
+    method: []const u8,
+    url_path: []const u8,
+    options: RequestOptions,
+    header_buf: []u8,
+    redirect_count: u8,
+) ?RequestResult {
+    // Resolve hostname if needed
+    var ip_buf: [64]u8 = undefined;
+    const host_ip = if (isIpAddress(host)) host else (resolve(host, &ip_buf) orelse {
+        _ = fx.write(2, "http: DNS resolution failed for ");
+        _ = fx.write(2, host);
+        _ = fx.write(2, "\n");
+        return null;
+    });
+
+    var conn = Connection.connect(host_ip, port, header_buf) orelse {
+        _ = fx.write(2, "http: TCP connect failed\n");
+        return null;
+    };
+
+    // Set up transport I/O (e.g. TLS handshake) if callback provided
+    if (options.on_connect) |setup| {
+        conn.io = setup(conn.data_fd, host);
+        if (conn.io == null) {
+            // Transport setup failed (e.g. TLS handshake failed)
+            _ = fx.write(2, "http: transport setup failed\n");
+            conn.close();
+            return null;
+        }
+    }
+
+    // Build HTTP request
+    var req_pos: usize = 0;
+    @memcpy(header_buf[req_pos..][0..method.len], method);
+    req_pos += method.len;
+    header_buf[req_pos] = ' ';
+    req_pos += 1;
+    @memcpy(header_buf[req_pos..][0..url_path.len], url_path);
+    req_pos += url_path.len;
+    const ver = " HTTP/1.1\r\nHost: ";
+    @memcpy(header_buf[req_pos..][0..ver.len], ver);
+    req_pos += ver.len;
+    @memcpy(header_buf[req_pos..][0..host.len], host);
+    req_pos += host.len;
+
+    // User-Agent
+    const ua = "\r\nUser-Agent: Fornax/1.0";
+    @memcpy(header_buf[req_pos..][0..ua.len], ua);
+    req_pos += ua.len;
+
+    // Custom headers
+    for (options.headers) |hdr| {
+        const crlf = "\r\n";
+        @memcpy(header_buf[req_pos..][0..crlf.len], crlf);
+        req_pos += crlf.len;
+        @memcpy(header_buf[req_pos..][0..hdr.name.len], hdr.name);
+        req_pos += hdr.name.len;
+        const sep = ": ";
+        @memcpy(header_buf[req_pos..][0..sep.len], sep);
+        req_pos += sep.len;
+        @memcpy(header_buf[req_pos..][0..hdr.value.len], hdr.value);
+        req_pos += hdr.value.len;
+    }
+
+    // Body headers (Content-Length + Content-Type)
+    if (options.body) |body| {
+        const ct_hdr = "\r\nContent-Type: ";
+        @memcpy(header_buf[req_pos..][0..ct_hdr.len], ct_hdr);
+        req_pos += ct_hdr.len;
+        const ct = options.content_type orelse "application/x-www-form-urlencoded";
+        @memcpy(header_buf[req_pos..][0..ct.len], ct);
+        req_pos += ct.len;
+
+        const cl_hdr = "\r\nContent-Length: ";
+        @memcpy(header_buf[req_pos..][0..cl_hdr.len], cl_hdr);
+        req_pos += cl_hdr.len;
+        var cl_buf: [20]u8 = undefined;
+        const cl_len = fmtUsize(body.len, &cl_buf);
+        @memcpy(header_buf[req_pos..][0..cl_len], cl_buf[0..cl_len]);
+        req_pos += cl_len;
+    }
+
+    const close_hdr = "\r\nConnection: close\r\n\r\n";
+    @memcpy(header_buf[req_pos..][0..close_hdr.len], close_hdr);
+    req_pos += close_hdr.len;
+
+    _ = conn.writeData(header_buf[0..req_pos]);
+
+    // Write body if present
+    if (options.body) |body| {
+        if (body.len > 0) {
+            _ = conn.writeData(body);
+        }
+    }
+
+    var resp = parseResponse(conn.data_fd, header_buf, conn.io) orelse {
+        conn.close();
+        return null;
+    };
+
+    // Handle redirects (301, 302, 307, 308)
+    if ((resp.status_code == 301 or resp.status_code == 302 or
+        resp.status_code == 307 or resp.status_code == 308) and
+        redirect_count < 3)
+    {
+        if (resp.getHeader("Location")) |location| {
+            // Copy location before closing (it points into header_buf)
+            var loc_buf: [512]u8 = undefined;
+            if (location.len <= loc_buf.len) {
+                @memcpy(loc_buf[0..location.len], location);
+                const loc = loc_buf[0..location.len];
+                conn.close();
+
+                // 301/302 change method to GET and drop body
+                var redir_method = method;
+                var redir_options = options;
+                if (resp.status_code == 301 or resp.status_code == 302) {
+                    redir_method = "GET";
+                    redir_options.body = null;
+                    redir_options.content_type = null;
+                }
+
+                // Strip Authorization on cross-domain redirects
+                var redir_path_buf: [512]u8 = undefined;
+                if (parseUrl(loc, &redir_path_buf)) |parts| {
+                    // Cross-domain: strip auth headers
+                    if (!caseInsensitiveEql(parts.host, host)) {
+                        redir_options = stripAuthHeaders(redir_options);
+                    }
+                    return requestWithRedirects(
+                        parts.host,
+                        parts.port,
+                        redir_method,
+                        parts.path,
+                        redir_options,
+                        header_buf,
+                        redirect_count + 1,
+                    );
+                }
+                // Relative redirect — same host
+                if (loc.len > 0 and loc[0] == '/') {
+                    @memcpy(redir_path_buf[0..loc.len], loc);
+                    return requestWithRedirects(
+                        host,
+                        port,
+                        redir_method,
+                        redir_path_buf[0..loc.len],
+                        redir_options,
+                        header_buf,
+                        redirect_count + 1,
+                    );
+                }
+            }
+        }
+        conn.close();
+        return null;
+    }
+
+    return .{ .conn = conn, .resp = resp };
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────
@@ -453,8 +919,8 @@ fn fmtU16(buf: []u8, val: u16) usize {
         tmp[len] = @intCast('0' + (v % 10));
         len += 1;
     }
-    for (0..len) |i| {
-        buf[i] = tmp[len - 1 - i];
+    for (0..len) |idx| {
+        buf[idx] = tmp[len - 1 - idx];
     }
     return len;
 }
@@ -467,7 +933,7 @@ fn caseInsensitiveEql(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-fn containsCI(hay: []const u8, needle: []const u8) bool {
+pub fn containsCI(hay: []const u8, needle: []const u8) bool {
     if (needle.len > hay.len) return false;
     var i: usize = 0;
     while (i + needle.len <= hay.len) : (i += 1) {
@@ -476,16 +942,24 @@ fn containsCI(hay: []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn toLower(c: u8) u8 {
-    if (c >= 'A' and c <= 'Z') return c + 32;
-    return c;
+fn prefixMatchCI(s: []const u8, prefix: []const u8) bool {
+    if (s.len < prefix.len) return false;
+    for (0..prefix.len) |i| {
+        if (toLower(s[i]) != toLower(prefix[i])) return false;
+    }
+    return true;
+}
+
+fn toLower(ch: u8) u8 {
+    if (ch >= 'A' and ch <= 'Z') return ch + 32;
+    return ch;
 }
 
 fn parseInt(s: []const u8) i64 {
     var val: i64 = 0;
-    for (s) |c| {
-        if (c >= '0' and c <= '9') {
-            val = val * 10 + (c - '0');
+    for (s) |ch| {
+        if (ch >= '0' and ch <= '9') {
+            val = val * 10 + (ch - '0');
         }
     }
     return val;
@@ -493,14 +967,14 @@ fn parseInt(s: []const u8) i64 {
 
 fn parseHex(s: []const u8) u64 {
     var val: u64 = 0;
-    for (s) |c| {
+    for (s) |ch| {
         val <<= 4;
-        if (c >= '0' and c <= '9') {
-            val |= c - '0';
-        } else if (c >= 'a' and c <= 'f') {
-            val |= c - 'a' + 10;
-        } else if (c >= 'A' and c <= 'F') {
-            val |= c - 'A' + 10;
+        if (ch >= '0' and ch <= '9') {
+            val |= ch - '0';
+        } else if (ch >= 'a' and ch <= 'f') {
+            val |= ch - 'a' + 10;
+        } else if (ch >= 'A' and ch <= 'F') {
+            val |= ch - 'A' + 10;
         }
     }
     return val;
@@ -509,4 +983,42 @@ fn parseHex(s: []const u8) u64 {
 fn isIpAddress(s: []const u8) bool {
     if (s.len == 0) return false;
     return s[0] >= '0' and s[0] <= '9';
+}
+
+fn fmtUsize(val: usize, buf: []u8) usize {
+    var tmp: [20]u8 = undefined;
+    var len: usize = 0;
+    var v = val;
+    if (v == 0) {
+        buf[0] = '0';
+        return 1;
+    }
+    while (v > 0) : (v /= 10) {
+        tmp[len] = @intCast('0' + (v % 10));
+        len += 1;
+    }
+    for (0..len) |idx| {
+        buf[idx] = tmp[len - 1 - idx];
+    }
+    return len;
+}
+
+/// Return options with Authorization headers removed (for cross-domain redirects).
+fn stripAuthHeaders(options: RequestOptions) RequestOptions {
+    // We can't easily filter the slice in-place, so we just check if any auth
+    // headers exist. For the common case (0-1 auth headers among few total),
+    // we use a static buffer to rebuild the header list.
+    const S = struct {
+        var filtered: [MAX_HEADERS]HeaderEntry = undefined;
+    };
+    var count: usize = 0;
+    for (options.headers) |hdr| {
+        if (!caseInsensitiveEql(hdr.name, "Authorization")) {
+            S.filtered[count] = hdr;
+            count += 1;
+        }
+    }
+    var result = options;
+    result.headers = S.filtered[0..count];
+    return result;
 }

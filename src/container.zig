@@ -230,9 +230,42 @@ pub fn canSpawnProcess(ct: *const Container) bool {
 
 /// Kill all processes in a container.
 pub fn killAllProcesses(ct: *Container) void {
+    killAllProcessesExcept(ct, null);
+}
+
+/// Kill all processes in a container, cleaning up ether devices and pipes.
+/// Optionally excludes a specific process (e.g., the init being cleaned up in sysExit).
+pub fn killAllProcessesExcept(ct: *Container, except_pid: ?u32) void {
+    const ether_mod = @import("ether.zig");
+    const pipe_mod = @import("pipe.zig");
+    const tg_mod = @import("thread_group.zig");
     const table = process.getProcessTable();
     for (table) |*p| {
         if (p.state != .free and p.state != .dead and p.container_id == ct.id) {
+            if (except_pid) |ep| {
+                if (p.pid == ep) continue;
+            }
+            // Clean up ether and pipe fds before killing.
+            // Thread groups share the fd table, so getFdSlice returns
+            // the shared table — setting entries to null prevents
+            // double-free when we process sibling threads.
+            const fds = tg_mod.getFdSlice(p);
+            for (0..process.MAX_FDS) |i| {
+                if (fds[i]) |entry| {
+                    if (entry.fd_type == .dev_ether) {
+                        ether_mod.freeClient(entry.ether_client);
+                        fds[i] = null;
+                    }
+                    if (entry.fd_type == .pipe) {
+                        if (entry.pipe_is_read) {
+                            pipe_mod.closeReadEnd(entry.pipe_id);
+                        } else {
+                            pipe_mod.closeWriteEnd(entry.pipe_id);
+                        }
+                        fds[i] = null;
+                    }
+                }
+            }
             p.state = .dead;
         }
     }
@@ -273,6 +306,10 @@ pub fn start(ct: *Container, init_elf: []const u8, console_channel_id: ?ipc.Chan
         klog.err("[container] start: process.create() failed\n");
         return null;
     };
+
+    // Re-parent: container init has no parent so it survives when
+    // the management tool (fnx run -d) exits and calls killChildren.
+    proc.parent_pid = null;
 
     // Apply resource quotas
     proc.quotas = ct.quotas;

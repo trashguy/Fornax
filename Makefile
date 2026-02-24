@@ -1,6 +1,7 @@
 .PHONY: all x86_64 aarch64 riscv64 run run-x86_64 run-smp run-aarch64 run-riscv64 disk disk-x86_64 disk-aarch64 clean clean-disk help
 .PHONY: release release-x86_64 release-aarch64 release-riscv64 run-release disk-img disk-format
 .PHONY: run-posix run-posix-release run-tcc
+.PHONY: run-tls run-tls-smp
 .PHONY: run-containers run-containers-dev
 .PHONY: run-dev run-dev-posix run-nvme run-ahci test unit-test integration-test
 .PHONY: debug debug-smp debug-dev debug-containers
@@ -56,6 +57,14 @@ run-posix-release:
 run-tcc:
 	zig build x86_64 -Dposix=true -Dtcc=true
 	./scripts/run-x86_64.sh
+
+run-tls:
+	zig build x86_64 -Dcontainers=true -Dtls=true
+	./scripts/run-x86_64.sh -smp 4 -m 2048
+
+run-tls-smp:
+	zig build x86_64 -Dcontainers=true -Dtls=true
+	./scripts/run-x86_64.sh -smp 8 -m 4096
 
 run-containers:
 	zig build x86_64 -Dcontainers=true
@@ -149,6 +158,8 @@ help:
 	@echo "  make run-tcc         Run x86_64 with POSIX + TCC compiler"
 	@echo "  make run-posix       Run x86_64 with C/POSIX realm support"
 	@echo "  make run-posix-release  Run x86_64 with POSIX (ReleaseSafe kernel)"
+	@echo "  make run-tls         Run x86_64 with TLS + containers (4 cores, 2GB)"
+	@echo "  make run-tls-smp     Run x86_64 with TLS + containers (8 cores, 4GB)"
 	@echo "  make run-containers  Run x86_64 with container support (4 cores, 2GB)"
 	@echo "  make run-containers-dev  Run x86_64 with containers (8 cores, 8GB)"
 	@echo "  make debug           Run x86_64 with GDB server (connect: gdb -x fornax.gdb)"

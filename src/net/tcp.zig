@@ -1017,17 +1017,16 @@ fn addWaiter(waiters: *[MAX_WAITERS]?u16, pid: u16) void {
 }
 
 /// Wake all waiters in the array and clear it.
+/// No .blocked guard: markReady CAS handles any state safely.
 fn wakeAllWaiters(waiters: *[MAX_WAITERS]?u16, is_error: bool) void {
     for (waiters) |*w| {
         if (w.*) |pid| {
             w.* = null;
             if (process.getByPid(pid)) |proc| {
-                if (proc.state == .blocked) {
-                    if (is_error) {
-                        proc.syscall_ret = 0xFFFF_FFFF_FFFF_FFF2; // -ECONNRESET equivalent
-                    }
-                    process.markReady(proc);
+                if (is_error) {
+                    proc.syscall_ret = 0xFFFF_FFFF_FFFF_FFF2; // -ECONNRESET equivalent
                 }
+                process.markReady(proc);
             }
         }
     }

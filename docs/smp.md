@@ -34,7 +34,7 @@ Each core has private state accessed via the GS segment register (x86_64) or har
 
 1. UEFI boot hands control to `main.zig`
 2. PMM, heap, serial, console initialized (single-threaded, no locks needed yet)
-3. `percpu.init()` — sets `cores_online = 1`, programs GS_BASE and KERNEL_GS_BASE MSRs to point at `asm_states[0]`
+3. `percpu.init()` — sets `cores_online = 1`, programs GS_BASE and KERNEL_GS_BASE MSRs to point at `asm_states[0]`, allocates BSP scheduler stack
 4. `arch.init()` — GDT, IDT, paging
 5. `apic.init(rsdp)`:
    - Parses ACPI RSDP → XSDT → MADT to discover LAPIC IDs and core count
@@ -69,7 +69,8 @@ For each AP:
 3. BSP sends INIT-SIPI-SIPI to the target LAPIC ID
 4. AP wakes in 16-bit real mode at 0x8000, transitions to 64-bit long mode
 5. AP's `apEntry()` loads BSP's GDT/IDT, enables its LAPIC, sets GS_BASE/KERNEL_GS_BASE MSRs
-6. AP increments `cores_online` atomically and enters the idle loop in `scheduleNext()`
+6. AP allocates its per-CPU scheduler stack from PMM
+7. AP increments `cores_online` atomically and enters the idle loop in `scheduleNext()`
 
 APs are started sequentially with a synchronization flag (`ap_boot_done`) to avoid trampoline conflicts.
 
@@ -77,7 +78,7 @@ APs are started sequentially with a synchronization flag (`ap_boot_done`) to avo
 
 Two structures per core:
 
-### AsmState (extern struct, 40 bytes)
+### AsmState (extern struct, 48 bytes)
 
 Accessed from `entry.S` via `%gs:offset` after `swapgs`. Fixed offsets for assembly code:
 
@@ -88,6 +89,7 @@ Accessed from `entry.S` via `%gs:offset` after `swapgs`. Fixed offsets for assem
 | gs:16 | `saved_user_rip` | User RIP (from RCX on SYSCALL) |
 | gs:24 | `saved_user_rflags` | User RFLAGS (from R11 on SYSCALL) |
 | gs:32 | `saved_kernel_rsp` | Kernel RSP for resume after blocking |
+| gs:40 | `scheduler_stack_top` | Per-CPU scheduler stack (see below) |
 
 GS_BASE points to `asm_states[core_id]`. On SYSCALL entry, `swapgs` loads GS_BASE from KERNEL_GS_BASE; on SYSRET, `swapgs` restores it. Both MSRs are set to the same value per core, so `swapgs` is effectively idempotent.
 
@@ -153,10 +155,11 @@ The pattern: set state, push to target core's run queue, IPI if remote. The IPI 
 
 ### scheduleNext — Per-Core Scheduler
 
-Each core runs its own `scheduleNext()` loop:
+Each core runs its own `scheduleNext()` loop. On x86_64 SMP, the first action is switching RSP and gs:0 to the per-CPU scheduler stack (see "Per-CPU Scheduler Stacks" below).
 
 ```
 scheduleNext():
+  0. Switch RSP + gs:0 to per-CPU scheduler stack (x86_64 SMP)
   1. Re-enqueue current process if still running
   2. Pop from local run queue → switchTo
   3. If empty: try work stealing from other cores
@@ -187,6 +190,57 @@ idle core:
 ```
 
 Work stealing uses the run queue's spinlock. Only the steal path acquires the lock — local push/pop are lockless. Stolen processes get their `assigned_core` updated so future `markReady()` calls target the new core.
+
+## Per-CPU Scheduler Stacks
+
+Each core has a dedicated scheduler stack (same size as process kernel stacks: `KERNEL_STACK_PAGES` = 8 pages = 32 KB). The BSP's scheduler stack is allocated in `percpu.init()` and each AP's in `apEntry()`, stored in `AsmState.scheduler_stack_top` (gs:40).
+
+### The Problem
+
+When a process blocks in a syscall (e.g., IPC send) and calls `scheduleNext()`, execution is still on that process's kernel stack. On SMP, another core can resume the blocked process at any time (via IPC reply → `markReady` → `switchTo` → `resume_from_kernel_frame`), which uses the **top** of the same kernel stack for its GPR frame restoration and IRETQ frame.
+
+Meanwhile, if an interrupt fires on the original core while it's still in `scheduleNext` on the process's kernel stack, the ISR entry code reads `gs:0` (kernel_stack_top — still pointing to the process's kernel stack) and pushes its frame from the top of that stack. Two cores now write to the same kernel stack simultaneously, causing silent corruption of the saved register frame.
+
+```
+Process P's kernel stack (two cores using it simultaneously):
+
+   ┌──────────────────────────────┐  ← kernel_stack_top
+   │  IRETQ frame                 │  ← Core B: resume_from_kernel_frame
+   │  GPR frame (16 regs)         │     pops from here, builds IRETQ, iretq
+   │  saved_kernel_rsp ───────────│──────────────────────────────────────
+   │  ... Zig call frames ...     │
+   │  scheduleNext frame          │  ← Core A: still running here
+   │  (growing down)              │
+   │                              │  ← Core A: ISR also pushes from top!
+   └──────────────────────────────┘
+```
+
+### The Fix
+
+`scheduleNext()` switches RSP and gs:0 to the per-CPU scheduler stack via inline assembly before calling `scheduleNextImpl()`:
+
+```zig
+pub fn scheduleNext() noreturn {
+    // Switch to per-CPU scheduler stack
+    const sched_top = percpu.asm_states[getCoreId()].scheduler_stack_top;
+    if (sched_top != 0) {
+        asm volatile (
+            \\mov %[stack], %%rsp
+            \\mov %[stack], %%gs:0
+            :
+            : [stack] "r" (sched_top),
+        );
+    }
+    scheduleNextImpl();
+}
+```
+
+This ensures:
+- The scheduler loop runs on a stack that no other core will ever touch
+- `gs:0` points to the scheduler stack, so any interrupt during scheduling uses the correct stack
+- `switchTo()` later restores `gs:0` to the process's kernel stack before resuming user mode
+
+The scheduler stack is reset to its top on every `scheduleNext()` call (since it's `noreturn`, prior frames are never needed). This is safe even for recursive calls from within `switchTo()` (e.g., when a pending operation re-blocks).
 
 ## Locking
 
@@ -229,6 +283,8 @@ No code path acquires these in reverse order. In practice, most paths only touch
 ### Early Boot Safety
 
 The spinlock debug path calls `percpu.getCoreId()` which reads the GS_BASE MSR. Before `percpu.init()` sets GS_BASE (during heap/PMM init), this would crash. A guard checks `cores_online == 0` and returns core 0 for early boot.
+
+`getCoreId()` is `noinline` to ensure consistent computation of `@intFromPtr(&asm_states[0])` across all call sites (inlining can cause mismatches with UEFI PE relocation). It includes a bounds check: if the computed core index exceeds `MAX_CORES`, it dumps diagnostic info (GS_BASE, KERNEL_GS_BASE, LAPIC ID) to serial and halts the core. Returning a wrong core ID (e.g., 0) on corruption would cause cascading cross-core state contamination.
 
 ## Inter-Processor Interrupts
 
@@ -277,12 +333,13 @@ This is a conservative approach (full TLB flush, not targeted `invlpg`). It's su
 
 | Structure | Per-Core | Total (128 cores) |
 |-----------|----------|-------------------|
-| AsmState | 40 bytes | 5 KB |
+| AsmState | 48 bytes | 6 KB |
 | PerCpu | ~520 bytes | ~65 KB |
-| Kernel stack | 16 KB | 2 MB (only for booted cores) |
+| Kernel stack | 32 KB | 4 MB (only for booted cores) |
+| Scheduler stack | 32 KB | 4 MB (only for booted cores) |
 | TSS (x86_64) | 104 bytes | 13 KB |
 
-MAX_CORES is set to 128 (`src/percpu.zig`). Static arrays (AsmState, PerCpu) live in BSS (~70 KB total) — zero cost in the binary since BSS is zero-initialized. Kernel stacks are allocated from PMM only for cores that actually boot, so on a 4-core machine only 64 KB of stack memory is used. AP trampoline uses physical 0x8000 (512 bytes, temporary).
+MAX_CORES is set to 128 (`src/percpu.zig`). Static arrays (AsmState, PerCpu) live in BSS (~71 KB total) — zero cost in the binary since BSS is zero-initialized. Kernel stacks and scheduler stacks are allocated from PMM only for cores that actually boot, so on a 4-core machine 128 KB (kernel) + 128 KB (scheduler) = 256 KB of stack memory is used. AP trampoline uses physical 0x8000 (512 bytes, temporary).
 
 ### GS_BASE Setup
 

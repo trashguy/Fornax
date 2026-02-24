@@ -4,6 +4,7 @@
 /// and namespace (mount table).
 const pmm = @import("pmm.zig");
 const klog = @import("klog.zig");
+const serial = @import("serial.zig");
 const mem = @import("mem.zig");
 const ipc = @import("ipc.zig");
 const namespace = @import("namespace.zig");
@@ -853,7 +854,17 @@ pub fn markReady(proc: *Process) void {
     }
 
     const target_core = proc.assigned_core;
-    if (target_core >= percpu.MAX_CORES) {
+    if (target_core >= percpu.cores_online or target_core >= percpu.MAX_CORES) {
+        // SMP invariant: assigned_core should be < cores_online.
+        // Fix and log if violated (stale assigned_core after work steal, etc.)
+        if (target_core >= percpu.MAX_CORES) {
+            const klog_local = @import("klog.zig");
+            klog_local.err("[markReady: bad core ");
+            klog_local.errDec(target_core);
+            klog_local.err(" for pid ");
+            klog_local.errDec(proc.pid);
+            klog_local.err("]\n");
+        }
         proc.assigned_core = 0;
         _ = percpu.percpu_array[0].run_queue.push(procIndex(proc));
         return;
@@ -931,7 +942,8 @@ pub fn killChildren(parent_pid: u32) void {
     for (&processes) |*p| {
         if (p.parent_pid) |ppid| {
             if (ppid == parent_pid and p.state != .free) {
-                // Skip threads in the same thread group — they're siblings, not children
+                // Skip threads in the same thread group — they're siblings, not children.
+                // Thread cleanup is handled by the exit group mechanism.
                 if (p.thread_group != null) continue;
                 // Recurse first (kill grandchildren before child)
                 killChildren(p.pid);
@@ -993,6 +1005,40 @@ pub fn saveCurrentContext() void {
 /// Round-robin scheduler: pick the next .ready process and jump to it.
 /// If no process is ready, halts the system.
 pub fn scheduleNext() noreturn {
+    // On x86_64 SMP, switch to a per-CPU scheduler stack to avoid sharing
+    // the process kernel stack with another core that may resume the process.
+    //
+    // Why: When a process blocks in a syscall (e.g., IPC send) and calls
+    // scheduleNext, we're still on that process's kernel stack. Another core
+    // can resume the blocked process at any time via reply → markReady →
+    // switchTo → resume_from_kernel_frame. That resume path uses the TOP
+    // of the same kernel stack (GPR frame + IRETQ frame). If an interrupt
+    // fires on THIS core while we're still on the process's kernel stack,
+    // the ISR entry would ALSO push onto the top of the process's stack
+    // (since gs:0 still points there), colliding with the other core's
+    // resume path. Switching RSP to a dedicated per-CPU stack eliminates
+    // this entire class of bugs.
+    //
+    // We also update gs:0 (kernel_stack_top) to the scheduler stack so
+    // that interrupts on this core use the correct stack.
+    switch (@import("builtin").cpu.arch) {
+        .x86_64 => {
+            const sched_top = percpu.asm_states[percpu.getCoreId()].scheduler_stack_top;
+            if (sched_top != 0) {
+                asm volatile (
+                    \\mov %[stack], %%rsp
+                    \\mov %[stack], %%gs:0
+                    :
+                    : [stack] "r" (sched_top),
+                );
+            }
+        },
+        else => {},
+    }
+    scheduleNextImpl();
+}
+
+fn scheduleNextImpl() noreturn {
     // Mark current as no longer running (if it was)
     if (current()) |proc| {
         if (proc.state == .running) {
@@ -1106,8 +1152,45 @@ extern fn resume_user_mode(rip: u64, rsp: u64, flags: u64, ret_val: u64) callcon
     else => .c,
 }) noreturn;
 
+/// Inline hex output for crash diagnostics (no locks, no .rodata access).
+pub fn inlineHex(val: u64) void {
+    serial.putChar('0');
+    serial.putChar('x');
+    const hex = "0123456789ABCDEF";
+    var i: u5 = 16;
+    while (i > 0) {
+        i -= 1;
+        serial.putChar(hex[@as(u4, @truncate(val >> (@as(u6, i) * 4)))]);
+    }
+}
+
 /// Switch to a specific process and jump to its user mode.
 fn switchTo(proc: *Process) noreturn {
+    // SMP invariant assertions — catch corrupt state before it cascades.
+    // These fire on serial (no locks needed) and halt the core.
+    if (proc.pml4 == null and proc.thread_group == null) {
+        serial.putChar('!');
+        serial.putChar('P');
+        serial.putChar('M');
+        serial.putChar('L');
+        serial.putChar('4');
+        serial.putChar(' ');
+        inlineHex(proc.pid);
+        serial.putChar('\n');
+        cpu.halt();
+    }
+    if (proc.user_rip == 0 and proc.saved_kernel_rsp == 0) {
+        serial.putChar('!');
+        serial.putChar('R');
+        serial.putChar('I');
+        serial.putChar('P');
+        serial.putChar('0');
+        serial.putChar(' ');
+        inlineHex(proc.pid);
+        serial.putChar('\n');
+        cpu.halt();
+    }
+
     setCurrentInternal(proc);
     // Note: proc.state is already .running, set by CAS in scheduleNext.
     // Increment per-core context switch counter
@@ -1185,11 +1268,19 @@ fn switchTo(proc: *Process) noreturn {
             if (result) |n| {
                 proc.syscall_ret = n;
             } else {
-                // Still no data — re-block
-                tcp.setReadWaiter(fd_entry.net_conn, @intCast(proc.pid));
+                // Still no data — set .blocked BEFORE registering waiter
+                // (same SMP race prevention as pipe_read).
                 proc.state = .blocked;
-                setCurrentInternal(null);
-                scheduleNext();
+                tcp.setReadWaiter(fd_entry.net_conn, @intCast(proc.pid));
+                // Re-check: TCP data may have arrived in the gap
+                const retry = netfs.netRead(fd_entry.net_kind, fd_entry.net_conn, dest[0..buf_size], &fd_entry.net_read_done);
+                if (retry) |n2| {
+                    proc.state = .running;
+                    proc.syscall_ret = n2;
+                } else {
+                    setCurrentInternal(null);
+                    scheduleNext();
+                }
             }
         } else {
             proc.syscall_ret = 0;
@@ -1228,11 +1319,18 @@ fn switchTo(proc: *Process) noreturn {
             if (result) |n| {
                 proc.syscall_ret = n;
             } else {
-                // Still no data — re-block (timeout or spurious wake)
-                icmp_mod.setReadWaiter(fd_entry.net_conn, @intCast(proc.pid));
+                // Still no data — set .blocked BEFORE registering waiter
+                // (same SMP race prevention as pipe_read).
                 proc.state = .blocked;
-                setCurrentInternal(null);
-                scheduleNext();
+                icmp_mod.setReadWaiter(fd_entry.net_conn, @intCast(proc.pid));
+                const retry = netfs.netRead(fd_entry.net_kind, fd_entry.net_conn, dest[0..buf_size], &fd_entry.net_read_done);
+                if (retry) |n2| {
+                    proc.state = .running;
+                    proc.syscall_ret = n2;
+                } else {
+                    setCurrentInternal(null);
+                    scheduleNext();
+                }
             }
         } else {
             proc.syscall_ret = 0;
@@ -1251,24 +1349,31 @@ fn switchTo(proc: *Process) noreturn {
     // Console read delivery — address space is active, so user pointers are valid
     if (proc.pending_op == .console_read) {
         const keyboard = @import("keyboard.zig");
-        if (keyboard.dataAvailable(proc.vt)) {
-            if (proc.ipc_recv_buf_ptr != 0 and proc.ipc_recv_buf_ptr < 0x0000_8000_0000_0000) {
-                const dest: [*]u8 = @ptrFromInt(proc.ipc_recv_buf_ptr);
-                const buf_size = proc.pending_fd; // we stash the count in pending_fd
-                const n = keyboard.read(proc.vt, dest, buf_size);
-                proc.syscall_ret = n;
-            } else {
-                proc.syscall_ret = 0;
-            }
-            keyboard.clearWaiter(proc.vt);
-        } else {
-            // Data not ready yet (spurious wake) — re-block
+        var console_data_ready = keyboard.dataAvailable(proc.vt);
+        if (!console_data_ready) {
+            // Data not ready yet (spurious wake) — set .blocked BEFORE
+            // re-checking so keyboard IRQ handler's markReady sees .blocked.
             proc.state = .blocked;
             proc.pending_op = .console_read;
-            setCurrentInternal(null);
-            // Return to scheduler by re-scanning
-            scheduleNext();
+            // Re-check: keyboard data may have arrived between our check
+            // and .blocked set (keyboard IRQ on another core).
+            console_data_ready = keyboard.dataAvailable(proc.vt);
+            if (!console_data_ready) {
+                setCurrentInternal(null);
+                scheduleNext();
+            }
+            // Data arrived during re-check — undo block
+            proc.state = .running;
         }
+        if (proc.ipc_recv_buf_ptr != 0 and proc.ipc_recv_buf_ptr < 0x0000_8000_0000_0000) {
+            const dest: [*]u8 = @ptrFromInt(proc.ipc_recv_buf_ptr);
+            const buf_size = proc.pending_fd; // we stash the count in pending_fd
+            const n = keyboard.read(proc.vt, dest, buf_size);
+            proc.syscall_ret = n;
+        } else {
+            proc.syscall_ret = 0;
+        }
+        keyboard.clearWaiter(proc.vt);
         proc.ipc_recv_buf_ptr = 0;
         proc.pending_op = .none;
         proc.pending_fd = 0;
@@ -1292,24 +1397,36 @@ fn switchTo(proc: *Process) noreturn {
             }
         };
 
-        if (pipe_mod.hasDataOrEof(fd_entry.pipe_id)) {
-            if (proc.ipc_recv_buf_ptr != 0 and proc.ipc_recv_buf_ptr < 0x0000_8000_0000_0000) {
-                const dest: [*]u8 = @ptrFromInt(proc.ipc_recv_buf_ptr);
-                const buf_size = @min(proc.syscall_ret, 4096);
-                if (pipe_mod.pipeRead(fd_entry.pipe_id, dest[0..buf_size])) |n| {
-                    proc.syscall_ret = n;
-                } else {
-                    proc.syscall_ret = 0; // EOF
-                }
+        var pipe_data_ready = pipe_mod.hasDataOrEof(fd_entry.pipe_id);
+        if (!pipe_data_ready) {
+            // No data yet — set .blocked BEFORE registering waiter to prevent
+            // the SMP race where pipeWrite finds our waiter but skips wake
+            // because state is still .running. With .blocked set first, the
+            // waker's markReady CAS(.blocked → .ready) succeeds immediately.
+            proc.state = .blocked;
+            pipe_mod.setReadWaiter(fd_entry.pipe_id, @intCast(proc.pid));
+            // Re-check: data may have arrived between our first check and
+            // waiter registration. Without this, a write that lands in the
+            // gap produces a lost wakeup (data present, waiter registered,
+            // but the waker already ran and found no waiter).
+            pipe_data_ready = pipe_mod.hasDataOrEof(fd_entry.pipe_id);
+            if (!pipe_data_ready) {
+                setCurrentInternal(null);
+                scheduleNext();
+            }
+            // Data arrived during re-check — undo block and read below
+            proc.state = .running;
+        }
+        if (proc.ipc_recv_buf_ptr != 0 and proc.ipc_recv_buf_ptr < 0x0000_8000_0000_0000) {
+            const dest: [*]u8 = @ptrFromInt(proc.ipc_recv_buf_ptr);
+            const buf_size = @min(proc.syscall_ret, 4096);
+            if (pipe_mod.pipeRead(fd_entry.pipe_id, dest[0..buf_size])) |n| {
+                proc.syscall_ret = n;
             } else {
-                proc.syscall_ret = 0;
+                proc.syscall_ret = 0; // EOF
             }
         } else {
-            // Still no data — re-block
-            pipe_mod.setReadWaiter(fd_entry.pipe_id, @intCast(proc.pid));
-            proc.state = .blocked;
-            setCurrentInternal(null);
-            scheduleNext();
+            proc.syscall_ret = 0;
         }
         proc.ipc_recv_buf_ptr = 0;
         proc.pending_op = .none;
@@ -1334,24 +1451,29 @@ fn switchTo(proc: *Process) noreturn {
             }
         };
 
-        if (pipe_mod.hasSpaceOrBroken(fd_entry.pipe_id)) {
-            if (proc.ipc_recv_buf_ptr != 0 and proc.ipc_recv_buf_ptr < 0x0000_8000_0000_0000) {
-                const src: [*]const u8 = @ptrFromInt(proc.ipc_recv_buf_ptr);
-                const n = @min(proc.syscall_ret, 4096);
-                if (pipe_mod.pipeWrite(fd_entry.pipe_id, src[0..n])) |bytes| {
-                    proc.syscall_ret = bytes;
-                } else {
-                    proc.syscall_ret = pipe_mod.EPIPE;
-                }
+        var pipe_space_ready = pipe_mod.hasSpaceOrBroken(fd_entry.pipe_id);
+        if (!pipe_space_ready) {
+            // Pipe still full — set .blocked BEFORE registering waiter
+            // (same SMP race prevention as pipe_read above).
+            proc.state = .blocked;
+            pipe_mod.setWriteWaiter(fd_entry.pipe_id, @intCast(proc.pid));
+            pipe_space_ready = pipe_mod.hasSpaceOrBroken(fd_entry.pipe_id);
+            if (!pipe_space_ready) {
+                setCurrentInternal(null);
+                scheduleNext();
+            }
+            proc.state = .running;
+        }
+        if (proc.ipc_recv_buf_ptr != 0 and proc.ipc_recv_buf_ptr < 0x0000_8000_0000_0000) {
+            const src: [*]const u8 = @ptrFromInt(proc.ipc_recv_buf_ptr);
+            const n = @min(proc.syscall_ret, 4096);
+            if (pipe_mod.pipeWrite(fd_entry.pipe_id, src[0..n])) |bytes| {
+                proc.syscall_ret = bytes;
             } else {
-                proc.syscall_ret = 0;
+                proc.syscall_ret = pipe_mod.EPIPE;
             }
         } else {
-            // Still full — re-block
-            pipe_mod.setWriteWaiter(fd_entry.pipe_id, @intCast(proc.pid));
-            proc.state = .blocked;
-            setCurrentInternal(null);
-            scheduleNext();
+            proc.syscall_ret = 0;
         }
         proc.ipc_recv_buf_ptr = 0;
         proc.pending_op = .none;
@@ -1376,20 +1498,25 @@ fn switchTo(proc: *Process) noreturn {
             }
         };
 
-        if (ether_mod.hasData(fd_entry.ether_client)) {
-            if (proc.ipc_recv_buf_ptr != 0 and proc.ipc_recv_buf_ptr < 0x0000_8000_0000_0000) {
-                const dest: [*]u8 = @ptrFromInt(proc.ipc_recv_buf_ptr);
-                const buf_size: u16 = @intCast(@min(proc.syscall_ret, ether_mod.MAX_FRAME));
-                proc.syscall_ret = ether_mod.readFrame(fd_entry.ether_client, dest[0..buf_size]);
-            } else {
-                proc.syscall_ret = 0;
-            }
-        } else {
-            // Still no data — re-block
-            ether_mod.setReadWaiter(fd_entry.ether_client, @intCast(proc.pid));
+        var ether_data_ready = ether_mod.hasData(fd_entry.ether_client);
+        if (!ether_data_ready) {
+            // No data — set .blocked BEFORE registering waiter
+            // (same SMP race prevention as pipe_read).
             proc.state = .blocked;
-            setCurrentInternal(null);
-            scheduleNext();
+            ether_mod.setReadWaiter(fd_entry.ether_client, @intCast(proc.pid));
+            ether_data_ready = ether_mod.hasData(fd_entry.ether_client);
+            if (!ether_data_ready) {
+                setCurrentInternal(null);
+                scheduleNext();
+            }
+            proc.state = .running;
+        }
+        if (proc.ipc_recv_buf_ptr != 0 and proc.ipc_recv_buf_ptr < 0x0000_8000_0000_0000) {
+            const dest: [*]u8 = @ptrFromInt(proc.ipc_recv_buf_ptr);
+            const buf_size: u16 = @intCast(@min(proc.syscall_ret, ether_mod.MAX_FRAME));
+            proc.syscall_ret = ether_mod.readFrame(fd_entry.ether_client, dest[0..buf_size]);
+        } else {
+            proc.syscall_ret = 0;
         }
         proc.ipc_recv_buf_ptr = 0;
         proc.pending_op = .none;
@@ -1421,7 +1548,9 @@ fn switchTo(proc: *Process) noreturn {
         // Resume from blocked syscall: the process's kernel stack still has
         // the full GPR frame from entry.S. Write the return value into the
         // saved return register slot and jump to the restore/return path.
-        const frame: [*]u64 = @ptrFromInt(proc.saved_kernel_rsp);
+        const saved_ksp = proc.saved_kernel_rsp;
+        const frame: [*]u64 = @ptrFromInt(saved_ksp);
+
         frame[RET_SLOT] = proc.syscall_ret;
         proc.saved_kernel_rsp = 0;
         syscall_entry.resume_from_kernel_frame(@intFromPtr(frame));

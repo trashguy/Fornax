@@ -79,11 +79,13 @@ pub fn pipeRead(id: u8, dest: []u8) ?usize {
     }
     p.count -= n;
 
-    // Wake all blocked writers — they'll retry in switchTo
+    // Wake all writers — markReady's CAS handles any state safely.
+    // No .blocked guard: the process may still be .running in switchTo's
+    // re-block path (between hasSpaceOrBroken check and .blocked set).
     for (&p.write_waiters) |*slot| {
         if (slot.*) |wpid| {
             if (process.getByPid(wpid)) |wproc| {
-                if (wproc.state == .blocked) process.markReady(wproc);
+                process.markReady(wproc);
             }
             slot.* = null;
         }
@@ -118,11 +120,13 @@ pub fn pipeWrite(id: u8, src: []const u8) ?usize {
     }
     p.count += n;
 
-    // Wake all blocked readers — they'll get data in switchTo
+    // Wake all readers — no .blocked guard needed, markReady's CAS
+    // safely handles .running (switchTo re-block window), .ready (no-op),
+    // and .blocked (normal wake) states.
     for (&p.read_waiters) |*slot| {
         if (slot.*) |rpid| {
             if (process.getByPid(rpid)) |rproc| {
-                if (rproc.state == .blocked) process.markReady(rproc);
+                process.markReady(rproc);
             }
             slot.* = null;
         }
@@ -161,11 +165,12 @@ pub fn closeReadEnd(id: u8) void {
     if (!p.active) return;
     if (p.readers > 0) p.readers -= 1;
 
-    // Wake all blocked writers — they'll get EPIPE on retry in switchTo
+    // Wake all writers — they'll get EPIPE on retry in switchTo.
+    // No .blocked guard: markReady CAS handles any state safely.
     for (&p.write_waiters) |*slot| {
         if (slot.*) |wpid| {
             if (process.getByPid(wpid)) |wproc| {
-                if (wproc.state == .blocked) process.markReady(wproc);
+                process.markReady(wproc);
             }
             slot.* = null;
         }
@@ -184,11 +189,12 @@ pub fn closeWriteEnd(id: u8) void {
     if (!p.active) return;
     if (p.writers > 0) p.writers -= 1;
 
-    // Wake all blocked readers — they'll get EOF in switchTo
+    // Wake all readers — they'll get EOF in switchTo.
+    // No .blocked guard: markReady CAS handles any state safely.
     for (&p.read_waiters) |*slot| {
         if (slot.*) |rpid| {
             if (process.getByPid(rpid)) |rproc| {
-                if (rproc.state == .blocked) process.markReady(rproc);
+                process.markReady(rproc);
             }
             slot.* = null;
         }

@@ -12,9 +12,13 @@
 ///   ps [-a]               List containers (running only, or all with -a)
 ///   images                List available images
 ///   inspect <name|id>     Show container details
+///   pull <image[:tag]>    Pull image from OCI registry
 ///   import <tar> <name>   Import a tarball as an image
 ///   cp <src> <cntr:dest>  Copy file into container rootfs
 const fx = @import("fornax");
+const fnx_options = @import("fnx_options");
+const has_tls = fnx_options.has_tls;
+const tls = if (has_tls) @import("tls") else struct {};
 
 const out = fx.io.Writer.stdout;
 const stderr = fx.io.Writer.stderr;
@@ -28,6 +32,134 @@ var argv_buf: [4096]u8 = undefined;
 /// Static buffer for general file I/O.
 var io_buf: [4096]u8 linksection(".bss") = undefined;
 var cf_source_buf: [4096]u8 linksection(".bss") = undefined;
+
+// --- Pull command BSS buffers ---
+const http = fx.http;
+const deflate = fx.deflate;
+const tar = fx.tar;
+const json = fx.json;
+
+var sliding_window: [32768]u8 linksection(".bss") = undefined;
+var inflate_out_buf: [8192]u8 linksection(".bss") = undefined;
+var manifest_buf: [32768]u8 linksection(".bss") = undefined;
+var header_buf: [8192]u8 linksection(".bss") = undefined;
+var pull_io_buf: [4096]u8 linksection(".bss") = undefined;
+var path_scratch: [512]u8 linksection(".bss") = undefined;
+
+// --- Auth token BSS buffers ---
+var auth_token_buf: [4096]u8 linksection(".bss") = undefined;
+var auth_token_len: usize = 0;
+var auth_value_buf: [4112]u8 linksection(".bss") = undefined; // "Bearer " + token
+var auth_value_len: usize = 0;
+var combined_hdrs: [12]http.HeaderEntry = undefined;
+
+// --- TLS support (conditionally compiled via -Dtls=true) ---
+const TlsSupport = if (has_tls) struct {
+    const T = @import("tls");
+
+    pub var conn: T.TlsConnection linksection(".bss") = undefined;
+    pub var pem_buf: [262144]u8 linksection(".bss") = undefined; // 256 KB for PEM file
+    pub var ta_data: [131072]u8 linksection(".bss") = undefined; // 128 KB for DN + key data
+    pub var anchors: [200]T.TrustAnchor linksection(".bss") = undefined;
+    pub var anchor_count: usize = 0;
+    pub var initialized: bool = false;
+    pub var server_name_buf: [256]u8 = undefined;
+
+    /// Load trust anchors from /etc/ssl/certs/ca-certificates.crt.
+    pub fn init() bool {
+        if (initialized) return anchor_count > 0;
+        initialized = true;
+
+        const fd = fx.open("/etc/ssl/certs/ca-certificates.crt");
+        if (fd < 0) {
+            stderr.puts("fnx: cannot open /etc/ssl/certs/ca-certificates.crt\n");
+            return false;
+        }
+
+        // Read PEM file
+        var pem_len: usize = 0;
+        while (pem_len < pem_buf.len) {
+            const n = fx.read(fd, pem_buf[pem_len..]);
+            if (n <= 0) break;
+            pem_len += @intCast(n);
+        }
+        _ = fx.close(fd);
+
+        if (pem_len == 0) {
+            stderr.puts("fnx: empty CA bundle\n");
+            return false;
+        }
+
+        // Parse PEM → trust anchors
+        var der_buf: [32768]u8 = undefined; // scratch for DER decoding
+        if (T.loadTrustAnchors(
+            pem_buf[0..pem_len],
+            &der_buf,
+            &ta_data,
+            &anchors,
+        )) |count| {
+            anchor_count = count;
+            stderr.print("fnx: loaded {d} CA certificates\n", .{count});
+            return true;
+        }
+
+        stderr.puts("fnx: failed to parse CA certificates\n");
+        return false;
+    }
+
+    /// http.RequestOptions on_connect callback for TLS.
+    pub fn onConnect(data_fd: i32, host: []const u8) ?http.IoFns {
+        // Copy host to null-terminated buffer for BearSSL SNI
+        if (host.len >= server_name_buf.len) return null;
+        @memcpy(server_name_buf[0..host.len], host);
+        server_name_buf[host.len] = 0;
+        const sname: [*:0]const u8 = @ptrCast(&server_name_buf);
+
+        if (!conn.initInPlace(
+            data_fd,
+            sname,
+            &anchors,
+            anchor_count,
+        )) {
+            stderr.puts("fnx: TLS handshake failed\n");
+            return null;
+        }
+
+        return conn.ioFns();
+    }
+} else struct {};
+
+/// Build RequestOptions with TLS on_connect callback if the ImageRef needs TLS.
+fn makeOpts(extra_headers: []const http.HeaderEntry, use_tls_for_request: bool) http.RequestOptions {
+    var count: usize = 0;
+
+    // Add auth header if token is present
+    if (auth_token_len > 0) {
+        combined_hdrs[count] = .{ .name = "Authorization", .value = auth_value_buf[0..auth_value_len] };
+        count += 1;
+    }
+
+    // Copy caller's extra headers
+    for (extra_headers) |h| {
+        if (count < combined_hdrs.len) {
+            combined_hdrs[count] = h;
+            count += 1;
+        }
+    }
+
+    var opts = http.RequestOptions{ .headers = combined_hdrs[0..count] };
+    if (has_tls and use_tls_for_request) {
+        opts.on_connect = &TlsSupport.onConnect;
+    }
+    return opts;
+}
+
+/// Initialize TLS if needed for this image ref. Returns true if ready (or not needed).
+fn ensureTls(ref: *const ImageRef) bool {
+    if (!has_tls) return !ref.use_tls;
+    if (!ref.use_tls) return true;
+    return TlsSupport.init();
+}
 
 export fn _start() noreturn {
     const argc = fx.getArgc();
@@ -105,6 +237,12 @@ export fn _start() noreturn {
             fx.exit(1);
         }
         cmdBuild(argc, argv);
+    } else if (strEql(cmd_cstr, "pull")) {
+        if (argc < 3) {
+            stderr.puts("Usage: fnx pull <image[:tag]>\n");
+            fx.exit(1);
+        }
+        cmdPull(cstr(argv[2]));
     } else if (strEql(cmd_cstr, "--help") or strEql(cmd_cstr, "help")) {
         usage();
         fx.exit(0);
@@ -132,6 +270,7 @@ fn usage() void {
     out.puts("  images                  List images\n");
     out.puts("  inspect <name|id>       Show container status\n");
     out.puts("\nImage management:\n");
+    out.puts("  pull <image[:tag]>      Pull image from OCI registry\n");
     out.puts("  import <tar> <name>     Import tarball as image\n");
     out.puts("  cp <src> <cntr:dest>    Copy file into container\n");
 }
@@ -1056,6 +1195,1100 @@ fn cmdBuild(argc: u64, argv: []const [*:0]const u8) void {
 
     out.puts("Successfully built image '");
     out.puts(tag_name);
+    out.puts("'\n");
+}
+
+// --- OCI Registry Pull ---
+
+const MAX_LAYERS = 32;
+
+const ImageRef = struct {
+    registry_host: []const u8, // "10.0.2.2" or "myregistry.local"
+    registry_port: u16, // 5000
+    name: []const u8, // "library/alpine" or "myapp"
+    tag: []const u8, // "latest"
+    use_tls: bool, // true for HTTPS registries (port 443)
+};
+
+/// Parse image reference: [registry:port/]name[:tag]
+/// Heuristic: if part before first '/' contains ':' or '.', it's a registry host.
+fn parseImageRef(ref: []const u8) ImageRef {
+    const S = struct {
+        var library_name_buf: [256]u8 = undefined;
+    };
+
+    // Split on ':'  for tag (last colon after last '/')
+    var tag_start: usize = ref.len;
+    var last_slash: usize = ref.len;
+    for (0..ref.len) |i| {
+        if (ref[i] == '/') last_slash = i;
+    }
+    // Look for ':' after last slash (that's the tag separator)
+    var i: usize = if (last_slash < ref.len) last_slash else 0;
+    while (i < ref.len) : (i += 1) {
+        if (ref[i] == ':') tag_start = i;
+    }
+
+    const tag = if (tag_start < ref.len) ref[tag_start + 1 ..] else "latest";
+    const name_with_registry = ref[0..tag_start];
+
+    // Find first '/'
+    var first_slash: usize = name_with_registry.len;
+    for (0..name_with_registry.len) |j| {
+        if (name_with_registry[j] == '/') {
+            first_slash = j;
+            break;
+        }
+    }
+
+    // Check if part before first '/' looks like a registry (contains ':' or '.')
+    if (first_slash < name_with_registry.len) {
+        const maybe_host = name_with_registry[0..first_slash];
+        var has_registry_chars = false;
+        for (maybe_host) |c| {
+            if (c == ':' or c == '.') {
+                has_registry_chars = true;
+                break;
+            }
+        }
+        if (has_registry_chars) {
+            // Split registry host:port
+            var colon: usize = maybe_host.len;
+            for (0..maybe_host.len) |k| {
+                if (maybe_host[k] == ':') {
+                    colon = k;
+                    break;
+                }
+            }
+            var host = maybe_host[0..colon];
+            var port: u16 = if (colon < maybe_host.len) parsePort(maybe_host[colon + 1 ..]) else 443;
+            if (port == 0) port = 443;
+            var name = name_with_registry[first_slash + 1 ..];
+
+            // Docker Hub shorthand: docker.io → registry-1.docker.io
+            if (sliceEql(host, "docker.io") or sliceEql(host, "index.docker.io")) {
+                host = "registry-1.docker.io";
+                port = 443;
+
+                // Add "library/" prefix for single-name images (e.g. "alpine" → "library/alpine")
+                var has_slash_in_name = false;
+                for (name) |c| {
+                    if (c == '/') {
+                        has_slash_in_name = true;
+                        break;
+                    }
+                }
+                if (!has_slash_in_name and name.len > 0) {
+                    const prefix = "library/";
+                    if (prefix.len + name.len <= S.library_name_buf.len) {
+                        @memcpy(S.library_name_buf[0..prefix.len], prefix);
+                        @memcpy(S.library_name_buf[prefix.len..][0..name.len], name);
+                        name = S.library_name_buf[0 .. prefix.len + name.len];
+                    }
+                }
+            }
+
+            return .{
+                .registry_host = host,
+                .registry_port = port,
+                .name = name,
+                .tag = tag,
+                .use_tls = port == 443,
+            };
+        }
+    }
+
+    // No registry specified — use default, add "library/" prefix if no slash
+    const name = if (first_slash >= name_with_registry.len) name_with_registry else name_with_registry;
+    return .{
+        .registry_host = "10.0.2.2",
+        .registry_port = 5000,
+        .name = name,
+        .tag = tag,
+        .use_tls = false,
+    };
+}
+
+fn parsePort(s: []const u8) u16 {
+    var val: u16 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') break;
+        val = val * 10 + @as(u16, c - '0');
+    }
+    return if (val == 0) 5000 else val;
+}
+
+/// Build API path: /v2/<name>/<suffix> into buf
+fn buildApiPath(buf: []u8, name: []const u8, suffix: []const u8) []const u8 {
+    var pos: usize = 0;
+    const prefix = "/v2/";
+    @memcpy(buf[pos..][0..prefix.len], prefix);
+    pos += prefix.len;
+    @memcpy(buf[pos..][0..name.len], name);
+    pos += name.len;
+    @memcpy(buf[pos..][0..suffix.len], suffix);
+    pos += suffix.len;
+    return buf[0..pos];
+}
+
+/// Build registry host:port string for display
+fn fmtRegistry(buf: []u8, host: []const u8, port: u16) []const u8 {
+    var pos: usize = 0;
+    @memcpy(buf[pos..][0..host.len], host);
+    pos += host.len;
+    buf[pos] = ':';
+    pos += 1;
+    pos += fmtU16(buf[pos..], port);
+    return buf[0..pos];
+}
+
+fn fmtU16(buf: []u8, val: u16) usize {
+    var tmp: [5]u8 = undefined;
+    var len: usize = 0;
+    var v = val;
+    if (v == 0) {
+        buf[0] = '0';
+        return 1;
+    }
+    while (v > 0) : (v /= 10) {
+        tmp[len] = @intCast('0' + (v % 10));
+        len += 1;
+    }
+    for (0..len) |fi| {
+        buf[fi] = tmp[len - 1 - fi];
+    }
+    return len;
+}
+
+/// HTTP reader context for streaming through deflate.
+const HttpReaderCtx = struct {
+    resp: *http.Response,
+};
+
+fn httpReadFn(ctx_ptr: *anyopaque, buf: []u8) isize {
+    const ctx: *HttpReaderCtx = @ptrCast(@alignCast(ctx_ptr));
+    return ctx.resp.readBody(buf);
+}
+
+/// Gzip reader that decompresses HTTP body into tar blocks.
+const HttpGzipReader = struct {
+    bit_reader: deflate.BitReader,
+    inflater: deflate.Inflater,
+
+    fn init(ctx: *HttpReaderCtx) HttpGzipReader {
+        return .{
+            .bit_reader = deflate.BitReader.init(&httpReadFn, @ptrCast(ctx), &pull_io_buf),
+            .inflater = deflate.Inflater.init(&sliding_window, &inflate_out_buf),
+        };
+    }
+
+    fn skipGzipHeader(self: *HttpGzipReader) bool {
+        return deflate.skipGzipHeader(&self.bit_reader);
+    }
+
+    fn readBlock(self: *HttpGzipReader, dest: *[tar.HEADER_SIZE]u8) bool {
+        var pos: usize = 0;
+        while (pos < tar.HEADER_SIZE) {
+            if (self.inflater.done) break;
+            const n = self.inflater.readBytes(&self.bit_reader, dest[pos..]);
+            if (n == 0) break;
+            pos += n;
+        }
+        if (pos == 0) return false;
+        if (pos < tar.HEADER_SIZE) {
+            @memset(dest[pos..], 0);
+        }
+        return true;
+    }
+};
+
+/// Extract a gzipped tar layer from an HTTP response into rootfs_path.
+fn extractLayer(resp: *http.Response, rootfs_path: []const u8) bool {
+    var ctx = HttpReaderCtx{ .resp = resp };
+    var gz = HttpGzipReader.init(&ctx);
+
+    if (!gz.skipGzipHeader()) {
+        stderr.puts("fnx: invalid gzip header in layer\n");
+        return false;
+    }
+
+    var zero_blocks: u32 = 0;
+    var header: [tar.HEADER_SIZE]u8 = undefined;
+    while (true) {
+        if (!gz.readBlock(&header)) break;
+        if (tar.isZeroBlock(&header)) {
+            zero_blocks += 1;
+            if (zero_blocks >= 2) break;
+            continue;
+        }
+        zero_blocks = 0;
+        extractEntry(&header, &gz, rootfs_path);
+    }
+    return true;
+}
+
+fn extractEntry(header_raw: *[tar.HEADER_SIZE]u8, gz: *HttpGzipReader, rootfs_path: []const u8) void {
+    const hdr = tar.Header{ .raw = header_raw };
+
+    if (!hdr.validateChecksum()) return;
+
+    const name = hdr.name(&path_scratch);
+    const size = hdr.size();
+    const mode_val = hdr.mode();
+    const uid_val = hdr.uid();
+    const gid_val = hdr.gid();
+    const typeflag = hdr.typeflag();
+
+    if (!tar.isSafePath(name)) {
+        if (size > 0 and (typeflag == '0' or typeflag == 0)) {
+            skipGzBlocks(gz, size);
+        }
+        return;
+    }
+
+    // Build full path: rootfs_path + "/" + name
+    var full_path: [512]u8 = undefined;
+    var fpos: usize = 0;
+    @memcpy(full_path[fpos..][0..rootfs_path.len], rootfs_path);
+    fpos += rootfs_path.len;
+    full_path[fpos] = '/';
+    fpos += 1;
+    // Strip leading "./" from tar names
+    var clean_name = name;
+    if (clean_name.len >= 2 and clean_name[0] == '.' and clean_name[1] == '/') {
+        clean_name = clean_name[2..];
+    }
+    // Strip leading "/"
+    while (clean_name.len > 0 and clean_name[0] == '/') {
+        clean_name = clean_name[1..];
+    }
+    if (clean_name.len == 0) {
+        if (size > 0 and (typeflag == '0' or typeflag == 0)) {
+            skipGzBlocks(gz, size);
+        }
+        return;
+    }
+    if (fpos + clean_name.len > full_path.len) {
+        if (size > 0 and (typeflag == '0' or typeflag == 0)) {
+            skipGzBlocks(gz, size);
+        }
+        return;
+    }
+    @memcpy(full_path[fpos..][0..clean_name.len], clean_name);
+    fpos += clean_name.len;
+    const fpath = full_path[0..fpos];
+
+    if (typeflag == '5') {
+        // Directory
+        pullEnsureParentDirs(fpath);
+        var n_len = fpath.len;
+        while (n_len > 0 and fpath[n_len - 1] == '/') n_len -= 1;
+        if (n_len > 0) {
+            _ = fx.mkdir(fpath[0..n_len]);
+        }
+    } else if (typeflag == '0' or typeflag == 0) {
+        // Regular file
+        pullEnsureParentDirs(fpath);
+        const out_fd = fx.create(fpath, 0);
+        if (out_fd < 0) {
+            skipGzBlocks(gz, size);
+            return;
+        }
+
+        var remaining: u64 = size;
+        const blocks = (size + tar.HEADER_SIZE - 1) / tar.HEADER_SIZE;
+        var block_i: u64 = 0;
+        while (block_i < blocks) : (block_i += 1) {
+            var block: [tar.HEADER_SIZE]u8 = undefined;
+            if (!gz.readBlock(&block)) break;
+            const to_write: usize = @intCast(@min(remaining, tar.HEADER_SIZE));
+            _ = fx.syscall.write(out_fd, block[0..to_write]);
+            remaining -= to_write;
+        }
+
+        _ = fx.wstat(out_fd, @intCast(mode_val & 0o7777), @intCast(uid_val), @intCast(gid_val), fx.WSTAT_MODE | fx.WSTAT_UID | fx.WSTAT_GID);
+        _ = fx.close(out_fd);
+    } else {
+        // Symlinks, hardlinks, etc — skip data
+        if (size > 0) {
+            skipGzBlocks(gz, size);
+        }
+    }
+}
+
+fn skipGzBlocks(gz: *HttpGzipReader, size: u64) void {
+    const blocks = (size + tar.HEADER_SIZE - 1) / tar.HEADER_SIZE;
+    var block: [tar.HEADER_SIZE]u8 = undefined;
+    var bi: u64 = 0;
+    while (bi < blocks) : (bi += 1) {
+        _ = gz.readBlock(&block);
+    }
+}
+
+fn pullEnsureParentDirs(fpath: []const u8) void {
+    var dir_buf: [512]u8 = undefined;
+    var pi: usize = 0;
+    while (pi < fpath.len) : (pi += 1) {
+        if (fpath[pi] == '/' and pi > 0) {
+            if (pi <= dir_buf.len) {
+                @memcpy(dir_buf[0..pi], fpath[0..pi]);
+                _ = fx.mkdir(dir_buf[0..pi]);
+            }
+        }
+    }
+}
+
+/// Fetch a blob and read body into buf. Returns slice or null.
+fn fetchBlob(host: []const u8, port: u16, name: []const u8, digest: []const u8, buf: []u8, use_tls_flag: bool) ?[]const u8 {
+    // Build path: /v2/<name>/blobs/<digest>
+    var api_path: [512]u8 = undefined;
+    var pos: usize = 0;
+    const p1 = "/v2/";
+    @memcpy(api_path[pos..][0..p1.len], p1);
+    pos += p1.len;
+    @memcpy(api_path[pos..][0..name.len], name);
+    pos += name.len;
+    const p2 = "/blobs/";
+    @memcpy(api_path[pos..][0..p2.len], p2);
+    pos += p2.len;
+    @memcpy(api_path[pos..][0..digest.len], digest);
+    pos += digest.len;
+
+    const accept_hdr = [_]http.HeaderEntry{
+        .{ .name = "Accept", .value = "*/*" },
+    };
+    const opts = makeOpts(&accept_hdr, use_tls_flag);
+
+    var result = http.request(host, port, "GET", api_path[0..pos], opts, &header_buf) orelse return null;
+    defer result.conn.close();
+
+    if (result.resp.status_code < 200 or result.resp.status_code >= 300) return null;
+
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = result.resp.readBody(buf[total..]);
+        if (n <= 0) break;
+        total += @intCast(n);
+    }
+    if (total == 0) return null;
+    return buf[0..total];
+}
+
+/// Parse OCI config JSON to extract Entrypoint + Cmd.
+/// Returns command string or null.
+fn parseOciConfig(config_json: []const u8, cmd_buf: []u8) ?[]const u8 {
+    var parser = json.Parser.init(config_json);
+
+    // Find top-level "config" key
+    var tok = parser.next();
+    if (tok.kind != .object_begin) return null;
+    if (!parser.findKey("config")) return null;
+
+    // Now inside config object
+    tok = parser.next();
+    if (tok.kind != .object_begin) return null;
+
+    // Try Entrypoint first, then Cmd
+    var cmd_pos: usize = 0;
+
+    // Look for Entrypoint
+    const saved_pos = parser.pos;
+    if (parser.findKey("Entrypoint")) {
+        cmd_pos = parseJsonArrayConcat(&parser, cmd_buf, cmd_pos);
+    }
+
+    // Look for Cmd (reset won't work simply, but Cmd often follows Entrypoint)
+    // Try from current position
+    if (parser.findKey("Cmd")) {
+        cmd_pos = parseJsonArrayConcat(&parser, cmd_buf, cmd_pos);
+    } else {
+        // Restart from saved position to find Cmd before Entrypoint
+        parser.pos = saved_pos;
+        if (parser.findKey("Cmd")) {
+            cmd_pos = parseJsonArrayConcat(&parser, cmd_buf, cmd_pos);
+        }
+    }
+
+    if (cmd_pos == 0) return null;
+    return cmd_buf[0..cmd_pos];
+}
+
+fn skipWs(parser: *json.Parser) void {
+    while (parser.pos < parser.src.len) {
+        switch (parser.src[parser.pos]) {
+            ' ', '\t', '\n', '\r' => parser.pos += 1,
+            else => return,
+        }
+    }
+}
+
+/// Parse a JSON array of strings and concatenate with spaces.
+fn parseJsonArrayConcat(parser: *json.Parser, buf: []u8, start_pos: usize) usize {
+    var pos = start_pos;
+    const tok = parser.next();
+    if (tok.kind == .null_val) return pos;
+    if (tok.kind != .array_begin) return pos;
+
+    var first = pos == 0;
+    while (true) {
+        skipWs(parser);
+        if (parser.pos < parser.src.len and parser.src[parser.pos] == ']') {
+            parser.pos += 1;
+            break;
+        }
+        if (!first and pos > start_pos) {
+            // Comma between elements
+            const comma = parser.next();
+            if (comma.kind != .comma) break;
+        }
+        const elem = parser.next();
+        if (elem.kind != .string) break;
+
+        if (pos > 0 and !first) {
+            if (pos < buf.len) {
+                buf[pos] = ' ';
+                pos += 1;
+            }
+        }
+        first = false;
+        const val = elem.str_value;
+        if (pos + val.len <= buf.len) {
+            @memcpy(buf[pos..][0..val.len], val);
+            pos += val.len;
+        }
+    }
+    return pos;
+}
+
+/// Accept header for manifest requests — covers all common formats.
+const MANIFEST_ACCEPT = "application/vnd.docker.distribution.manifest.v2+json, " ++
+    "application/vnd.oci.image.manifest.v1+json, " ++
+    "application/vnd.docker.distribution.manifest.list.v2+json, " ++
+    "application/vnd.oci.image.index.v1+json";
+
+/// Fetch manifest, resolving manifest lists to the amd64/linux platform manifest.
+/// Returns the manifest JSON as a slice into `buf`. Exits on error.
+fn fetchManifest(api_path_buf: []u8, ref: ImageRef, buf: []u8) []const u8 {
+    const data = fetchManifestOnce(api_path_buf, ref.registry_host, ref.registry_port, ref.name, ref.tag, buf, ref.use_tls);
+
+    // Check if this is a manifest list (contains "manifests" array)
+    if (isManifestList(data)) {
+        // Find amd64/linux platform digest
+        const digest = findPlatformDigest(data) orelse {
+            stderr.puts("fnx: no amd64/linux manifest in manifest list\n");
+            fx.exit(1);
+        };
+
+        stderr.puts("Resolving manifest list -> amd64/linux\n");
+
+        // Re-fetch using the platform-specific digest
+        return fetchManifestOnce(api_path_buf, ref.registry_host, ref.registry_port, ref.name, digest, buf, ref.use_tls);
+    }
+
+    return data;
+}
+
+fn fetchManifestOnce(api_path_buf: []u8, host: []const u8, port: u16, name: []const u8, reference: []const u8, buf: []u8, use_tls_flag: bool) []const u8 {
+    var suf_buf: [256]u8 = undefined;
+    var spos: usize = 0;
+    const s1 = "/manifests/";
+    @memcpy(suf_buf[spos..][0..s1.len], s1);
+    spos += s1.len;
+    @memcpy(suf_buf[spos..][0..reference.len], reference);
+    spos += reference.len;
+
+    const path = buildApiPath(api_path_buf, name, suf_buf[0..spos]);
+
+    const accept_hdr = [_]http.HeaderEntry{
+        .{ .name = "Accept", .value = MANIFEST_ACCEPT },
+    };
+    const opts = makeOpts(&accept_hdr, use_tls_flag);
+
+    var result = http.request(host, port, "GET", path, opts, &header_buf) orelse {
+        stderr.puts("fnx: failed to fetch manifest\n");
+        fx.exit(1);
+    };
+
+    if (result.resp.status_code == 404) {
+        result.conn.close();
+        stderr.puts("fnx: image not found: ");
+        stderr.puts(name);
+        stderr.puts(":");
+        stderr.puts(reference);
+        stderr.puts("\n");
+        fx.exit(1);
+    }
+    if (result.resp.status_code < 200 or result.resp.status_code >= 300) {
+        result.conn.close();
+        stderr.puts("fnx: registry returned status ");
+        stderr.print("{d}", .{result.resp.status_code});
+        stderr.puts(" for manifest\n");
+        fx.exit(1);
+    }
+
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = result.resp.readBody(buf[total..]);
+        if (n <= 0) break;
+        total += @intCast(n);
+    }
+    result.conn.close();
+
+    if (total == 0) {
+        stderr.puts("fnx: empty manifest\n");
+        fx.exit(1);
+    }
+    return buf[0..total];
+}
+
+/// Check if JSON contains a "manifests" key (= manifest list / OCI index).
+fn isManifestList(data: []const u8) bool {
+    // Quick substring scan — "manifests" only appears in list/index types
+    var i: usize = 0;
+    const needle = "\"manifests\"";
+    while (i + needle.len <= data.len) : (i += 1) {
+        if (data[i] == needle[0]) {
+            var match = true;
+            for (0..needle.len) |j| {
+                if (data[i + j] != needle[j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return true;
+        }
+    }
+    return false;
+}
+
+/// Find the digest of the amd64/linux platform in a manifest list.
+/// Returns the digest string (slice into manifest data) or null.
+/// Uses two passes per entry to handle arbitrary key order.
+fn findPlatformDigest(data: []const u8) ?[]const u8 {
+    var parser = json.Parser.init(data);
+    var tok = parser.next();
+    if (tok.kind != .object_begin) return null;
+
+    if (!parser.findKey("manifests")) return null;
+    tok = parser.next();
+    if (tok.kind != .array_begin) return null;
+
+    // Iterate manifest entries
+    var first = true;
+    while (true) {
+        skipWs(&parser);
+        if (parser.pos < parser.src.len and parser.src[parser.pos] == ']') break;
+
+        if (!first) {
+            const comma = parser.next();
+            if (comma.kind != .comma) break;
+        }
+        first = false;
+
+        // Each entry is an object — save position for two-pass scan
+        tok = parser.next();
+        if (tok.kind != .object_begin) break;
+
+        const entry_start = parser.pos;
+
+        // Pass 1: check platform
+        var is_amd64_linux = false;
+        if (parser.findKey("platform")) {
+            const ptok = parser.next();
+            if (ptok.kind == .object_begin) {
+                var arch_ok = false;
+                var os_ok = false;
+
+                // Scan platform object keys in any order
+                const plat_start = parser.pos;
+                if (parser.findKey("architecture")) {
+                    if (parser.expectString()) |arch| {
+                        arch_ok = sliceEql(arch, "amd64");
+                    }
+                }
+                if (parser.findKey("os")) {
+                    if (parser.expectString()) |os_val| {
+                        os_ok = sliceEql(os_val, "linux");
+                    }
+                }
+                if (!os_ok) {
+                    // os might have been before architecture — retry
+                    parser.pos = plat_start;
+                    if (parser.findKey("os")) {
+                        if (parser.expectString()) |os_val| {
+                            os_ok = sliceEql(os_val, "linux");
+                        }
+                    }
+                }
+                is_amd64_linux = arch_ok and os_ok;
+            }
+        }
+
+        // Rewind to entry start for pass 2 (find digest) or to skip
+        parser.pos = entry_start;
+
+        var entry_digest: ?[]const u8 = null;
+        if (is_amd64_linux) {
+            if (parser.findKey("digest")) {
+                entry_digest = parser.expectString();
+            }
+            // Rewind again to skip the full entry
+            parser.pos = entry_start;
+        }
+
+        // Skip the entire entry object
+        // We're positioned just after '{', need to skip to matching '}'
+        var depth: u32 = 1;
+        while (depth > 0) {
+            const t = parser.next();
+            if (t.kind == .object_begin) depth += 1;
+            if (t.kind == .object_end) depth -= 1;
+            if (t.kind == .eof) return null;
+        }
+
+        if (is_amd64_linux) {
+            if (entry_digest) |d| return d;
+        }
+    }
+    return null;
+}
+
+/// Obtain a Bearer token for registry authentication.
+/// Performs the OAuth2 token exchange: GET /v2/ → 401 + WWW-Authenticate → fetch token.
+/// Returns true if a token was successfully obtained and stored.
+fn obtainAuthToken(ref: *const ImageRef) bool {
+    // Legacy wrapper — calls fetchAuthToken after doing its own /v2/ request.
+    // Prefer calling fetchAuthToken directly with the WWW-Authenticate header
+    // from an existing 401 response to avoid redundant connections.
+    const opts = makeOpts(&.{}, ref.use_tls);
+    var result = http.request(ref.registry_host, ref.registry_port, "GET", "/v2/", opts, &header_buf) orelse return false;
+    if (result.resp.status_code != 401) {
+        result.conn.close();
+        return false;
+    }
+    const www_auth = result.resp.getHeader("WWW-Authenticate") orelse {
+        result.conn.close();
+        return false;
+    };
+    var www_auth_copy: [512]u8 = undefined;
+    if (www_auth.len > www_auth_copy.len) {
+        result.conn.close();
+        return false;
+    }
+    @memcpy(www_auth_copy[0..www_auth.len], www_auth);
+    result.resp.drainBody();
+    result.conn.close();
+    return fetchAuthToken(www_auth_copy[0..www_auth.len], ref);
+}
+
+/// Fetch a Bearer token using a pre-parsed WWW-Authenticate header value.
+/// This avoids the redundant /v2/ request that obtainAuthToken makes.
+fn fetchAuthToken(www_auth: []const u8, ref: *const ImageRef) bool {
+    // Parse challenge
+    var challenge: http.AuthChallenge = undefined;
+    if (!http.parseWwwAuthenticate(www_auth, &challenge)) {
+        stderr.puts("auth: failed to parse WWW-Authenticate\n");
+        return false;
+    }
+
+    // Copy realm/service to stable buffers
+    var realm_buf: [512]u8 = undefined;
+    var service_buf: [128]u8 = undefined;
+    if (challenge.realm.len > realm_buf.len or challenge.service.len > service_buf.len) return false;
+    @memcpy(realm_buf[0..challenge.realm.len], challenge.realm);
+    const realm = realm_buf[0..challenge.realm.len];
+    @memcpy(service_buf[0..challenge.service.len], challenge.service);
+    const service = service_buf[0..challenge.service.len];
+
+    // Build token URL from realm
+    var url_path_buf: [512]u8 = undefined;
+    const parts = http.parseUrl(realm, &url_path_buf) orelse return false;
+
+    // Build query string: ?service=<service>&scope=repository:<name>:pull
+    var query_buf: [512]u8 = undefined;
+    var qpos: usize = 0;
+
+    if (parts.path.len > query_buf.len) return false;
+    @memcpy(query_buf[0..parts.path.len], parts.path);
+    qpos = parts.path.len;
+    query_buf[qpos] = '?';
+    qpos += 1;
+
+    const svc_key = "service=";
+    @memcpy(query_buf[qpos..][0..svc_key.len], svc_key);
+    qpos += svc_key.len;
+    const enc_svc = http.percentEncode(service, query_buf[qpos..]);
+    qpos += enc_svc.len;
+
+    const scope_key = "&scope=repository%3A";
+    @memcpy(query_buf[qpos..][0..scope_key.len], scope_key);
+    qpos += scope_key.len;
+    const enc_name = http.percentEncode(ref.name, query_buf[qpos..]);
+    qpos += enc_name.len;
+    const scope_suf = "%3Apull";
+    @memcpy(query_buf[qpos..][0..scope_suf.len], scope_suf);
+    qpos += scope_suf.len;
+
+    const token_path = query_buf[0..qpos];
+
+    // Fetch token from auth endpoint (may be different host)
+    var token_use_tls = parts.tls;
+    if (!has_tls) token_use_tls = false;
+    if (has_tls and token_use_tls and !TlsSupport.initialized) {
+        _ = TlsSupport.init();
+    }
+
+    const token_opts = makeOpts(&.{}, token_use_tls);
+    var token_result = http.request(parts.host, parts.port, "GET", token_path, token_opts, &header_buf) orelse return false;
+
+    if (token_result.resp.status_code < 200 or token_result.resp.status_code >= 300) {
+        token_result.conn.close();
+        return false;
+    }
+
+    // Read token response body
+    var token_body: [8192]u8 = undefined;
+    var total: usize = 0;
+    while (total < token_body.len) {
+        const n = token_result.resp.readBody(token_body[total..]);
+        if (n <= 0) break;
+        total += @intCast(n);
+    }
+    token_result.conn.close();
+
+    if (total == 0) return false;
+
+    // Parse JSON response for "token" or "access_token" field
+    var parser = json.Parser.init(token_body[0..total]);
+    const tok = parser.next();
+    if (tok.kind != .object_begin) return false;
+
+    while (true) {
+        const key_tok = parser.next();
+        if (key_tok.kind == .object_end or key_tok.kind == .eof) break;
+        if (key_tok.kind == .comma) continue;
+
+        if (key_tok.kind == .string) {
+            const is_token_key = sliceEql(key_tok.str_value, "token") or sliceEql(key_tok.str_value, "access_token");
+            const colon = parser.next();
+            if (colon.kind != .colon) break;
+
+            if (is_token_key) {
+                if (parser.expectString()) |token_val| {
+                    if (token_val.len > auth_token_buf.len) return false;
+                    @memcpy(auth_token_buf[0..token_val.len], token_val);
+                    auth_token_len = token_val.len;
+
+                    const prefix = "Bearer ";
+                    @memcpy(auth_value_buf[0..prefix.len], prefix);
+                    @memcpy(auth_value_buf[prefix.len..][0..token_val.len], token_val);
+                    auth_value_len = prefix.len + token_val.len;
+
+                    return true;
+                }
+                return false;
+            } else {
+                const val = parser.next();
+                if (val.kind == .object_begin) {
+                    var depth: u32 = 1;
+                    while (depth > 0) {
+                        const t = parser.next();
+                        if (t.kind == .object_begin) depth += 1;
+                        if (t.kind == .object_end) depth -= 1;
+                        if (t.kind == .eof) break;
+                    }
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+fn cmdPull(image_str: []const u8) void {
+    const ref = parseImageRef(image_str);
+
+    // Display what we're pulling
+    stderr.puts("Pulling ");
+    stderr.puts(ref.name);
+    stderr.puts(":");
+    stderr.puts(ref.tag);
+    stderr.puts(" from ");
+    var reg_buf: [128]u8 = undefined;
+    stderr.puts(fmtRegistry(&reg_buf, ref.registry_host, ref.registry_port));
+    if (ref.use_tls) stderr.puts(" (TLS)");
+    stderr.puts("\n");
+
+    // Initialize TLS if this registry uses HTTPS
+    if (!ensureTls(&ref)) {
+        stderr.puts("fnx: TLS required but not available or CA bundle missing\n");
+        fx.exit(1);
+    }
+
+    // Step 1: Check registry connectivity — GET /v2/ (with auth if needed)
+    {
+        const opts = makeOpts(&.{}, ref.use_tls);
+        var result = http.request(ref.registry_host, ref.registry_port, "GET", "/v2/", opts, &header_buf) orelse {
+            stderr.puts("fnx: cannot connect to registry ");
+            stderr.puts(fmtRegistry(&reg_buf, ref.registry_host, ref.registry_port));
+            stderr.puts("\n");
+            fx.exit(1);
+        };
+
+        if (result.resp.status_code == 401) {
+            // Extract WWW-Authenticate before closing (points into header_buf)
+            const www_auth = result.resp.getHeader("WWW-Authenticate") orelse {
+                stderr.puts("fnx: 401 but no WWW-Authenticate header\n");
+                result.conn.close();
+                fx.exit(1);
+            };
+            // Copy to stable buffer before closing connection
+            var www_auth_copy: [512]u8 = undefined;
+            if (www_auth.len > www_auth_copy.len) {
+                result.conn.close();
+                fx.exit(1);
+            }
+            @memcpy(www_auth_copy[0..www_auth.len], www_auth);
+            result.resp.drainBody();
+            result.conn.close();
+
+            // Fetch auth token using the challenge from the 401
+            stderr.puts("Authenticating...\n");
+            if (!fetchAuthToken(www_auth_copy[0..www_auth.len], &ref)) {
+                stderr.puts("fnx: registry requires auth but token fetch failed\n");
+                fx.exit(1);
+            }
+        } else {
+            result.conn.close();
+            if (result.resp.status_code != 200) {
+                stderr.puts("fnx: registry returned status ");
+                stderr.print("{d}", .{result.resp.status_code});
+                stderr.puts("\n");
+                fx.exit(1);
+            }
+        }
+    }
+
+    // Step 2: Fetch manifest (handles manifest lists / OCI indexes)
+    var api_path: [512]u8 = undefined;
+    var manifest_data: []const u8 = undefined;
+    {
+        manifest_data = fetchManifest(&api_path, ref, manifest_buf[0..]);
+    }
+
+    // Step 3: Parse manifest — extract config digest + layer digests
+    var config_digest: []const u8 = "";
+    var layer_digests: [MAX_LAYERS][]const u8 = undefined;
+    var layer_count: usize = 0;
+    {
+        var parser = json.Parser.init(manifest_data);
+        var tok = parser.next();
+        if (tok.kind != .object_begin) {
+            stderr.puts("fnx: invalid manifest format\n");
+            fx.exit(1);
+        }
+
+        // Find "config" -> "digest"
+        if (parser.findKey("config")) {
+            tok = parser.next();
+            if (tok.kind == .object_begin) {
+                if (parser.findKey("digest")) {
+                    if (parser.expectString()) |d| {
+                        config_digest = d;
+                    }
+                }
+                // Skip rest of config object
+                // Find closing brace
+                var depth: u32 = 1;
+                while (depth > 0) {
+                    const t = parser.next();
+                    if (t.kind == .object_begin) depth += 1;
+                    if (t.kind == .object_end) depth -= 1;
+                    if (t.kind == .eof) break;
+                }
+            }
+        }
+
+        // Find "layers" array
+        if (parser.findKey("layers")) {
+            tok = parser.next();
+            if (tok.kind == .array_begin) {
+                while (layer_count < MAX_LAYERS) {
+                    skipWs(&parser);
+                    if (parser.pos < parser.src.len and parser.src[parser.pos] == ']') {
+                        parser.pos += 1;
+                        break;
+                    }
+                    if (layer_count > 0) {
+                        const comma = parser.next();
+                        if (comma.kind != .comma) break;
+                    }
+                    // Each layer is an object with "digest"
+                    tok = parser.next();
+                    if (tok.kind != .object_begin) break;
+                    if (parser.findKey("digest")) {
+                        if (parser.expectString()) |d| {
+                            layer_digests[layer_count] = d;
+                            layer_count += 1;
+                        }
+                    }
+                    // Skip rest of layer object
+                    var depth: u32 = 1;
+                    while (depth > 0) {
+                        const t = parser.next();
+                        if (t.kind == .object_begin) depth += 1;
+                        if (t.kind == .object_end) depth -= 1;
+                        if (t.kind == .eof) break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (layer_count == 0) {
+        stderr.puts("fnx: no layers in manifest\n");
+        fx.exit(1);
+    }
+
+    // Step 4: Create image directory
+    // Determine short name for directory (last component of name)
+    var short_name = ref.name;
+    for (0..ref.name.len) |ni| {
+        if (ref.name[ni] == '/') {
+            if (ni + 1 < ref.name.len) short_name = ref.name[ni + 1 ..];
+        }
+    }
+    // Include tag if not "latest"
+    var img_name_buf: [128]u8 = undefined;
+    var img_name: []const u8 = undefined;
+    if (!sliceEql(ref.tag, "latest")) {
+        var np: usize = 0;
+        @memcpy(img_name_buf[np..][0..short_name.len], short_name);
+        np += short_name.len;
+        img_name_buf[np] = ':';
+        np += 1;
+        @memcpy(img_name_buf[np..][0..ref.tag.len], ref.tag);
+        np += ref.tag.len;
+        img_name = img_name_buf[0..np];
+    } else {
+        img_name = short_name;
+    }
+
+    _ = fx.mkdir("/var/lib");
+    _ = fx.mkdir("/var/lib/fnx");
+    _ = fx.mkdir("/var/lib/fnx/images");
+
+    var img_dir: [256]u8 = undefined;
+    const img_dir_len = fmtPath(&img_dir, "/var/lib/fnx/images/", img_name, "");
+    _ = fx.mkdir(img_dir[0..img_dir_len]);
+
+    var rootfs: [256]u8 = undefined;
+    const rootfs_len = fmtPath(&rootfs, img_dir[0..img_dir_len], "/rootfs", "");
+    _ = fx.mkdir(rootfs[0..rootfs_len]);
+    const rootfs_path = rootfs[0..rootfs_len];
+
+    // Step 5: Save manifest
+    {
+        var mpath: [256]u8 = undefined;
+        const mlen = fmtPath(&mpath, img_dir[0..img_dir_len], "/manifest.json", "");
+        const mfd = fx.create(mpath[0..mlen], 0);
+        if (mfd >= 0) {
+            _ = fx.write(mfd, manifest_data);
+            _ = fx.close(mfd);
+        }
+    }
+
+    // Step 6: Fetch and parse config blob
+    if (config_digest.len > 0) {
+        // Use elf_buf as temp for config JSON (it's large enough)
+        if (fetchBlob(ref.registry_host, ref.registry_port, ref.name, config_digest, &elf_buf, ref.use_tls)) |config_json| {
+            var cmd_buf: [256]u8 = undefined;
+            if (parseOciConfig(config_json, &cmd_buf)) |cmd_str| {
+                var cpath: [256]u8 = undefined;
+                const clen = fmtPath(&cpath, img_dir[0..img_dir_len], "/config", "");
+                const cfd = fx.create(cpath[0..clen], 0);
+                if (cfd >= 0) {
+                    _ = fx.write(cfd, cmd_str);
+                    _ = fx.close(cfd);
+                }
+            }
+
+            // Check if this is a linux image (write compat file)
+            // OCI config has "os" field at top level
+            var os_parser = json.Parser.init(config_json);
+            const otok = os_parser.next();
+            if (otok.kind == .object_begin) {
+                if (os_parser.findKey("os")) {
+                    if (os_parser.expectString()) |os_str| {
+                        if (sliceEql(os_str, "linux")) {
+                            var compat_path: [256]u8 = undefined;
+                            const cplen = fmtPath(&compat_path, img_dir[0..img_dir_len], "/compat", "");
+                            const cpfd = fx.create(compat_path[0..cplen], 0);
+                            if (cpfd >= 0) {
+                                _ = fx.write(cpfd, "linux");
+                                _ = fx.close(cpfd);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 7: Download and extract layers
+    for (0..layer_count) |li| {
+        stderr.print("Layer {d}/{d}: ", .{ li + 1, layer_count });
+
+        // Short digest for display
+        const digest = layer_digests[li];
+        if (digest.len > 19) {
+            stderr.puts(digest[7..19]); // skip "sha256:" prefix, show 12 chars
+        } else {
+            stderr.puts(digest);
+        }
+        stderr.puts("...");
+
+        // Build blob path
+        var blob_path: [512]u8 = undefined;
+        var bpos: usize = 0;
+        const bp1 = "/v2/";
+        @memcpy(blob_path[bpos..][0..bp1.len], bp1);
+        bpos += bp1.len;
+        @memcpy(blob_path[bpos..][0..ref.name.len], ref.name);
+        bpos += ref.name.len;
+        const bp2 = "/blobs/";
+        @memcpy(blob_path[bpos..][0..bp2.len], bp2);
+        bpos += bp2.len;
+        @memcpy(blob_path[bpos..][0..digest.len], digest);
+        bpos += digest.len;
+
+        const accept_hdr = [_]http.HeaderEntry{
+            .{ .name = "Accept", .value = "application/vnd.docker.image.rootfs.diff.tar.gzip" },
+        };
+        const opts = makeOpts(&accept_hdr, ref.use_tls);
+
+        var result = http.request(ref.registry_host, ref.registry_port, "GET", blob_path[0..bpos], opts, &header_buf) orelse {
+            stderr.puts(" failed to connect\n");
+            fx.exit(1);
+        };
+
+        if (result.resp.status_code < 200 or result.resp.status_code >= 300) {
+            result.conn.close();
+            stderr.print(" HTTP {d}\n", .{result.resp.status_code});
+            fx.exit(1);
+        }
+
+        // Stream: HTTP body → gzip → tar → extract
+        if (extractLayer(&result.resp, rootfs_path)) {
+            stderr.puts(" done\n");
+        } else {
+            stderr.puts(" extraction failed\n");
+        }
+        result.conn.close();
+    }
+
+    out.puts("Successfully pulled '");
+    out.puts(img_name);
     out.puts("'\n");
 }
 

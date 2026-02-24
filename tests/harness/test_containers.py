@@ -1,4 +1,4 @@
-"""Container tests: native, Linux compat, build, networking."""
+"""Container tests: native, Linux compat, build, networking, OCI pull."""
 import time
 
 from .config import log_pass, log_fail
@@ -139,4 +139,111 @@ def test_container_networking(qemu):
         return True
     except (TimeoutError, RuntimeError) as e:
         log_fail("test_container_networking", str(e))
+        return False
+
+
+def test_container_pull(qemu):
+    """Test fnx pull from an OCI registry (mock served on host port 5000).
+
+    The mock OCI registry is started by the test harness before this test
+    runs. It serves a tiny image with one layer containing /hello.txt.
+    After pulling, we verify the image appears in 'fnx images' and that
+    the extracted rootfs contains the expected file.
+    """
+    try:
+        # Pull the test image (10.0.2.2:5000 is QEMU host gateway)
+        qemu.send_line("fnx pull testimg; echo __PULL1__")
+        qemu.expect(r"Successfully pulled", timeout=60)
+        qemu.expect(r"__PULL1__", timeout=10)
+
+        # Verify image appears in list
+        qemu.send_line("fnx images; echo __PULL2__")
+        qemu.expect(r"testimg", timeout=10)
+        qemu.expect(r"__PULL2__", timeout=10)
+
+        # Verify extracted rootfs has our test file
+        qemu.send_line("cat /var/lib/fnx/images/testimg/rootfs/hello.txt; echo __PULL3__")
+        qemu.expect(r"oci-pull-test-ok", timeout=10)
+        qemu.expect(r"__PULL3__", timeout=10)
+
+        # Verify config was extracted
+        qemu.send_line("cat /var/lib/fnx/images/testimg/config; echo __PULL4__")
+        qemu.expect(r"/bin/sh", timeout=10)
+        qemu.expect(r"__PULL4__", timeout=10)
+
+        log_pass("test_container_pull")
+        return True
+    except (TimeoutError, RuntimeError) as e:
+        log_fail("test_container_pull", str(e))
+        return False
+
+
+def test_container_pull_real(qemu):
+    """Test fnx pull alpine from a real Docker registry:2 on host port 5001.
+
+    Requires Docker on the host (skipped if unavailable). The harness starts
+    registry:2, pushes alpine:latest to it, then Fornax pulls via the
+    explicit registry syntax. Verifies alpine's /etc/alpine-release exists.
+    """
+    try:
+        # Pull alpine with explicit registry:port (5001 = real Docker registry)
+        qemu.send_line("fnx pull 10.0.2.2:5001/alpine; echo __RPULL1__")
+        qemu.expect(r"Successfully pulled", timeout=120)
+        qemu.expect(r"__RPULL1__", timeout=10)
+
+        # Verify image appears
+        qemu.send_line("fnx images; echo __RPULL2__")
+        qemu.expect(r"alpine", timeout=10)
+        qemu.expect(r"__RPULL2__", timeout=10)
+
+        # Verify alpine rootfs has expected files
+        qemu.send_line("cat /var/lib/fnx/images/alpine/rootfs/etc/alpine-release; echo __RPULL3__")
+        qemu.expect(r"\d+\.\d+", timeout=10)  # e.g. "3.21.3"
+        qemu.expect(r"__RPULL3__", timeout=10)
+
+        # Verify compat file says linux
+        qemu.send_line("cat /var/lib/fnx/images/alpine/compat; echo __RPULL4__")
+        qemu.expect(r"linux", timeout=10)
+        qemu.expect(r"__RPULL4__", timeout=10)
+
+        log_pass("test_container_pull_real")
+        return True
+    except (TimeoutError, RuntimeError) as e:
+        log_fail("test_container_pull_real", str(e))
+        return False
+
+
+def test_container_pull_dockerhub(qemu):
+    """Test fnx pull alpine directly from Docker Hub over TLS.
+
+    Requires internet access (QEMU SLIRP provides NAT) and a TLS-enabled
+    build (-Dtls=true). Tests the full Docker Hub auth flow:
+    401 → WWW-Authenticate → anonymous Bearer token → authenticated pull.
+    Verifies alpine's /etc/alpine-release exists after extraction.
+    """
+    try:
+        # Pull alpine from Docker Hub (TLS + Bearer token auth)
+        qemu.send_line("fnx pull docker.io/alpine; echo __DHPULL1__")
+        qemu.expect(r"Successfully pulled", timeout=180)
+        qemu.expect(r"__DHPULL1__", timeout=10)
+
+        # Verify image appears in list
+        qemu.send_line("fnx images; echo __DHPULL2__")
+        qemu.expect(r"alpine", timeout=10)
+        qemu.expect(r"__DHPULL2__", timeout=10)
+
+        # Verify alpine rootfs has expected files
+        qemu.send_line("cat /var/lib/fnx/images/alpine/rootfs/etc/alpine-release; echo __DHPULL3__")
+        qemu.expect(r"\d+\.\d+", timeout=10)  # e.g. "3.21.3"
+        qemu.expect(r"__DHPULL3__", timeout=10)
+
+        # Verify compat file says linux (alpine is a Linux image)
+        qemu.send_line("cat /var/lib/fnx/images/alpine/compat; echo __DHPULL4__")
+        qemu.expect(r"linux", timeout=10)
+        qemu.expect(r"__DHPULL4__", timeout=10)
+
+        log_pass("test_container_pull_dockerhub")
+        return True
+    except (TimeoutError, RuntimeError) as e:
+        log_fail("test_container_pull_dockerhub", str(e))
         return False

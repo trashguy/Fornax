@@ -6,18 +6,16 @@ import subprocess
 from .config import PROJECT_DIR, log
 
 
-def create_test_disk(tmpdir, rootfs_dir, disk_size_mb=8192):
+def create_test_disk(tmpdir, rootfs_dir, disk_size_mb=256):
     """Create a fresh test disk image with GPT + fxfs."""
     disk_img = os.path.join(tmpdir, "test-disk.img")
     mkgpt = os.path.join(PROJECT_DIR, "zig-out", "bin", "mkgpt")
     mkfxfs = os.path.join(PROJECT_DIR, "zig-out", "bin", "mkfxfs")
 
-    # Create blank disk (non-sparse, fully allocated)
+    # Create blank disk (sparse — only metadata uses real space)
     log("DISK", f"Creating {disk_size_mb} MB test disk...")
     with open(disk_img, "wb") as f:
-        chunk = b"\0" * (1024 * 1024)
-        for _ in range(disk_size_mb):
-            f.write(chunk)
+        f.truncate(disk_size_mb * 1024 * 1024)
 
     # GPT partition table
     log("DISK", "Creating GPT partition table...")

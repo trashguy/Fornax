@@ -319,10 +319,10 @@ fn pushToRingVt(input: *VtInput, c: u8) void {
 fn wakeWaiterVt(input: *VtInput) void {
     const pid = input.waiting_pid orelse return;
     if (process.getByPid(pid)) |proc| {
-        if (proc.state == .blocked) {
-            process.markReady(proc);
-            proc.pending_op = .console_read;
-        }
+        // No .blocked guard: markReady CAS handles any state safely.
+        // The process may be .running in switchTo's console_read re-block path.
+        proc.pending_op = .console_read;
+        process.markReady(proc);
     }
 }
 

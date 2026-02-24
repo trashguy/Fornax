@@ -21,6 +21,7 @@
 .set PERCPU_UIP, 16   # saved_user_rip
 .set PERCPU_UFL, 24   # saved_user_rflags
 .set PERCPU_KSR, 32   # saved_kernel_rsp
+.set PERCPU_SST, 40   # scheduler_stack_top
 
 .text
 

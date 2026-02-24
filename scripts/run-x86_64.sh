@@ -92,6 +92,12 @@ root:x:0:root
 users:x:100:
 GROUP
 
+# Stage CA certificates for TLS
+if [ -f "$PROJECT_DIR/etc/ssl/certs/ca-certificates.crt" ]; then
+    mkdir -p "$ROOTFS_DIR/etc/ssl/certs"
+    cp "$PROJECT_DIR/etc/ssl/certs/ca-certificates.crt" "$ROOTFS_DIR/etc/ssl/certs/ca-certificates.crt"
+fi
+
 # Create default /etc/crontab
 cat > "$ROOTFS_DIR/etc/crontab" << 'CRONTAB'
 # /etc/crontab - Fornax cron table

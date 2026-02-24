@@ -1,5 +1,5 @@
 """Package manager (fay) tests."""
-from .config import log_pass, log_fail
+from .config import log_pass, log_fail, log, YELLOW
 
 
 def test_fay_install_xxd(qemu):
@@ -14,6 +14,11 @@ def test_fay_install_xxd(qemu):
         qemu.send_line("fay install xxd")
         qemu.expect(r"xxd 1\.0\.0-1 installed", timeout=60)
         qemu.expect(r"root@fornax[#$] ", timeout=10)
+
+        # Verify the binary was written correctly
+        qemu.send_line("wc -c < /bin/xxd; echo __WC__")
+        qemu.expect(r"\d+", timeout=10)
+        qemu.expect(r"__WC__", timeout=5)
 
         # Test xxd works: write a file, then xxd it
         qemu.send_cmd("echo hello > /tmp/xxd_test.txt")

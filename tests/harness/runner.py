@@ -19,8 +19,18 @@ from .test_containers import (
     test_container_linux_compat,
     test_container_build,
     test_container_networking,
+    test_container_pull,
+    test_container_pull_real,
+    test_container_pull_dockerhub,
 )
+from .test_smp import test_smp_stress
 from .test_packages import test_fay_install_xxd
+from .registry import (
+    start_mock_registry,
+    docker_available,
+    start_real_registry,
+    stop_real_registry,
+)
 
 
 # ── Test session runner ──────────────────────────────────────────────
@@ -126,6 +136,10 @@ def run_test_session(session_name, ovmf, build_flags, tests, tmpdir,
     finally:
         if qemu:
             qemu.stop()
+        # Clean up disk image to free space for subsequent sessions
+        import shutil
+        if os.path.isdir(disk_subdir):
+            shutil.rmtree(disk_subdir, ignore_errors=True)
 
     log("SESSION", f"{session_name}: {passed} passed, {failed} failed\n")
     return passed, failed, full_log
@@ -139,11 +153,15 @@ ALL_TESTS = {
     "time": test_time_subsystem,
     "networking": test_host_networking,
     "filesystem": test_filesystem,
+    "smp": test_smp_stress,
     "fay": test_fay_install_xxd,
     "container_native": test_container_native,
     "container_linux": test_container_linux_compat,
     "container_build": test_container_build,
     "container_net": test_container_networking,
+    "container_pull": test_container_pull,
+    "container_pull_real": test_container_pull_real,
+    "container_pull_dockerhub": test_container_pull_dockerhub,
     "shutdown": test_shutdown,
 }
 
@@ -153,7 +171,7 @@ def parse_args():
     import argparse
     p = argparse.ArgumentParser(description="Fornax integration tests")
     p.add_argument("--filter", "-f", help="Comma-separated test names or substring (e.g. 'container' or 'container_native,container_net')")
-    p.add_argument("--session", "-s", choices=["core", "posix", "all"], default="all", help="Which session to run (default: all)")
+    p.add_argument("--session", "-s", choices=["core", "posix", "tls", "all"], default="all", help="Which session to run (default: all)")
     p.add_argument("--smp", type=int, default=4, help="Number of QEMU vCPUs (default: 4)")
     p.add_argument("--list", "-l", action="store_true", help="List available test names and exit")
     return p.parse_args()
@@ -210,16 +228,17 @@ def main():
             return 1
         log("SETUP", f"OVMF: {ovmf}")
 
-        # 2. Check port 8000 availability
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            sock.bind(("0.0.0.0", 8000))
-            sock.close()
-        except OSError:
-            print(f"{RED}Error: Port 8000 is already in use.{RESET}", file=sys.stderr)
-            print("Stop the process using port 8000 and try again.", file=sys.stderr)
-            return 1
+        # 2. Check port availability (8000 for packages, 5000 for OCI registry)
+        for check_port in [8000, 5000]:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("0.0.0.0", check_port))
+                sock.close()
+            except OSError:
+                print(f"{RED}Error: Port {check_port} is already in use.{RESET}", file=sys.stderr)
+                print(f"Stop the process using port {check_port} and try again.", file=sys.stderr)
+                return 1
 
         def stage_linux_elf(rootfs_dir):
             """Stage minimal Linux hello ELF for container compat test."""
@@ -233,36 +252,68 @@ def main():
 
         with tempfile.TemporaryDirectory(prefix="fornax-test-") as tmpdir:
 
-            core_tests = filter_tests([
+            # Start mock OCI registry (always available)
+            registry_server = start_mock_registry(port=5000)
+            log("REGISTRY", "Mock OCI registry on :5000")
+
+            # Start real registry if podman/docker is available
+            has_real_registry = False
+            if docker_available():
+                log("REGISTRY", "Container engine detected, starting real registry:2...")
+                has_real_registry = start_real_registry(port=5001)
+                if not has_real_registry:
+                    log("REGISTRY", "Real registry setup failed, skipping real pull test", YELLOW)
+            else:
+                log("REGISTRY", "No container engine (podman/docker), skipping real pull test", YELLOW)
+
+            core_tests_list = [
                 test_boot_login,
                 test_basic_commands,
                 test_time_subsystem,
                 test_host_networking,
                 test_filesystem,
+                test_smp_stress,
                 test_container_native,
                 test_container_linux_compat,
                 test_container_build,
                 test_container_networking,
-                test_shutdown,
-            ], cli.filter)
+                test_container_pull,
+            ]
+            if has_real_registry:
+                core_tests_list.append(test_container_pull_real)
+            core_tests_list.append(test_shutdown)
+            core_tests = filter_tests(core_tests_list, cli.filter)
 
-            posix_tests = filter_tests([
+            posix_tests_list = [
                 test_boot_login,
                 test_basic_commands,
                 test_time_subsystem,
                 test_host_networking,
                 test_fay_install_xxd,
                 test_filesystem,
+                test_smp_stress,
                 test_container_native,
                 test_container_linux_compat,
                 test_container_build,
                 test_container_networking,
+                test_container_pull,
+            ]
+            if has_real_registry:
+                posix_tests_list.append(test_container_pull_real)
+            posix_tests_list.append(test_shutdown)
+            posix_tests = filter_tests(posix_tests_list, cli.filter)
+
+            tls_tests_list = [
+                test_boot_login,
+                test_container_pull_dockerhub,
                 test_shutdown,
-            ], cli.filter)
+            ]
+            tls_tests = filter_tests(tls_tests_list, cli.filter)
 
             smp = cli.smp
             run_core = cli.session in ("core", "all")
             run_posix = cli.session in ("posix", "all")
+            run_tls = cli.session in ("tls", "all")
 
             # ── Session 1: Core + Containers (no POSIX) ──────────
             if run_core:
@@ -324,12 +375,40 @@ def main():
                 if http_server:
                     http_server.shutdown()
 
+            if total_failed > 0:
+                log("SESSION", "Previous session failed, skipping TLS session", RED)
+                run_tls = False
+
+            if run_tls:
+                # ── Session 3: TLS + Containers (Docker Hub pull) ─
+                p, f, log_data = run_test_session(
+                    "tls",
+                    ovmf,
+                    ["-Dcontainers=true", "-Dtls=true"],
+                    tls_tests,
+                    tmpdir,
+                    pre_disk_hook=stage_linux_elf,
+                    smp=smp, memory="4G",
+                )
+                total_passed += p
+                total_failed += f
+                if log_data:
+                    last_log = log_data
+
+            registry_server.shutdown()
+
     except KeyboardInterrupt:
         print(f"\n{YELLOW}Interrupted.{RESET}", file=sys.stderr)
         total_failed += 1
     except Exception as e:
         print(f"{RED}Unexpected error: {e}{RESET}", file=sys.stderr)
         total_failed += 1
+    finally:
+        # Always clean up Docker registry container if we started one
+        try:
+            stop_real_registry()
+        except Exception:
+            pass
 
     # Summary
     print(file=sys.stderr)

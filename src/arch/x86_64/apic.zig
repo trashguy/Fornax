@@ -394,6 +394,15 @@ export fn apEntry() callconv(.{ .x86_64_sysv = .{} }) noreturn {
     cpu.wrmsr(0xC0000102, @intFromPtr(&percpu.asm_states[core_id]));
     cpu.wrmsr(0xC0000101, @intFromPtr(&percpu.asm_states[core_id]));
 
+    // Allocate per-CPU scheduler stack for this AP.
+    // Must match KERNEL_STACK_PAGES for deep scheduler call chains.
+    const paging = @import("paging.zig");
+    if (pmm.allocContiguousPages(process.KERNEL_STACK_PAGES)) |phys_base| {
+        const virt_base = @intFromPtr(paging.physPtr(phys_base));
+        const virt_top = virt_base + mem.PAGE_SIZE * process.KERNEL_STACK_PAGES;
+        percpu.asm_states[core_id].scheduler_stack_top = virt_top;
+    }
+
     // Signal BSP that this AP is up
     @atomicStore(bool, &ap_boot_done, true, .release);
 

@@ -345,18 +345,17 @@ fn cacheInsert(name: []const u8, ip: [4]u8, ttl: u32) void {
     entry.valid = true;
 }
 
+/// No .blocked guard: markReady CAS handles any state safely.
 fn wakeWaiter(is_error: bool) void {
     if (pending_waiter_pid == 0) return;
     const pid = pending_waiter_pid;
     pending_waiter_pid = 0;
 
     if (process.getByPid(pid)) |proc| {
-        if (proc.state == .blocked) {
-            if (is_error) {
-                proc.syscall_ret = 0xFFFF_FFFF_FFFF_FFF6; // -ENOENT equivalent
-            }
-            process.markReady(proc);
+        if (is_error) {
+            proc.syscall_ret = 0xFFFF_FFFF_FFFF_FFF6; // -ENOENT equivalent
         }
+        process.markReady(proc);
     }
 }
 

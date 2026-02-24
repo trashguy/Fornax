@@ -19,5 +19,10 @@
             .hash = "N-V-__8AABn_QQCbGtT3cv8EOQGM7nIyJ4swuCXLJuT_xHYB",
             .lazy = true,
         },
+        .bearssl = .{
+            .url = "https://bearssl.org/bearssl-0.6.tar.gz",
+            .hash = "N-V-__8AAP0mNAAkyiY2ykjGvFxPCz3MG1hET12zva5TtOmP",
+            .lazy = true,
+        },
     },
 }

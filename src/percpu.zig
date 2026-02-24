@@ -29,6 +29,9 @@ pub const AsmState = extern struct {
     saved_user_rflags: u64 = 0, // gs:24
     /// Saved kernel RSP after building GPR frame (for resume_from_kernel_frame).
     saved_kernel_rsp: u64 = 0, // gs:32
+    /// Per-CPU scheduler stack top. Used by scheduleNext to avoid sharing
+    /// the process kernel stack with another core that resumes the process.
+    scheduler_stack_top: u64 = 0, // gs:40
 };
 
 // Offsets for use in entry.S (verified by comptime assertions below).
@@ -44,7 +47,7 @@ comptime {
     if (@offsetOf(AsmState, "saved_user_rip") != ASM_SAVED_USER_RIP) @compileError("AsmState offset mismatch: saved_user_rip");
     if (@offsetOf(AsmState, "saved_user_rflags") != ASM_SAVED_USER_RFLAGS) @compileError("AsmState offset mismatch: saved_user_rflags");
     if (@offsetOf(AsmState, "saved_kernel_rsp") != ASM_SAVED_KERNEL_RSP) @compileError("AsmState offset mismatch: saved_kernel_rsp");
-    if (@sizeOf(AsmState) != 40) @compileError("AsmState size mismatch");
+    if (@sizeOf(AsmState) != 48) @compileError("AsmState size mismatch");
 }
 
 /// Per-core AsmState array. Index by core_id. GS_BASE points into this.
@@ -65,6 +68,15 @@ pub const RunQueue = struct {
     pub fn push(self: *RunQueue, pid: u16) bool {
         self.lock.lock();
         defer self.lock.unlock();
+        // SMP invariant: only valid process indices should be pushed.
+        const process_mod = @import("process.zig");
+        if (pid >= process_mod.MAX_PROCESSES) {
+            const klog_mod = @import("klog.zig");
+            klog_mod.err("[RQ push: bad idx ");
+            klog_mod.errDec(pid);
+            klog_mod.err("]\n");
+            return false;
+        }
         if (self.len >= RUN_QUEUE_SIZE) return false;
         self.entries[self.tail % RUN_QUEUE_SIZE] = pid;
         self.tail +%= 1;
@@ -177,11 +189,30 @@ pub fn init() void {
         cpu.wrmsr(MSR_GS_BASE, @intFromPtr(&asm_states[0]));
     }
 
+    // Allocate per-CPU scheduler stack for BSP.
+    // scheduleNext runs on this stack to avoid sharing the process kernel
+    // stack with another core that may resume the blocked process.
+    // Must match KERNEL_STACK_PAGES since the scheduler calls deep functions
+    // (switchTo, net.poll, stealHalf, etc.).
+    const process = @import("process.zig");
+    const pmm = @import("pmm.zig");
+    const mem_mod = @import("mem.zig");
+    const paging = switch (builtin.cpu.arch) {
+        .x86_64 => @import("arch/x86_64/paging.zig"),
+        .riscv64 => @import("arch/riscv64/paging.zig"),
+        else => unreachable,
+    };
+    if (pmm.allocContiguousPages(process.KERNEL_STACK_PAGES)) |phys_base| {
+        const virt_base = @intFromPtr(paging.physPtr(phys_base));
+        const virt_top = virt_base + process.KERNEL_STACK_PAGES * mem_mod.PAGE_SIZE;
+        asm_states[0].scheduler_stack_top = virt_top;
+    }
+
     klog.info("Per-CPU init: BSP (core 0) online.\n");
 }
 
 /// Get the current core's ID.
-pub inline fn getCoreId() u8 {
+pub noinline fn getCoreId() u8 {
     if (builtin.cpu.arch == .x86_64) {
         // Before percpu.init() sets GS_BASE, we're on BSP (core 0)
         if (cores_online == 0) return 0;
@@ -191,7 +222,38 @@ pub inline fn getCoreId() u8 {
         const gs_base = cpu.rdmsr(0xC0000101);
         const base = @intFromPtr(&asm_states[0]);
         const offset = gs_base -% base;
-        return @intCast(offset / @sizeOf(AsmState));
+        const idx = offset / @sizeOf(AsmState);
+        if (idx >= MAX_CORES) {
+            // GS_BASE is corrupt — dump diagnostic and halt this core.
+            // Returning a wrong core ID causes cascading cross-core corruption
+            // (e.g. setKernelStack writing to wrong core's AsmState).
+            const serial = @import("serial.zig");
+            const process = @import("process.zig");
+            serial.putChar('\n');
+            serial.putChar('G');
+            serial.putChar('S');
+            serial.putChar('!');
+            // GS_BASE, KERNEL_GS_BASE, base, LAPIC ID
+            process.inlineHex(gs_base);
+            serial.putChar(' ');
+            process.inlineHex(cpu.rdmsr(0xC0000102)); // KERNEL_GS_BASE
+            serial.putChar(' ');
+            process.inlineHex(base);
+            serial.putChar(' ');
+            // Read LAPIC ID (MMIO at 0xFEE00020, bits 24-31)
+            const lapic_id: u32 = asm volatile (
+                "movl 0xFEE00020, %[out]"
+                : [out] "=r" (-> u32),
+            );
+            process.inlineHex(lapic_id >> 24);
+            serial.putChar('\n');
+            // Halt this core — can't safely continue with wrong GS
+            while (true) {
+                asm volatile ("cli");
+                asm volatile ("hlt");
+            }
+        }
+        return @intCast(idx);
     } else {
         // riscv64: single-core for now
         return 0;

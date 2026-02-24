@@ -495,6 +495,11 @@ pub const TcpStack = struct {
             c.retransmit_count = 0;
             c.rto = INITIAL_RTO;
             c.retransmit_tick = self.getTicksFn();
+
+            // Send next segment if there's remaining data in tx_buf
+            if (c.tx_len > 0) {
+                self.sendDataSegment(c);
+            }
         }
     }
 

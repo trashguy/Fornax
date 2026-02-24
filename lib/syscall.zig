@@ -105,7 +105,11 @@ pub fn create(path: []const u8, flags: u32) i32 {
 }
 
 pub fn mkdir(path: []const u8) i32 {
-    return create(path, O_DIR);
+    const fd = create(path, O_DIR);
+    if (fd >= 0) {
+        _ = close(fd);
+    }
+    return fd;
 }
 
 pub fn stat(fd: i32, buf: *Stat) i32 {
