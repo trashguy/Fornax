@@ -369,7 +369,7 @@ pub fn main() !void {
 
         // Store file data
         const max_inline = BLOCK_SIZE - NODE_HEADER_SIZE - LEAF_ITEM_HEADER_SIZE * 10 - 100;
-        if (entry.data.len <= max_inline and entry.data.len <= 3800) {
+        if (entry.data.len <= max_inline and entry.data.len <= 2000) {
             try items.append(alloc, .{
                 .key = .{ .inode_nr = file_inode, .item_type = EXTENT_DATA, .offset = 0 },
                 .data = entry.data,
@@ -474,7 +474,7 @@ pub fn main() !void {
 
                     // Store file data
                     const max_inline = BLOCK_SIZE - NODE_HEADER_SIZE - LEAF_ITEM_HEADER_SIZE * 10 - 100;
-                    if (data.len <= max_inline and data.len <= 3800) {
+                    if (data.len <= max_inline and data.len <= 2000) {
                         try items.append(alloc, .{
                             .key = .{ .inode_nr = file_inode, .item_type = EXTENT_DATA, .offset = 0 },
                             .data = data,

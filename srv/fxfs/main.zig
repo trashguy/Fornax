@@ -45,6 +45,12 @@ const MAX_LEAF_ITEMS = 194;
 // Max keys per internal node: (4096 - 16) / (17 + 8) = 163
 const MAX_INTERNAL_KEYS = 163;
 
+// Max inline data for small files stored directly in B-tree leaves.
+// Must be ≤ (BLOCK_SIZE - NODE_HEADER_SIZE - 2*LEAF_ITEM_HEADER_SIZE) / 2
+// to guarantee that any two items fit in a leaf, ensuring 2-way splits
+// always produce valid halves. (4096 - 16 - 42) / 2 = 2019.
+const MAX_INLINE_DATA = 2000;
+
 // Node cache
 const CACHE_SIZE = 16;
 
@@ -1070,8 +1076,71 @@ fn cowNode(old_block: u64) ?u64 {
     return new_block;
 }
 
-/// Insert an item into the B-tree. Does CoW on modified nodes.
-/// Returns true on success.
+/// Find the optimal split point for a leaf overflow. Returns the number of items
+/// in the left half. Walks combined items (old + new) in sorted order and picks
+/// the split where both halves fit in BLOCK_SIZE, preferring the most balanced split.
+fn findLeafSplitPoint(
+    old_leaf: *const [BLOCK_SIZE]u8,
+    num_items: u16,
+    new_key: Key,
+    new_data_len: usize,
+    total_data: usize,
+) u16 {
+    const total_items: usize = @as(usize, num_items) + 1;
+
+    var left_data: usize = 0;
+    var old_idx: u16 = 0;
+    var new_inserted = false;
+    var best_split: u16 = 1;
+    var best_max: usize = @as(usize, BLOCK_SIZE) + 1;
+
+    var combined_idx: usize = 0;
+    while (combined_idx < total_items) : (combined_idx += 1) {
+        // Get current item's data size
+        var item_data: usize = 0;
+        if (!new_inserted) {
+            if (old_idx >= num_items) {
+                item_data = new_data_len;
+                new_inserted = true;
+            } else {
+                const k = parseLeafItemKey(old_leaf, old_idx);
+                if (new_key.lessThan(k)) {
+                    item_data = new_data_len;
+                    new_inserted = true;
+                } else {
+                    item_data = parseLeafItemDataSize(old_leaf, old_idx);
+                    old_idx += 1;
+                }
+            }
+        } else {
+            item_data = parseLeafItemDataSize(old_leaf, old_idx);
+            old_idx += 1;
+        }
+
+        left_data += item_data;
+        const left_count = combined_idx + 1;
+        const right_count = total_items - left_count;
+
+        if (right_count == 0) break; // Need at least 1 item per side
+
+        const left_size = NODE_HEADER_SIZE + left_count * LEAF_ITEM_HEADER_SIZE + left_data;
+        const right_data = total_data - left_data;
+        const right_size = NODE_HEADER_SIZE + right_count * LEAF_ITEM_HEADER_SIZE + right_data;
+
+        if (left_size <= BLOCK_SIZE and right_size <= BLOCK_SIZE) {
+            const this_max = @max(left_size, right_size);
+            if (this_max < best_max) {
+                best_max = this_max;
+                best_split = @intCast(left_count);
+            }
+        }
+
+        if (left_size > BLOCK_SIZE) break;
+    }
+
+    return best_split;
+}
+
 /// Build a leaf from a range of "combined items" (old leaf items + new item in sorted order).
 /// Items from combined index range_start (inclusive) to range_end (exclusive) are written.
 /// Returns the first key written (used as separator key for splits).
@@ -1448,8 +1517,8 @@ fn btreeInsert(key: Key, data: []const u8) bool {
         return true;
     }
 
-    // Leaf overflow — split into two halves
-    const split_at = total_items / 2;
+    // Leaf overflow — split by data size for balance
+    const split_at = findLeafSplitPoint(&old_leaf, num_items, key, data.len, total_data);
 
     var left_buf: [BLOCK_SIZE]u8 = undefined;
     _ = buildLeafRange(&old_leaf, num_items, key, data, 0, split_at, &left_buf);
@@ -1543,8 +1612,8 @@ fn leafInsert(leaf_block: u64, key: Key, data: []const u8) bool {
         return true;
     }
 
-    // Leaf overflow — split into two halves, create new internal root
-    const split_at = total_items / 2;
+    // Leaf overflow — split by data size for balance
+    const split_at = findLeafSplitPoint(&old_leaf, num_items, key, data.len, total_data);
 
     var left_buf: [BLOCK_SIZE]u8 = undefined;
     _ = buildLeafRange(&old_leaf, num_items, key, data, 0, split_at, &left_buf);
@@ -2245,10 +2314,10 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
     const old_size: usize = @intCast(inode.size);
 
     // For small files, store inline in the B-tree
-    if (new_end <= 3800) {
+    if (new_end <= MAX_INLINE_DATA) {
 
         // Build combined buffer: preserve existing data, place new data at write_offset
-        var combined: [3800]u8 = [_]u8{0} ** 3800;
+        var combined: [MAX_INLINE_DATA]u8 = [_]u8{0} ** MAX_INLINE_DATA;
 
         // Read existing inline data before tree modification (btreeSearch returns
         // a slice into a cached block buffer that gets invalidated by btreeDelete)
@@ -2285,9 +2354,9 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
         // Don't rewrite old blocks — just handle the partial last block and add new blocks.
 
         // If transitioning from inline to block-based, convert first
-        if (old_size > 0 and old_size <= 3800) {
+        if (old_size > 0 and old_size <= MAX_INLINE_DATA) {
             // Read old inline data
-            var inline_buf: [3800]u8 = [_]u8{0} ** 3800;
+            var inline_buf: [MAX_INLINE_DATA]u8 = [_]u8{0} ** MAX_INLINE_DATA;
             var inline_len: usize = 0;
             if (btreeSearch(.{ .inode_nr = h.inode_nr, .item_type = EXTENT_DATA, .offset = 0 })) |data| {
                 const is_extent = data.len == EXTENT_DATA_SIZE and blk: {
@@ -2404,9 +2473,9 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
     } else {
         // General overwrite path: rewrite entire file (rare case)
         // Save old inline data if applicable
-        var inline_buf: [3800]u8 = [_]u8{0} ** 3800;
+        var inline_buf: [MAX_INLINE_DATA]u8 = [_]u8{0} ** MAX_INLINE_DATA;
         var was_inline = false;
-        if (old_size > 0 and old_size <= 3800) {
+        if (old_size > 0 and old_size <= MAX_INLINE_DATA) {
             if (btreeSearch(.{ .inode_nr = h.inode_nr, .item_type = EXTENT_DATA, .offset = 0 })) |data| {
                 const is_extent = data.len == EXTENT_DATA_SIZE and blk: {
                     const blk_nr = readU64LE(data[0..8]);
@@ -2472,7 +2541,7 @@ fn handleWrite(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
                         const avail = old_size - blk_start;
                         const to_copy = @min(avail, BLOCK_SIZE);
                         @memcpy(block_buf[0..to_copy], inline_buf[blk_start..][0..to_copy]);
-                    } else if (old_size > 3800) {
+                    } else if (old_size > MAX_INLINE_DATA) {
                         _ = readFileData(h.inode_nr, @intCast(blk_start), &block_buf);
                     }
                 }
@@ -2776,10 +2845,10 @@ fn handleTruncate(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
         // Shrinking: free excess extent data
         freeAllExtents(h.inode_nr);
 
-        if (new_size > 0 and new_size <= 3800) {
+        if (new_size > 0 and new_size <= MAX_INLINE_DATA) {
             // Re-read data and store inline at new size
             // (data was already freed, so this results in a zero-filled inline item)
-            var zero_buf: [3800]u8 = [_]u8{0} ** 3800;
+            var zero_buf: [MAX_INLINE_DATA]u8 = [_]u8{0} ** MAX_INLINE_DATA;
             if (!btreeInsert(.{ .inode_nr = h.inode_nr, .item_type = EXTENT_DATA, .offset = 0 }, zero_buf[0..@intCast(new_size)])) {
                 resp.* = fx.IpcMessage.init(fx.R_ERROR);
                 return;

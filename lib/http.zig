@@ -292,6 +292,28 @@ pub const Response = struct {
             if (n <= 0) break;
         }
     }
+
+    /// Drain remaining body and return true if connection is reusable.
+    /// Returns false when the connection must be closed after this response:
+    /// - read-until-close (no content-length, not chunked)
+    /// - server sent Connection: close
+    /// - HTTP/1.0 without explicit Connection: keep-alive
+    pub fn drainAndReady(self: *Response) bool {
+        if (self.content_length < 0 and !self.chunked) {
+            return false;
+        }
+        self.drainBody();
+        // Check Connection header for explicit close
+        if (self.getHeader("Connection")) |conn_hdr| {
+            if (containsCI(conn_hdr, "close")) return false;
+            // Explicit keep-alive — reusable even for HTTP/1.0
+            return true;
+        }
+        // No Connection header: HTTP/1.0 defaults to close, HTTP/1.1 to keep-alive.
+        // We can't easily distinguish, but servers that support keep-alive
+        // typically send the header. Assume close if absent.
+        return false;
+    }
 };
 
 /// Parse HTTP response headers from the data fd.
@@ -499,6 +521,8 @@ pub const RequestOptions = struct {
     body: ?[]const u8 = null,
     /// Content-Type for body. Defaults to application/x-www-form-urlencoded.
     content_type: ?[]const u8 = null,
+    /// If true, send "Connection: keep-alive" instead of "Connection: close".
+    keep_alive: bool = false,
 };
 
 pub const UrlParts = struct {
@@ -741,41 +765,39 @@ pub fn request(
     return requestWithRedirects(host, port, method, url_path, options, header_buf, 0);
 }
 
-fn requestWithRedirects(
+/// Send an HTTP request on an existing open connection (no redirect handling).
+/// The caller must have drained the previous response body before calling this.
+/// Returns null if the write fails (connection dead).
+pub fn requestOnConnection(
+    conn: *Connection,
     host: []const u8,
-    port: u16,
     method: []const u8,
     url_path: []const u8,
     options: RequestOptions,
     header_buf: []u8,
-    redirect_count: u8,
-) ?RequestResult {
-    // Resolve hostname if needed
-    var ip_buf: [64]u8 = undefined;
-    const host_ip = if (isIpAddress(host)) host else (resolve(host, &ip_buf) orelse {
-        _ = fx.write(2, "http: DNS resolution failed for ");
-        _ = fx.write(2, host);
-        _ = fx.write(2, "\n");
-        return null;
-    });
+) ?Response {
+    const req_len = buildRequest(method, url_path, host, options, header_buf);
+    const w = conn.writeData(header_buf[0..req_len]);
+    if (w <= 0) return null;
 
-    var conn = Connection.connect(host_ip, port, header_buf) orelse {
-        _ = fx.write(2, "http: TCP connect failed\n");
-        return null;
-    };
-
-    // Set up transport I/O (e.g. TLS handshake) if callback provided
-    if (options.on_connect) |setup| {
-        conn.io = setup(conn.data_fd, host);
-        if (conn.io == null) {
-            // Transport setup failed (e.g. TLS handshake failed)
-            _ = fx.write(2, "http: transport setup failed\n");
-            conn.close();
-            return null;
+    // Write body if present
+    if (options.body) |body| {
+        if (body.len > 0) {
+            _ = conn.writeData(body);
         }
     }
 
-    // Build HTTP request
+    return parseResponse(conn.data_fd, header_buf, conn.io);
+}
+
+/// Build an HTTP request into header_buf. Returns the request size.
+pub fn buildRequest(
+    method: []const u8,
+    url_path: []const u8,
+    host: []const u8,
+    options: RequestOptions,
+    header_buf: []u8,
+) usize {
     var req_pos: usize = 0;
     @memcpy(header_buf[req_pos..][0..method.len], method);
     req_pos += method.len;
@@ -826,11 +848,57 @@ fn requestWithRedirects(
         req_pos += cl_len;
     }
 
-    const close_hdr = "\r\nConnection: close\r\n\r\n";
-    @memcpy(header_buf[req_pos..][0..close_hdr.len], close_hdr);
-    req_pos += close_hdr.len;
+    // Connection header
+    if (options.keep_alive) {
+        const ka_hdr = "\r\nConnection: keep-alive\r\n\r\n";
+        @memcpy(header_buf[req_pos..][0..ka_hdr.len], ka_hdr);
+        req_pos += ka_hdr.len;
+    } else {
+        const close_hdr = "\r\nConnection: close\r\n\r\n";
+        @memcpy(header_buf[req_pos..][0..close_hdr.len], close_hdr);
+        req_pos += close_hdr.len;
+    }
 
-    _ = conn.writeData(header_buf[0..req_pos]);
+    return req_pos;
+}
+
+fn requestWithRedirects(
+    host: []const u8,
+    port: u16,
+    method: []const u8,
+    url_path: []const u8,
+    options: RequestOptions,
+    header_buf: []u8,
+    redirect_count: u8,
+) ?RequestResult {
+    // Resolve hostname if needed
+    var ip_buf: [64]u8 = undefined;
+    const host_ip = if (isIpAddress(host)) host else (resolve(host, &ip_buf) orelse {
+        _ = fx.write(2, "http: DNS resolution failed for ");
+        _ = fx.write(2, host);
+        _ = fx.write(2, "\n");
+        return null;
+    });
+
+    var conn = Connection.connect(host_ip, port, header_buf) orelse {
+        _ = fx.write(2, "http: TCP connect failed\n");
+        return null;
+    };
+
+    // Set up transport I/O (e.g. TLS handshake) if callback provided
+    if (options.on_connect) |setup| {
+        conn.io = setup(conn.data_fd, host);
+        if (conn.io == null) {
+            // Transport setup failed (e.g. TLS handshake failed)
+            _ = fx.write(2, "http: transport setup failed\n");
+            conn.close();
+            return null;
+        }
+    }
+
+    // Build and send HTTP request
+    const req_len = buildRequest(method, url_path, host, options, header_buf);
+    _ = conn.writeData(header_buf[0..req_len]);
 
     // Write body if present
     if (options.body) |body| {
@@ -980,7 +1048,7 @@ fn parseHex(s: []const u8) u64 {
     return val;
 }
 
-fn isIpAddress(s: []const u8) bool {
+pub fn isIpAddress(s: []const u8) bool {
     if (s.len == 0) return false;
     return s[0] >= '0' and s[0] <= '9';
 }

@@ -53,6 +53,20 @@ var auth_value_buf: [4112]u8 linksection(".bss") = undefined; // "Bearer " + tok
 var auth_value_len: usize = 0;
 var combined_hdrs: [12]http.HeaderEntry = undefined;
 
+// --- Persistent connection state for registry requests ---
+var persistent_conn: http.Connection = .{
+    .data_fd = -1,
+    .ctl_fd = -1,
+    .conn_num = &.{},
+    .conn_num_buf = undefined,
+    .conn_num_len = 0,
+    .io = null,
+};
+var persistent_active: bool = false;
+var persistent_host_buf: [128]u8 linksection(".bss") = undefined;
+var persistent_host_len: usize = 0;
+var persistent_port: u16 = 0;
+
 // --- TLS support (conditionally compiled via -Dtls=true) ---
 const TlsSupport = if (has_tls) struct {
     const T = @import("tls");
@@ -1539,15 +1553,15 @@ fn pullEnsureParentDirs(fpath: []const u8) void {
 }
 
 /// Fetch a blob and read body into buf. Returns slice or null.
-fn fetchBlob(host: []const u8, port: u16, name: []const u8, digest: []const u8, buf: []u8, use_tls_flag: bool) ?[]const u8 {
+fn fetchBlob(ref: *const ImageRef, digest: []const u8, buf: []u8) ?[]const u8 {
     // Build path: /v2/<name>/blobs/<digest>
     var api_path: [512]u8 = undefined;
     var pos: usize = 0;
     const p1 = "/v2/";
     @memcpy(api_path[pos..][0..p1.len], p1);
     pos += p1.len;
-    @memcpy(api_path[pos..][0..name.len], name);
-    pos += name.len;
+    @memcpy(api_path[pos..][0..ref.name.len], ref.name);
+    pos += ref.name.len;
     const p2 = "/blobs/";
     @memcpy(api_path[pos..][0..p2.len], p2);
     pos += p2.len;
@@ -1557,19 +1571,46 @@ fn fetchBlob(host: []const u8, port: u16, name: []const u8, digest: []const u8, 
     const accept_hdr = [_]http.HeaderEntry{
         .{ .name = "Accept", .value = "*/*" },
     };
-    const opts = makeOpts(&accept_hdr, use_tls_flag);
 
-    var result = http.request(host, port, "GET", api_path[0..pos], opts, &header_buf) orelse return null;
-    defer result.conn.close();
+    var rr = registryRequest(ref.registry_host, ref.registry_port, "GET", api_path[0..pos], &accept_hdr, ref.use_tls) orelse return null;
 
-    if (result.resp.status_code < 200 or result.resp.status_code >= 300) return null;
+    if (rr.resp.status_code >= 300 and rr.resp.status_code < 400) {
+        // Redirect (e.g. Docker Hub 307 to CDN) — persistent conn can't follow
+        // cross-domain redirects. Drain body, fall back to http.request() with
+        // redirect handling.
+        if (!rr.resp.drainAndReady()) closePersistent();
+
+        const opts = makeOpts(&accept_hdr, ref.use_tls);
+        var result = http.request(ref.registry_host, ref.registry_port, "GET", api_path[0..pos], opts, &header_buf) orelse return null;
+        defer result.conn.close();
+
+        if (result.resp.status_code < 200 or result.resp.status_code >= 300) return null;
+
+        var total: usize = 0;
+        while (total < buf.len) {
+            const n = result.resp.readBody(buf[total..]);
+            if (n <= 0) break;
+            total += @intCast(n);
+        }
+        if (total == 0) return null;
+        return buf[0..total];
+    }
+
+    if (rr.resp.status_code < 200 or rr.resp.status_code >= 300) {
+        if (!rr.resp.drainAndReady()) closePersistent();
+        return null;
+    }
 
     var total: usize = 0;
     while (total < buf.len) {
-        const n = result.resp.readBody(buf[total..]);
+        const n = rr.resp.readBody(buf[total..]);
         if (n <= 0) break;
         total += @intCast(n);
     }
+
+    // Body fully read — check if connection is reusable
+    if (!rr.resp.drainAndReady()) closePersistent();
+
     if (total == 0) return null;
     return buf[0..total];
 }
@@ -1668,8 +1709,8 @@ const MANIFEST_ACCEPT = "application/vnd.docker.distribution.manifest.v2+json, "
 
 /// Fetch manifest, resolving manifest lists to the amd64/linux platform manifest.
 /// Returns the manifest JSON as a slice into `buf`. Exits on error.
-fn fetchManifest(api_path_buf: []u8, ref: ImageRef, buf: []u8) []const u8 {
-    const data = fetchManifestOnce(api_path_buf, ref.registry_host, ref.registry_port, ref.name, ref.tag, buf, ref.use_tls);
+fn fetchManifest(api_path_buf: []u8, ref: *const ImageRef, buf: []u8) []const u8 {
+    const data = fetchManifestOnce(api_path_buf, ref, ref.tag, buf);
 
     // Check if this is a manifest list (contains "manifests" array)
     if (isManifestList(data)) {
@@ -1682,13 +1723,13 @@ fn fetchManifest(api_path_buf: []u8, ref: ImageRef, buf: []u8) []const u8 {
         stderr.puts("Resolving manifest list -> amd64/linux\n");
 
         // Re-fetch using the platform-specific digest
-        return fetchManifestOnce(api_path_buf, ref.registry_host, ref.registry_port, ref.name, digest, buf, ref.use_tls);
+        return fetchManifestOnce(api_path_buf, ref, digest, buf);
     }
 
     return data;
 }
 
-fn fetchManifestOnce(api_path_buf: []u8, host: []const u8, port: u16, name: []const u8, reference: []const u8, buf: []u8, use_tls_flag: bool) []const u8 {
+fn fetchManifestOnce(api_path_buf: []u8, ref: *const ImageRef, reference: []const u8, buf: []u8) []const u8 {
     var suf_buf: [256]u8 = undefined;
     var spos: usize = 0;
     const s1 = "/manifests/";
@@ -1697,42 +1738,43 @@ fn fetchManifestOnce(api_path_buf: []u8, host: []const u8, port: u16, name: []co
     @memcpy(suf_buf[spos..][0..reference.len], reference);
     spos += reference.len;
 
-    const path = buildApiPath(api_path_buf, name, suf_buf[0..spos]);
+    const path = buildApiPath(api_path_buf, ref.name, suf_buf[0..spos]);
 
     const accept_hdr = [_]http.HeaderEntry{
         .{ .name = "Accept", .value = MANIFEST_ACCEPT },
     };
-    const opts = makeOpts(&accept_hdr, use_tls_flag);
 
-    var result = http.request(host, port, "GET", path, opts, &header_buf) orelse {
+    var rr = registryRequest(ref.registry_host, ref.registry_port, "GET", path, &accept_hdr, ref.use_tls) orelse {
         stderr.puts("fnx: failed to fetch manifest\n");
         fx.exit(1);
     };
 
-    if (result.resp.status_code == 404) {
-        result.conn.close();
+    if (rr.resp.status_code == 404) {
+        if (!rr.resp.drainAndReady()) closePersistent();
         stderr.puts("fnx: image not found: ");
-        stderr.puts(name);
+        stderr.puts(ref.name);
         stderr.puts(":");
         stderr.puts(reference);
         stderr.puts("\n");
         fx.exit(1);
     }
-    if (result.resp.status_code < 200 or result.resp.status_code >= 300) {
-        result.conn.close();
+    if (rr.resp.status_code < 200 or rr.resp.status_code >= 300) {
+        if (!rr.resp.drainAndReady()) closePersistent();
         stderr.puts("fnx: registry returned status ");
-        stderr.print("{d}", .{result.resp.status_code});
+        stderr.print("{d}", .{rr.resp.status_code});
         stderr.puts(" for manifest\n");
         fx.exit(1);
     }
 
     var total: usize = 0;
     while (total < buf.len) {
-        const n = result.resp.readBody(buf[total..]);
+        const n = rr.resp.readBody(buf[total..]);
         if (n <= 0) break;
         total += @intCast(n);
     }
-    result.conn.close();
+
+    // Body fully read — check if connection is reusable
+    if (!rr.resp.drainAndReady()) closePersistent();
 
     if (total == 0) {
         stderr.puts("fnx: empty manifest\n");
@@ -1853,36 +1895,7 @@ fn findPlatformDigest(data: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Obtain a Bearer token for registry authentication.
-/// Performs the OAuth2 token exchange: GET /v2/ → 401 + WWW-Authenticate → fetch token.
-/// Returns true if a token was successfully obtained and stored.
-fn obtainAuthToken(ref: *const ImageRef) bool {
-    // Legacy wrapper — calls fetchAuthToken after doing its own /v2/ request.
-    // Prefer calling fetchAuthToken directly with the WWW-Authenticate header
-    // from an existing 401 response to avoid redundant connections.
-    const opts = makeOpts(&.{}, ref.use_tls);
-    var result = http.request(ref.registry_host, ref.registry_port, "GET", "/v2/", opts, &header_buf) orelse return false;
-    if (result.resp.status_code != 401) {
-        result.conn.close();
-        return false;
-    }
-    const www_auth = result.resp.getHeader("WWW-Authenticate") orelse {
-        result.conn.close();
-        return false;
-    };
-    var www_auth_copy: [512]u8 = undefined;
-    if (www_auth.len > www_auth_copy.len) {
-        result.conn.close();
-        return false;
-    }
-    @memcpy(www_auth_copy[0..www_auth.len], www_auth);
-    result.resp.drainBody();
-    result.conn.close();
-    return fetchAuthToken(www_auth_copy[0..www_auth.len], ref);
-}
-
 /// Fetch a Bearer token using a pre-parsed WWW-Authenticate header value.
-/// This avoids the redundant /v2/ request that obtainAuthToken makes.
 fn fetchAuthToken(www_auth: []const u8, ref: *const ImageRef) bool {
     // Parse challenge
     var challenge: http.AuthChallenge = undefined;
@@ -2005,6 +2018,98 @@ fn fetchAuthToken(www_auth: []const u8, ref: *const ImageRef) bool {
     return false;
 }
 
+// --- Persistent connection helpers ---
+
+/// Get an existing persistent connection or open a new one.
+/// Returns a pointer to the persistent_conn if successful, null otherwise.
+fn getOrConnect(host: []const u8, port: u16, use_tls_flag: bool) ?*http.Connection {
+    // Reuse if same host:port and still active
+    if (persistent_active and port == persistent_port and
+        host.len == persistent_host_len and
+        sliceEql(host, persistent_host_buf[0..persistent_host_len]))
+    {
+        return &persistent_conn;
+    }
+
+    // Close any existing connection first
+    if (persistent_active) closePersistent();
+
+    // Resolve hostname
+    var ip_buf: [64]u8 = undefined;
+    const host_ip = if (http.isIpAddress(host)) host else (http.resolve(host, &ip_buf) orelse {
+        stderr.puts("http: DNS resolution failed for ");
+        stderr.puts(host);
+        stderr.puts("\n");
+        return null;
+    });
+
+    persistent_conn = http.Connection.connect(host_ip, port, &header_buf) orelse {
+        stderr.puts("http: TCP connect failed\n");
+        return null;
+    };
+
+    // TLS handshake if needed
+    if (has_tls and use_tls_flag) {
+        persistent_conn.io = TlsSupport.onConnect(persistent_conn.data_fd, host);
+        if (persistent_conn.io == null) {
+            stderr.puts("http: TLS handshake failed\n");
+            persistent_conn.close();
+            return null;
+        }
+    }
+
+    // Save host/port state
+    if (host.len <= persistent_host_buf.len) {
+        @memcpy(persistent_host_buf[0..host.len], host);
+        persistent_host_len = host.len;
+    }
+    persistent_port = port;
+    persistent_active = true;
+    return &persistent_conn;
+}
+
+/// Close persistent connection (TLS close_notify + TCP close + reset state).
+fn closePersistent() void {
+    if (!persistent_active) return;
+    persistent_conn.close();
+    persistent_conn.io = null;
+    persistent_active = false;
+    persistent_host_len = 0;
+    persistent_port = 0;
+}
+
+const RegistryResult = struct {
+    resp: http.Response,
+};
+
+/// Send a request on the persistent connection, reconnecting once if the
+/// connection is dead. Returns null on failure.
+fn registryRequest(
+    host: []const u8,
+    port: u16,
+    method: []const u8,
+    path: []const u8,
+    extra_headers: []const http.HeaderEntry,
+    use_tls_flag: bool,
+) ?RegistryResult {
+    const conn = getOrConnect(host, port, use_tls_flag) orelse return null;
+
+    var opts = makeOpts(extra_headers, false); // on_connect already done
+    opts.keep_alive = true;
+
+    if (http.requestOnConnection(conn, host, method, path, opts, &header_buf)) |resp| {
+        return .{ .resp = resp };
+    }
+
+    // Connection dead — reconnect once
+    closePersistent();
+    const conn2 = getOrConnect(host, port, use_tls_flag) orelse return null;
+    if (http.requestOnConnection(conn2, host, method, path, opts, &header_buf)) |resp| {
+        return .{ .resp = resp };
+    }
+    return null;
+}
+
 fn cmdPull(image_str: []const u8) void {
     const ref = parseImageRef(image_str);
 
@@ -2027,30 +2132,31 @@ fn cmdPull(image_str: []const u8) void {
 
     // Step 1: Check registry connectivity — GET /v2/ (with auth if needed)
     {
-        const opts = makeOpts(&.{}, ref.use_tls);
-        var result = http.request(ref.registry_host, ref.registry_port, "GET", "/v2/", opts, &header_buf) orelse {
+        var rr = registryRequest(ref.registry_host, ref.registry_port, "GET", "/v2/", &.{}, ref.use_tls) orelse {
             stderr.puts("fnx: cannot connect to registry ");
             stderr.puts(fmtRegistry(&reg_buf, ref.registry_host, ref.registry_port));
             stderr.puts("\n");
             fx.exit(1);
         };
 
-        if (result.resp.status_code == 401) {
-            // Extract WWW-Authenticate before closing (points into header_buf)
-            const www_auth = result.resp.getHeader("WWW-Authenticate") orelse {
+        if (rr.resp.status_code == 401) {
+            // Extract WWW-Authenticate before draining (points into header_buf)
+            const www_auth = rr.resp.getHeader("WWW-Authenticate") orelse {
                 stderr.puts("fnx: 401 but no WWW-Authenticate header\n");
-                result.conn.close();
+                closePersistent();
                 fx.exit(1);
             };
-            // Copy to stable buffer before closing connection
+            // Copy to stable buffer before draining body (which reuses header_buf)
             var www_auth_copy: [512]u8 = undefined;
             if (www_auth.len > www_auth_copy.len) {
-                result.conn.close();
+                closePersistent();
                 fx.exit(1);
             }
             @memcpy(www_auth_copy[0..www_auth.len], www_auth);
-            result.resp.drainBody();
-            result.conn.close();
+            _ = rr.resp.drainAndReady();
+
+            // Server may reject reuse after 401 — close and reconnect after auth
+            closePersistent();
 
             // Fetch auth token using the challenge from the 401
             stderr.puts("Authenticating...\n");
@@ -2059,13 +2165,16 @@ fn cmdPull(image_str: []const u8) void {
                 fx.exit(1);
             }
         } else {
-            result.conn.close();
-            if (result.resp.status_code != 200) {
+            if (rr.resp.status_code != 200) {
+                _ = rr.resp.drainAndReady();
+                closePersistent();
                 stderr.puts("fnx: registry returned status ");
-                stderr.print("{d}", .{result.resp.status_code});
+                stderr.print("{d}", .{rr.resp.status_code});
                 stderr.puts("\n");
                 fx.exit(1);
             }
+            // Drain 200 body to prepare connection for reuse
+            if (!rr.resp.drainAndReady()) closePersistent();
         }
     }
 
@@ -2073,7 +2182,7 @@ fn cmdPull(image_str: []const u8) void {
     var api_path: [512]u8 = undefined;
     var manifest_data: []const u8 = undefined;
     {
-        manifest_data = fetchManifest(&api_path, ref, manifest_buf[0..]);
+        manifest_data = fetchManifest(&api_path, &ref, manifest_buf[0..]);
     }
 
     // Step 3: Parse manifest — extract config digest + layer digests
@@ -2198,10 +2307,10 @@ fn cmdPull(image_str: []const u8) void {
         }
     }
 
-    // Step 6: Fetch and parse config blob
+    // Step 6: Fetch and parse config blob (uses persistent connection)
     if (config_digest.len > 0) {
         // Use elf_buf as temp for config JSON (it's large enough)
-        if (fetchBlob(ref.registry_host, ref.registry_port, ref.name, config_digest, &elf_buf, ref.use_tls)) |config_json| {
+        if (fetchBlob(&ref, config_digest, &elf_buf)) |config_json| {
             var cmd_buf: [256]u8 = undefined;
             if (parseOciConfig(config_json, &cmd_buf)) |cmd_str| {
                 var cpath: [256]u8 = undefined;
@@ -2234,6 +2343,10 @@ fn cmdPull(image_str: []const u8) void {
             }
         }
     }
+
+    // Close persistent connection before layer downloads (layers use
+    // http.request() with redirect handling for CDN 307s)
+    closePersistent();
 
     // Step 7: Download and extract layers
     for (0..layer_count) |li| {
