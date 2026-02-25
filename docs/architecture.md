@@ -282,8 +282,7 @@ Compile-time feature flags:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-Dposix=true` | `false` | Enable POSIX/C programs (musl libc + shim) |
-| `-Dtls=true` | `false` | Enable TLS via BearSSL |
-| `-Dcontainers=true` | `false` | Enable container system (fnx CLI, Linux compat, bridge) |
+| `-Dposix=true` | `false` | Enable POSIX/C programs (musl libc + shim + TCC) |
+| `-Dcontainers=true` | `false` | Enable container system (fnx CLI, Linux compat, bridge, TLS) |
 | `-Dcluster=true` | `false` | Enable clustering (gossip discovery, 9P remote namespaces) |
 | `-Dviceroy=true` | `false` | Enable deployment tooling (implies `-Dcluster=true`) |

@@ -67,7 +67,7 @@ var persistent_host_buf: [128]u8 linksection(".bss") = undefined;
 var persistent_host_len: usize = 0;
 var persistent_port: u16 = 0;
 
-// --- TLS support (conditionally compiled via -Dtls=true) ---
+// --- TLS support (always enabled on x86_64) ---
 const TlsSupport = if (has_tls) struct {
     const T = @import("tls");
 

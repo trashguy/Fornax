@@ -216,8 +216,8 @@ def test_container_pull_real(qemu):
 def test_container_pull_dockerhub(qemu):
     """Test fnx pull alpine directly from Docker Hub over TLS.
 
-    Requires internet access (QEMU SLIRP provides NAT) and a TLS-enabled
-    build (-Dtls=true). Tests the full Docker Hub auth flow:
+    Requires internet access (QEMU SLIRP provides NAT). TLS is always
+    enabled on x86_64. Tests the full Docker Hub auth flow:
     401 → WWW-Authenticate → anonymous Bearer token → authenticated pull.
     Verifies alpine's /etc/alpine-release exists after extraction.
     """

@@ -394,7 +394,7 @@ def main():
                 p, f, log_data = run_test_session(
                     "core",
                     ovmf,
-                    ["-Dcontainers=true", "-Dtls=true"],
+                    ["-Dcontainers=true"],
                     core_tests,
                     tmpdir,
                     pre_disk_hook=make_stage_linux_elf("x86_64"),

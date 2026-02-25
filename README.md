@@ -34,9 +34,8 @@ zig build riscv64    # riscv64 freestanding kernel
 zig build aarch64    # aarch64 UEFI kernel
 
 # Feature flags (apply to any arch)
-zig build x86_64 -Dposix=true         # C/POSIX realm support (musl libc)
-zig build x86_64 -Dtcc=true           # TCC compiler (implies -Dposix=true)
-zig build x86_64 -Dcontainers=true    # Container system + fnx CLI
+zig build x86_64 -Dposix=true         # C/POSIX realm support (musl + TCC)
+zig build x86_64 -Dcontainers=true    # Container system + fnx CLI + TLS
 
 # Planned
 zig build x86_64 -Dcluster=true       # Multi-node clustering (Phase 3000+)
@@ -55,9 +54,8 @@ make run-smp-riscv64     # riscv64, 4 harts
 make run-aarch64         # aarch64 on QEMU virt
 make run-smp-aarch64     # aarch64, 4 cores
 make run-release         # ReleaseSafe kernel
-make run-posix           # with POSIX realm support
-make run-tcc             # with TCC compiler
-make run-containers      # with containers (4 cores, 2 GB)
+make run-posix           # with POSIX realm support (includes TCC)
+make run-containers      # with containers + TLS (4 cores, 2 GB)
 make run-dev             # development mode (8 cores, 8 GB)
 ```
 

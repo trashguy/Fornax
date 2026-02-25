@@ -274,9 +274,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const cluster = b.option(bool, "cluster", "Enable clustering support (gossip discovery, remote namespaces, scheduler)") orelse false;
     const posix = b.option(bool, "posix", "Enable C/POSIX realm support") orelse false;
-    const tcc_enabled = b.option(bool, "tcc", "Build TCC C compiler (requires -Dposix=true)") orelse false;
     const containers = b.option(bool, "containers", "Enable container support (fnx CLI, Linux compat, bridge)") orelse false;
-    const tls_enabled = b.option(bool, "tls", "Enable TLS support (BearSSL)") orelse false;
     const test_packages = b.option(bool, "test-packages", "Build test packages (xxd) for integration tests") orelse false;
     const user_strip = b.option(bool, "strip", "Strip debug info from userspace binaries") orelse
         (optimize != .Debug); // strip by default on release builds
@@ -1165,61 +1163,59 @@ const touch_bin = b.addExecutable(.{
     });
     smp_test_bin.image_base = user_image_base;
 
-    // ── TLS support (gated behind -Dtls=true) ─────────────────────────
+    // ── TLS support (BearSSL, x86_64 only) ────────────────────────────
     // BearSSL compiled as static library, linked into TLS-capable programs.
     var bearssl_lib: ?*std.Build.Step.Compile = null;
     var tls_module: ?*std.Build.Module = null;
-    if (tls_enabled) {
-        if (b.lazyDependency("bearssl", .{})) |bearssl_dep| {
-            const lib = b.addLibrary(.{
-                .linkage = .static,
-                .name = "bearssl",
-                .root_module = b.createModule(.{
-                    .target = x86_64_freestanding,
-                    .optimize = user_optimize,
-                }),
-            });
-
-            const bearssl_flags: []const []const u8 = &.{
-                "-std=c99",
-                "-ffreestanding",
-                "-nostdinc",
-                "-fno-sanitize=all",
-                "-DBR_LE_UNALIGNED=0",
-                "-DBR_USE_URANDOM=0",
-                "-DBR_USE_WIN32_RAND=0",
-                "-DBR_64=1",
-                "-DBR_RDRAND=0",
-                b.fmt("-I{s}", .{bearssl_dep.path("inc").getPath(b)}),
-                b.fmt("-I{s}", .{bearssl_dep.path("src").getPath(b)}),
-                b.fmt("-I{s}", .{b.path("lib/tls/include").getPath(b)}),
-            };
-
-            // Add BearSSL source files by walking subdirectories
-            addBearsslSources(b, lib, bearssl_dep, bearssl_flags);
-
-            // Add Fornax stubs (strlen for freestanding)
-            lib.addCSourceFile(.{
-                .file = b.path("lib/tls/stubs.c"),
-                .flags = bearssl_flags,
-            });
-
-            bearssl_lib = lib;
-
-            // Create TLS module (separate from fornax, uses @cImport for bearssl.h)
-            const tmod = b.createModule(.{
-                .root_source_file = b.path("lib/tls.zig"),
+    if (b.lazyDependency("bearssl", .{})) |bearssl_dep| {
+        const lib = b.addLibrary(.{
+            .linkage = .static,
+            .name = "bearssl",
+            .root_module = b.createModule(.{
                 .target = x86_64_freestanding,
                 .optimize = user_optimize,
-                .imports = &.{
-                    .{ .name = "fornax", .module = fornax_module },
-                },
-            });
-            tmod.addIncludePath(bearssl_dep.path("inc"));
-            tmod.addIncludePath(bearssl_dep.path("src"));
-            tmod.addIncludePath(b.path("lib/tls/include"));
-            tls_module = tmod;
-        }
+            }),
+        });
+
+        const bearssl_flags: []const []const u8 = &.{
+            "-std=c99",
+            "-ffreestanding",
+            "-nostdinc",
+            "-fno-sanitize=all",
+            "-DBR_LE_UNALIGNED=0",
+            "-DBR_USE_URANDOM=0",
+            "-DBR_USE_WIN32_RAND=0",
+            "-DBR_64=1",
+            "-DBR_RDRAND=0",
+            b.fmt("-I{s}", .{bearssl_dep.path("inc").getPath(b)}),
+            b.fmt("-I{s}", .{bearssl_dep.path("src").getPath(b)}),
+            b.fmt("-I{s}", .{b.path("lib/tls/include").getPath(b)}),
+        };
+
+        // Add BearSSL source files by walking subdirectories
+        addBearsslSources(b, lib, bearssl_dep, bearssl_flags);
+
+        // Add Fornax stubs (strlen for freestanding)
+        lib.addCSourceFile(.{
+            .file = b.path("lib/tls/stubs.c"),
+            .flags = bearssl_flags,
+        });
+
+        bearssl_lib = lib;
+
+        // Create TLS module (separate from fornax, uses @cImport for bearssl.h)
+        const tmod = b.createModule(.{
+            .root_source_file = b.path("lib/tls.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        });
+        tmod.addIncludePath(bearssl_dep.path("inc"));
+        tmod.addIncludePath(bearssl_dep.path("src"));
+        tmod.addIncludePath(b.path("lib/tls/include"));
+        tls_module = tmod;
     }
 
     // ── fay package manager (conditionally TLS-capable) ──────────────
@@ -1440,115 +1436,113 @@ const touch_bin = b.addExecutable(.{
                 }
             }
 
-            // ── TCC: Tiny C Compiler (gated behind -Dtcc=true) ──────
-            if (tcc_enabled) {
-                if (b.lazyDependency("tcc", .{})) |tcc_dep| {
-                    const tcc_exe = b.addExecutable(.{
-                        .name = "tcc",
-                        .root_module = b.createModule(.{
-                            .target = x86_64_freestanding,
-                            .optimize = user_optimize,
-                            .strip = if (user_strip) true else null,
-                        }),
-                    });
+            // ── TCC: Tiny C Compiler (built with POSIX) ─────────────
+            if (b.lazyDependency("tcc", .{})) |tcc_dep| {
+                const tcc_exe = b.addExecutable(.{
+                    .name = "tcc",
+                    .root_module = b.createModule(.{
+                        .target = x86_64_freestanding,
+                        .optimize = user_optimize,
+                        .strip = if (user_strip) true else null,
+                    }),
+                });
 
-                    tcc_exe.addAssemblyFile(b.path("lib/posix/crt0-x86_64.S"));
+                tcc_exe.addAssemblyFile(b.path("lib/posix/crt0-x86_64.S"));
+                tcc_exe.addCSourceFile(.{
+                    .file = b.path("lib/posix/shim.c"),
+                    .flags = c_flags,
+                });
+                tcc_exe.addCSourceFile(.{
+                    .file = b.path("lib/posix/process_stubs.c"),
+                    .flags = c_flags,
+                });
+
+                // TCC-specific flags: uses musl public includes only (not
+                // src/include or src/internal which define 'weak' macro
+                // that conflicts with tcc's struct member .weak)
+                const tcc_flags = &[_][]const u8{
+                    "-std=c99",
+                    "-ffreestanding",
+                    "-nostdinc",
+                    "-fno-sanitize=all",
+                    "-D_XOPEN_SOURCE=700",
+                    "-D_FORNAX",
+                    "-DONE_SOURCE=1",
+                    "-DTCC_TARGET_X86_64",
+                    "-DCONFIG_TCC_STATIC",
+                    "-DCONFIG_TCCDIR=\"/lib/tcc\"",
+                    "-DCONFIG_TCC_SYSINCLUDEPATHS=\"{B}/include\"",
+                    "-DCONFIG_TCC_LIBPATHS=\"{B}\"",
+                    "-DCONFIG_TCC_CRTPREFIX=\"{B}\"",
+                    "-DCONFIG_TCC_ELFINTERP=\"\"",
+                    "-DCONFIG_SYSROOT=\"\"",
+                    "-DCONFIG_USR_INCLUDE=\"\"",
+                    "-DCONFIG_LDDIR=\"lib\"",
+                    "-DTCC_VERSION=\"0.9.28rc\"",
+                    "-DCONFIG_TCC_CROSSPREFIX=\"\"",
+                    "-DCONFIG_TCC_PREDEFS=0",
+                    "-Wno-unused-function",
+                    "-Wno-unused-variable",
+                    "-Wno-sign-compare",
+                    "-Wno-implicit-function-declaration",
+                    "-Wno-int-conversion",
+                    "-Wno-incompatible-pointer-types",
+                    "-Wno-bitwise-op-parentheses",
+                    "-Wno-shift-op-parentheses",
+                    "-Wno-parentheses",
+                    "-Wno-string-plus-int",
+                    b.fmt("-I{s}", .{b.path("lib/tcc").getPath(b)}),
+                    b.fmt("-I{s}", .{tcc_dep.path("").getPath(b)}),
+                    b.fmt("-I{s}", .{b.path("lib/posix/overlay").getPath(b)}),
+                    b.fmt("-I{s}", .{musl_dep.path("arch/x86_64").getPath(b)}),
+                    b.fmt("-I{s}", .{musl_dep.path("arch/generic").getPath(b)}),
+                    b.fmt("-I{s}", .{musl_dep.path("include").getPath(b)}),
+                };
+
+                tcc_exe.addCSourceFile(.{
+                    .file = tcc_dep.path("tcc.c"),
+                    .flags = tcc_flags,
+                });
+
+                // Musl sources (same as other POSIX programs)
+                for (musl_sources) |src| {
                     tcc_exe.addCSourceFile(.{
-                        .file = b.path("lib/posix/shim.c"),
+                        .file = musl_dep.path(src),
                         .flags = c_flags,
                     });
-                    tcc_exe.addCSourceFile(.{
-                        .file = b.path("lib/posix/process_stubs.c"),
-                        .flags = c_flags,
-                    });
-
-                    // TCC-specific flags: uses musl public includes only (not
-                    // src/include or src/internal which define 'weak' macro
-                    // that conflicts with tcc's struct member .weak)
-                    const tcc_flags = &[_][]const u8{
-                        "-std=c99",
-                        "-ffreestanding",
-                        "-nostdinc",
-                        "-fno-sanitize=all",
-                        "-D_XOPEN_SOURCE=700",
-                        "-D_FORNAX",
-                        "-DONE_SOURCE=1",
-                        "-DTCC_TARGET_X86_64",
-                        "-DCONFIG_TCC_STATIC",
-                        "-DCONFIG_TCCDIR=\"/lib/tcc\"",
-                        "-DCONFIG_TCC_SYSINCLUDEPATHS=\"{B}/include\"",
-                        "-DCONFIG_TCC_LIBPATHS=\"{B}\"",
-                        "-DCONFIG_TCC_CRTPREFIX=\"{B}\"",
-                        "-DCONFIG_TCC_ELFINTERP=\"\"",
-                        "-DCONFIG_SYSROOT=\"\"",
-                        "-DCONFIG_USR_INCLUDE=\"\"",
-                        "-DCONFIG_LDDIR=\"lib\"",
-                        "-DTCC_VERSION=\"0.9.28rc\"",
-                        "-DCONFIG_TCC_CROSSPREFIX=\"\"",
-                        "-DCONFIG_TCC_PREDEFS=0",
-                        "-Wno-unused-function",
-                        "-Wno-unused-variable",
-                        "-Wno-sign-compare",
-                        "-Wno-implicit-function-declaration",
-                        "-Wno-int-conversion",
-                        "-Wno-incompatible-pointer-types",
-                        "-Wno-bitwise-op-parentheses",
-                        "-Wno-shift-op-parentheses",
-                        "-Wno-parentheses",
-                        "-Wno-string-plus-int",
-                        b.fmt("-I{s}", .{b.path("lib/tcc").getPath(b)}),
-                        b.fmt("-I{s}", .{tcc_dep.path("").getPath(b)}),
-                        b.fmt("-I{s}", .{b.path("lib/posix/overlay").getPath(b)}),
-                        b.fmt("-I{s}", .{musl_dep.path("arch/x86_64").getPath(b)}),
-                        b.fmt("-I{s}", .{musl_dep.path("arch/generic").getPath(b)}),
-                        b.fmt("-I{s}", .{musl_dep.path("include").getPath(b)}),
-                    };
-
-                    tcc_exe.addCSourceFile(.{
-                        .file = tcc_dep.path("tcc.c"),
-                        .flags = tcc_flags,
-                    });
-
-                    // Musl sources (same as other POSIX programs)
-                    for (musl_sources) |src| {
-                        tcc_exe.addCSourceFile(.{
-                            .file = musl_dep.path(src),
-                            .flags = c_flags,
-                        });
-                    }
-
-                    // Fornax stubs for functions TCC references but Fornax
-                    // doesn't support (sem_*, signal, tccrun, etc.)
-                    tcc_exe.addCSourceFile(.{
-                        .file = b.path("lib/tcc/fornax_stubs.c"),
-                        .flags = c_flags,
-                    });
-
-                    // Additional musl sources needed by tcc
-                    const tcc_extra_musl: []const []const u8 = &.{
-                        "src/env/getenv.c",
-                        "src/misc/realpath.c",
-                        "src/unistd/unlink.c",
-                        "src/unistd/rmdir.c",
-                        "src/string/strpbrk.c",
-                        "src/stdio/remove.c",
-                        "src/stdlib/qsort_nr.c",
-                        "src/math/ldexpl.c",
-                    };
-                    for (tcc_extra_musl) |src| {
-                        tcc_exe.addCSourceFile(.{
-                            .file = musl_dep.path(src),
-                            .flags = c_flags,
-                        });
-                    }
-
-                    // setjmp/longjmp assembly (tcc uses setjmp for error recovery)
-                    tcc_exe.addAssemblyFile(musl_dep.path("src/setjmp/x86_64/setjmp.s"));
-                    tcc_exe.addAssemblyFile(musl_dep.path("src/setjmp/x86_64/longjmp.s"));
-
-                    tcc_exe.image_base = user_image_base;
-                    tcc_bin = tcc_exe;
                 }
+
+                // Fornax stubs for functions TCC references but Fornax
+                // doesn't support (sem_*, signal, tccrun, etc.)
+                tcc_exe.addCSourceFile(.{
+                    .file = b.path("lib/tcc/fornax_stubs.c"),
+                    .flags = c_flags,
+                });
+
+                // Additional musl sources needed by tcc
+                const tcc_extra_musl: []const []const u8 = &.{
+                    "src/env/getenv.c",
+                    "src/misc/realpath.c",
+                    "src/unistd/unlink.c",
+                    "src/unistd/rmdir.c",
+                    "src/string/strpbrk.c",
+                    "src/stdio/remove.c",
+                    "src/stdlib/qsort_nr.c",
+                    "src/math/ldexpl.c",
+                };
+                for (tcc_extra_musl) |src| {
+                    tcc_exe.addCSourceFile(.{
+                        .file = musl_dep.path(src),
+                        .flags = c_flags,
+                    });
+                }
+
+                // setjmp/longjmp assembly (tcc uses setjmp for error recovery)
+                tcc_exe.addAssemblyFile(musl_dep.path("src/setjmp/x86_64/setjmp.s"));
+                tcc_exe.addAssemblyFile(musl_dep.path("src/setjmp/x86_64/longjmp.s"));
+
+                tcc_exe.image_base = user_image_base;
+                tcc_bin = tcc_exe;
             }
 
             // ── Test packages (gated behind -Dtest-packages=true) ──
