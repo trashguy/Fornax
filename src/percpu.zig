@@ -196,6 +196,9 @@ pub fn init() void {
         // Also set SSCRATCH for first trap entry from U-mode
         const rv_cpu = @import("arch/riscv64/cpu.zig");
         rv_cpu.csrWrite(rv_cpu.CSR_SSCRATCH, @intFromPtr(&asm_states[0]));
+    } else if (builtin.cpu.arch == .aarch64) {
+        // Set TPIDR_EL1 = &asm_states[0] for BSP. entry.S uses TPIDR_EL1 as percpu pointer.
+        @import("arch/aarch64/cpu.zig").writeTpidrEl1(@intFromPtr(&asm_states[0]));
     }
 
     // Allocate per-CPU scheduler stack for BSP.
@@ -290,8 +293,31 @@ pub noinline fn getCoreId() u8 {
             rv_cpu.halt();
         }
         return @intCast(idx);
+    } else if (builtin.cpu.arch == .aarch64) {
+        // Before percpu.init() sets TPIDR_EL1, we're on BSP (core 0)
+        if (cores_online == 0) return 0;
+        // TPIDR_EL1 = &asm_states[core_id]. Compute index from pointer offset.
+        const aa64_cpu = @import("arch/aarch64/cpu.zig");
+        const tpidr = aa64_cpu.readTpidrEl1();
+        const base = @intFromPtr(&asm_states[0]);
+        const offset = tpidr -% base;
+        const idx = offset / @sizeOf(AsmState);
+        if (idx >= MAX_CORES) {
+            // TPIDR_EL1 is corrupt — dump diagnostic and halt this core.
+            const serial = @import("serial.zig");
+            const process = @import("process.zig");
+            serial.putChar('\n');
+            serial.putChar('T');
+            serial.putChar('1');
+            serial.putChar('!');
+            process.inlineHex(tpidr);
+            serial.putChar(' ');
+            process.inlineHex(base);
+            serial.putChar('\n');
+            aa64_cpu.halt();
+        }
+        return @intCast(idx);
     } else {
-        // aarch64 etc: single-core for now
         return 0;
     }
 }

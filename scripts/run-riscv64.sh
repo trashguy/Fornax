@@ -78,7 +78,7 @@ echo "==> Launching QEMU (OpenSBI + freestanding kernel)..."
 exec qemu-system-riscv64 \
     -machine virt \
     -cpu rv64 \
-    -m 256M \
+    -m 4G \
     -bios default \
     -kernel "$KERNEL" \
     -device loader,file="$INITRD",addr=0x84000000,force-raw=on \

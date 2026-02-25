@@ -19,6 +19,7 @@ const GICD_CTLR: u64 = 0x000; // Distributor Control
 const GICD_ISENABLER: u64 = 0x100; // Interrupt Set-Enable (32 bits per reg)
 const GICD_IPRIORITYR: u64 = 0x400; // Interrupt Priority (8 bits per IRQ)
 const GICD_ITARGETSR: u64 = 0x800; // Interrupt Target (8 bits per IRQ)
+const GICD_SGIR: u64 = 0xF00; // Software Generated Interrupt Register
 
 // GICC registers
 const GICC_CTLR: u64 = 0x000; // CPU Interface Control
@@ -95,6 +96,45 @@ pub fn claim() u32 {
 }
 
 /// Complete (acknowledge) an interrupt.
+/// For SGIs, the full IAR value (including source CPU bits [12:10]) must be passed.
 pub fn complete(irq: u32) void {
     mmioWrite32(giccAddr(GICC_EOIR), irq);
+}
+
+/// Send a Software Generated Interrupt (SGI) to target CPUs.
+/// sgi_id: SGI number (0-15), target_mask: bitmask of target CPUs (bit N = CPU N).
+pub fn sendSgi(sgi_id: u4, target_mask: u8) void {
+    // GICD_SGIR format:
+    //   [3:0]   = SGIINTID (SGI number)
+    //   [15:4]  = reserved
+    //   [23:16] = CPUTargetList (bitmask)
+    //   [25:24] = TargetListFilter (0b00 = use CPUTargetList)
+    const val: u32 = @as(u32, sgi_id) |
+        (@as(u32, target_mask) << 16) |
+        (0b00 << 24); // TargetListFilter = use list
+    mmioWrite32(gicdAddr(GICD_SGIR), val);
+}
+
+/// Initialize per-CPU GIC interface (for APs — distributor already init'd by BSP).
+pub fn initCpuInterface() void {
+    // Set priority mask to accept all priorities
+    mmioWrite32(giccAddr(GICC_PMR), 0xFF);
+    // Enable CPU interface
+    mmioWrite32(giccAddr(GICC_CTLR), 1);
+}
+
+/// Enable timer PPI 30 for the calling core.
+/// PPIs are per-CPU — each core must enable its own.
+pub fn enableTimerPpi() void {
+    // PPI 30 priority = 0xA0
+    const prio_offset = GICD_IPRIORITYR + 30;
+    const prio_addr = gicdAddr(prio_offset & ~@as(u64, 3));
+    const prio_shift: u5 = @intCast((30 % 4) * 8);
+    var prio_val = mmioRead32(prio_addr);
+    prio_val &= ~(@as(u32, 0xFF) << prio_shift);
+    prio_val |= @as(u32, 0xA0) << prio_shift;
+    mmioWrite32(prio_addr, prio_val);
+
+    // Enable PPI 30 (bit 30 in ISENABLER0)
+    mmioWrite32(gicdAddr(GICD_ISENABLER), @as(u32, 1) << 30);
 }

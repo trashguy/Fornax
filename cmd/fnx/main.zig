@@ -971,6 +971,16 @@ fn parseU8(s: []const u8) ?u8 {
     return @intCast(val);
 }
 
+fn parseU64(s: []const u8) u64 {
+    if (s.len == 0) return 0;
+    var val: u64 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') break;
+        val = val * 10 + (c - '0');
+    }
+    return val;
+}
+
 fn fmtCntrPath(buf: []u8, id: u8, suffix: []const u8) usize {
     const prefix = "/cntr/";
     var pos: usize = 0;
@@ -2110,6 +2120,522 @@ fn registryRequest(
     return null;
 }
 
+
+// -- Parallel pull progress display types and helpers --
+
+const LayerState = enum(u8) { pending, downloading, downloaded, extracting, done, failed };
+
+const LayerProgress = struct {
+    state: u8, // atomic — LayerState
+    bytes_done: u64, // atomic
+    bytes_total: u64, // atomic
+    digest_short: [12]u8,
+};
+
+const DownloadCtx = struct {
+    // Inputs (set by main thread before spawn, read-only for worker)
+    registry_host: []const u8,
+    registry_port: u16,
+    blob_path_buf: [512]u8,
+    blob_path_len: usize,
+    tmp_path_buf: [64]u8,
+    tmp_path_len: usize,
+    use_tls: bool,
+    // Output (atomic writes by worker)
+    progress: *LayerProgress,
+};
+
+fn fmtSize(buf: *[16]u8, bytes: u64) []const u8 {
+    if (bytes >= 1_000_000) {
+        // "X.Y MB"
+        const mb_whole = bytes / 1_000_000;
+        const mb_frac = (bytes % 1_000_000) / 100_000; // one decimal
+        var pos: usize = 0;
+        pos += fmtU64(buf[pos..], mb_whole);
+        buf[pos] = '.';
+        pos += 1;
+        pos += fmtU64(buf[pos..], mb_frac);
+        buf[pos] = ' ';
+        pos += 1;
+        buf[pos] = 'M';
+        pos += 1;
+        buf[pos] = 'B';
+        pos += 1;
+        return buf[0..pos];
+    } else if (bytes >= 1_000) {
+        const kb = bytes / 1_000;
+        var pos: usize = 0;
+        pos += fmtU64(buf[pos..], kb);
+        buf[pos] = ' ';
+        pos += 1;
+        buf[pos] = 'K';
+        pos += 1;
+        buf[pos] = 'B';
+        pos += 1;
+        return buf[0..pos];
+    } else {
+        var pos: usize = 0;
+        pos += fmtU64(buf[pos..], bytes);
+        buf[pos] = ' ';
+        pos += 1;
+        buf[pos] = 'B';
+        pos += 1;
+        return buf[0..pos];
+    }
+}
+
+fn fmtU64(buf: []u8, val: u64) usize {
+    if (val == 0) {
+        buf[0] = '0';
+        return 1;
+    }
+    var tmp: [20]u8 = undefined;
+    var n: usize = 0;
+    var v = val;
+    while (v > 0) : (v /= 10) {
+        tmp[n] = @intCast('0' + (v % 10));
+        n += 1;
+    }
+    // reverse into buf
+    for (0..n) |i| {
+        buf[i] = tmp[n - 1 - i];
+    }
+    return n;
+}
+
+fn renderLayerLine(progress: *const LayerProgress) void {
+    const state: LayerState = @enumFromInt(@atomicLoad(u8, &progress.state, .acquire));
+    const done = @atomicLoad(u64, &progress.bytes_done, .acquire);
+    const total = @atomicLoad(u64, &progress.bytes_total, .acquire);
+
+    // "\r\x1b[K" — clear line
+    stderr.puts("\r\x1b[K");
+
+    // digest
+    stderr.puts(progress.digest_short[0..12]);
+    stderr.puts(": ");
+
+    switch (state) {
+        .pending => stderr.puts("Waiting"),
+        .downloading => {
+            stderr.puts("Downloading [");
+            renderBar(done, total);
+            stderr.puts("] ");
+            var sz1: [16]u8 = undefined;
+            stderr.puts(fmtSize(&sz1, done));
+            stderr.puts(" / ");
+            var sz2: [16]u8 = undefined;
+            stderr.puts(fmtSize(&sz2, total));
+        },
+        .downloaded => {
+            stderr.puts("Download complete   | ");
+            var sz: [16]u8 = undefined;
+            stderr.puts(fmtSize(&sz, total));
+        },
+        .extracting => {
+            stderr.puts("Extracting  [");
+            renderBar(done, total);
+            stderr.puts("] ");
+            var sz1: [16]u8 = undefined;
+            stderr.puts(fmtSize(&sz1, done));
+            stderr.puts(" / ");
+            var sz2: [16]u8 = undefined;
+            stderr.puts(fmtSize(&sz2, total));
+        },
+        .done => stderr.puts("Pull complete"),
+        .failed => stderr.puts("Failed"),
+    }
+    stderr.puts("\n");
+}
+
+fn renderBar(done: u64, total: u64) void {
+    const bar_width: u64 = 20;
+    const filled: u64 = if (total > 0) @min(done * bar_width / total, bar_width) else 0;
+    var bar: [20]u8 = undefined;
+    for (0..bar_width) |i| {
+        if (i < filled) {
+            bar[i] = '=';
+        } else if (i == filled and filled < bar_width) {
+            bar[i] = '>';
+        } else {
+            bar[i] = ' ';
+        }
+    }
+    stderr.puts(bar[0..bar_width]);
+}
+
+fn renderAllLines(progress: []LayerProgress, layer_count: usize) void {
+    // Move cursor up N lines
+    stderr.print("\x1b[{d}A", .{layer_count});
+    // Render each line
+    for (0..layer_count) |i| {
+        renderLayerLine(&progress[i]);
+    }
+}
+
+fn allDownloaded(progress: []LayerProgress, layer_count: usize) bool {
+    for (0..layer_count) |i| {
+        const s: LayerState = @enumFromInt(@atomicLoad(u8, &progress[i].state, .acquire));
+        if (s != .downloaded and s != .failed) return false;
+    }
+    return true;
+}
+
+
+fn downloadThreadFn(arg: *anyopaque) callconv(.c) void {
+    const ctx: *DownloadCtx = @ptrCast(@alignCast(arg));
+    const progress = ctx.progress;
+
+    @atomicStore(u8, &progress.state, @intFromEnum(LayerState.downloading), .release);
+
+    // Build headers on stack (avoid touching global combined_hdrs)
+    var thr_hdrs: [4]http.HeaderEntry = undefined;
+    var hdr_count: usize = 0;
+
+    // Auth header (auth_token_buf/len are read-only during downloads)
+    if (auth_token_len > 0) {
+        thr_hdrs[hdr_count] = .{ .name = "Authorization", .value = auth_value_buf[0..auth_value_len] };
+        hdr_count += 1;
+    }
+    thr_hdrs[hdr_count] = .{ .name = "Accept", .value = "application/vnd.docker.image.rootfs.diff.tar.gzip" };
+    hdr_count += 1;
+
+    // Threads are only used for non-TLS, so no TLS on_connect needed
+    const opts = http.RequestOptions{ .headers = thr_hdrs[0..hdr_count] };
+
+    // Stack-local buffers
+    var thr_header_buf: [8192]u8 = undefined;
+    var thr_io_buf: [16384]u8 = undefined;
+
+    var result = http.request(
+        ctx.registry_host,
+        ctx.registry_port,
+        "GET",
+        ctx.blob_path_buf[0..ctx.blob_path_len],
+        opts,
+        &thr_header_buf,
+    ) orelse {
+        @atomicStore(u8, &progress.state, @intFromEnum(LayerState.failed), .release);
+        return;
+    };
+
+    if (result.resp.status_code < 200 or result.resp.status_code >= 300) {
+        result.conn.close();
+        @atomicStore(u8, &progress.state, @intFromEnum(LayerState.failed), .release);
+        return;
+    }
+
+    // Set total from Content-Length
+    if (result.resp.content_length > 0) {
+        @atomicStore(u64, &progress.bytes_total, @intCast(result.resp.content_length), .release);
+    }
+
+    // Create temp file
+    const tmp_path = ctx.tmp_path_buf[0..ctx.tmp_path_len];
+    const tmp_fd = fx.create(tmp_path, 0);
+    if (tmp_fd < 0) {
+        result.conn.close();
+        @atomicStore(u8, &progress.state, @intFromEnum(LayerState.failed), .release);
+        return;
+    }
+
+    // Download loop
+    var total_written: u64 = 0;
+    while (true) {
+        const n = result.resp.readBody(&thr_io_buf);
+        if (n <= 0) break;
+        const nbytes: usize = @intCast(n);
+        _ = fx.syscall.write(tmp_fd, thr_io_buf[0..nbytes]);
+        total_written += nbytes;
+        @atomicStore(u64, &progress.bytes_done, total_written, .release);
+    }
+
+    _ = fx.close(tmp_fd);
+    result.conn.close();
+
+    // Final total for display accuracy
+    @atomicStore(u64, &progress.bytes_total, total_written, .release);
+    @atomicStore(u64, &progress.bytes_done, total_written, .release);
+    @atomicStore(u8, &progress.state, @intFromEnum(LayerState.downloaded), .release);
+}
+
+fn downloadSequential(ctx: *DownloadCtx) void {
+    const progress = ctx.progress;
+    @atomicStore(u8, &progress.state, @intFromEnum(LayerState.downloading), .release);
+
+    const accept_hdr = [_]http.HeaderEntry{
+        .{ .name = "Accept", .value = "application/vnd.docker.image.rootfs.diff.tar.gzip" },
+    };
+    const opts = makeOpts(&accept_hdr, ctx.use_tls);
+
+    var result = http.request(
+        ctx.registry_host,
+        ctx.registry_port,
+        "GET",
+        ctx.blob_path_buf[0..ctx.blob_path_len],
+        opts,
+        &header_buf,
+    ) orelse {
+        @atomicStore(u8, &progress.state, @intFromEnum(LayerState.failed), .release);
+        return;
+    };
+
+    if (result.resp.status_code < 200 or result.resp.status_code >= 300) {
+        result.conn.close();
+        @atomicStore(u8, &progress.state, @intFromEnum(LayerState.failed), .release);
+        return;
+    }
+
+    if (result.resp.content_length > 0) {
+        @atomicStore(u64, &progress.bytes_total, @intCast(result.resp.content_length), .release);
+    }
+
+    const tmp_path = ctx.tmp_path_buf[0..ctx.tmp_path_len];
+    const tmp_fd = fx.create(tmp_path, 0);
+    if (tmp_fd < 0) {
+        result.conn.close();
+        @atomicStore(u8, &progress.state, @intFromEnum(LayerState.failed), .release);
+        return;
+    }
+
+    var total_written: u64 = 0;
+    while (true) {
+        const n = result.resp.readBody(&pull_io_buf);
+        if (n <= 0) break;
+        const nbytes: usize = @intCast(n);
+        _ = fx.syscall.write(tmp_fd, pull_io_buf[0..nbytes]);
+        total_written += nbytes;
+        @atomicStore(u64, &progress.bytes_done, total_written, .release);
+    }
+
+    _ = fx.close(tmp_fd);
+    result.conn.close();
+
+    @atomicStore(u64, &progress.bytes_total, total_written, .release);
+    @atomicStore(u64, &progress.bytes_done, total_written, .release);
+    @atomicStore(u8, &progress.state, @intFromEnum(LayerState.downloaded), .release);
+}
+
+const FileReaderCtx = struct {
+    fd: i32,
+    bytes_read: u64,
+};
+
+fn fileReadFn(ctx_ptr: *anyopaque, buf: []u8) isize {
+    const ctx: *FileReaderCtx = @ptrCast(@alignCast(ctx_ptr));
+    const n = fx.syscall.read(ctx.fd, buf);
+    if (n > 0) {
+        ctx.bytes_read += @intCast(n);
+    }
+    return n;
+}
+
+const FileGzipReader = struct {
+    bit_reader: deflate.BitReader,
+    inflater: deflate.Inflater,
+
+    fn init(ctx: *FileReaderCtx) FileGzipReader {
+        return .{
+            .bit_reader = deflate.BitReader.init(&fileReadFn, @ptrCast(ctx), &pull_io_buf),
+            .inflater = deflate.Inflater.init(&sliding_window, &inflate_out_buf),
+        };
+    }
+
+    fn skipGzipHeader(self: *FileGzipReader) bool {
+        return deflate.skipGzipHeader(&self.bit_reader);
+    }
+
+    fn readBlock(self: *FileGzipReader, dest: *[tar.HEADER_SIZE]u8) bool {
+        var pos: usize = 0;
+        while (pos < tar.HEADER_SIZE) {
+            if (self.inflater.done) break;
+            const n = self.inflater.readBytes(&self.bit_reader, dest[pos..]);
+            if (n == 0) break;
+            pos += n;
+        }
+        if (pos == 0) return false;
+        if (pos < tar.HEADER_SIZE) {
+            @memset(dest[pos..], 0);
+        }
+        return true;
+    }
+};
+
+fn extractLayerFromFile(file_fd: i32, rootfs_path: []const u8, progress: *LayerProgress, mkdir_cache: *[64]u64) bool {
+    var ctx = FileReaderCtx{ .fd = file_fd, .bytes_read = 0 };
+    var gz = FileGzipReader.init(&ctx);
+
+    if (!gz.skipGzipHeader()) {
+        stderr.puts("fnx: invalid gzip header in layer\n");
+        return false;
+    }
+
+    var zero_blocks: u32 = 0;
+    var header_raw: [tar.HEADER_SIZE]u8 = undefined;
+    while (true) {
+        if (!gz.readBlock(&header_raw)) break;
+        if (tar.isZeroBlock(&header_raw)) {
+            zero_blocks += 1;
+            if (zero_blocks >= 2) break;
+            continue;
+        }
+        zero_blocks = 0;
+        extractEntryBuffered(&header_raw, &gz, rootfs_path, progress, mkdir_cache);
+    }
+    return true;
+}
+
+
+fn fnvHash(data: []const u8) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for (data) |b| {
+        h ^= b;
+        h *%= 0x100000001b3;
+    }
+    return h;
+}
+
+fn mkdirCached(fpath: []const u8, n_len: usize, cache: *[64]u64) void {
+    if (n_len == 0) return;
+    const h = fnvHash(fpath[0..n_len]);
+    const slot = h % 64;
+    if (cache[slot] == h) return; // already created
+    _ = fx.mkdir(fpath[0..n_len]);
+    cache[slot] = h;
+}
+
+fn ensureParentDirsCached(fpath: []const u8, cache: *[64]u64) void {
+    var pi: usize = 0;
+    while (pi < fpath.len) : (pi += 1) {
+        if (fpath[pi] == '/' and pi > 0) {
+            mkdirCached(fpath, pi, cache);
+        }
+    }
+}
+
+fn skipGzBlocksFile(gz: *FileGzipReader, size: u64) void {
+    const blocks = (size + tar.HEADER_SIZE - 1) / tar.HEADER_SIZE;
+    var block: [tar.HEADER_SIZE]u8 = undefined;
+    var bi: u64 = 0;
+    while (bi < blocks) : (bi += 1) {
+        _ = gz.readBlock(&block);
+    }
+}
+
+fn extractEntryBuffered(header_raw: *[tar.HEADER_SIZE]u8, gz: *FileGzipReader, rootfs_path: []const u8, progress: *LayerProgress, mkdir_cache: *[64]u64) void {
+    const hdr = tar.Header{ .raw = header_raw };
+
+    if (!hdr.validateChecksum()) return;
+
+    const name = hdr.name(&path_scratch);
+    const size = hdr.size();
+    const mode_val = hdr.mode();
+    const uid_val = hdr.uid();
+    const gid_val = hdr.gid();
+    const typeflag = hdr.typeflag();
+
+    if (!tar.isSafePath(name)) {
+        if (size > 0 and (typeflag == '0' or typeflag == 0)) {
+            skipGzBlocksFile(gz, size);
+        }
+        return;
+    }
+
+    // Build full path: rootfs_path + "/" + name
+    var full_path: [512]u8 = undefined;
+    var fpos: usize = 0;
+    @memcpy(full_path[fpos..][0..rootfs_path.len], rootfs_path);
+    fpos += rootfs_path.len;
+    full_path[fpos] = '/';
+    fpos += 1;
+    // Strip leading "./" from tar names
+    var clean_name = name;
+    if (clean_name.len >= 2 and clean_name[0] == '.' and clean_name[1] == '/') {
+        clean_name = clean_name[2..];
+    }
+    // Strip leading "/"
+    while (clean_name.len > 0 and clean_name[0] == '/') {
+        clean_name = clean_name[1..];
+    }
+    if (clean_name.len == 0) {
+        if (size > 0 and (typeflag == '0' or typeflag == 0)) {
+            skipGzBlocksFile(gz, size);
+        }
+        return;
+    }
+    if (fpos + clean_name.len > full_path.len) {
+        if (size > 0 and (typeflag == '0' or typeflag == 0)) {
+            skipGzBlocksFile(gz, size);
+        }
+        return;
+    }
+    @memcpy(full_path[fpos..][0..clean_name.len], clean_name);
+    fpos += clean_name.len;
+    const fpath = full_path[0..fpos];
+
+    if (typeflag == '5') {
+        // Directory
+        ensureParentDirsCached(fpath, mkdir_cache);
+        var n_len = fpath.len;
+        while (n_len > 0 and fpath[n_len - 1] == '/') n_len -= 1;
+        if (n_len > 0) {
+            mkdirCached(fpath, n_len, mkdir_cache);
+        }
+    } else if (typeflag == '0' or typeflag == 0) {
+        // Regular file — buffered writes
+        ensureParentDirsCached(fpath, mkdir_cache);
+        const out_fd = fx.create(fpath, 0);
+        if (out_fd < 0) {
+            skipGzBlocksFile(gz, size);
+            return;
+        }
+
+        var write_buf: [4096]u8 = undefined;
+        var wb_pos: usize = 0;
+        var remaining: u64 = size;
+        const blocks = (size + tar.HEADER_SIZE - 1) / tar.HEADER_SIZE;
+        var block_i: u64 = 0;
+        while (block_i < blocks) : (block_i += 1) {
+            var block: [tar.HEADER_SIZE]u8 = undefined;
+            if (!gz.readBlock(&block)) break;
+            const to_write: usize = @intCast(@min(remaining, tar.HEADER_SIZE));
+
+            // Buffer the data
+            var src_off: usize = 0;
+            while (src_off < to_write) {
+                const space = write_buf.len - wb_pos;
+                const chunk = @min(to_write - src_off, space);
+                @memcpy(write_buf[wb_pos..][0..chunk], block[src_off..][0..chunk]);
+                wb_pos += chunk;
+                src_off += chunk;
+
+                if (wb_pos == write_buf.len) {
+                    _ = fx.syscall.write(out_fd, write_buf[0..wb_pos]);
+                    wb_pos = 0;
+                }
+            }
+
+            remaining -= to_write;
+
+            // Update extraction progress
+            @atomicStore(u64, &progress.bytes_done, @atomicLoad(u64, &progress.bytes_done, .acquire) + to_write, .release);
+        }
+
+        // Flush remaining buffer
+        if (wb_pos > 0) {
+            _ = fx.syscall.write(out_fd, write_buf[0..wb_pos]);
+        }
+
+        _ = fx.wstat(out_fd, @intCast(mode_val & 0o7777), @intCast(uid_val), @intCast(gid_val), fx.WSTAT_MODE | fx.WSTAT_UID | fx.WSTAT_GID);
+        _ = fx.close(out_fd);
+    } else {
+        // Symlinks, hardlinks, etc — skip data
+        if (size > 0) {
+            skipGzBlocksFile(gz, size);
+        }
+    }
+}
+
 fn cmdPull(image_str: []const u8) void {
     const ref = parseImageRef(image_str);
 
@@ -2185,9 +2711,10 @@ fn cmdPull(image_str: []const u8) void {
         manifest_data = fetchManifest(&api_path, &ref, manifest_buf[0..]);
     }
 
-    // Step 3: Parse manifest — extract config digest + layer digests
+    // Step 3: Parse manifest — extract config digest + layer digests + sizes
     var config_digest: []const u8 = "";
     var layer_digests: [MAX_LAYERS][]const u8 = undefined;
+    var layer_sizes: [MAX_LAYERS]u64 = undefined;
     var layer_count: usize = 0;
     {
         var parser = json.Parser.init(manifest_data);
@@ -2232,22 +2759,42 @@ fn cmdPull(image_str: []const u8) void {
                         const comma = parser.next();
                         if (comma.kind != .comma) break;
                     }
-                    // Each layer is an object with "digest"
+                    // Each layer is an object with "digest" and "size"
                     tok = parser.next();
                     if (tok.kind != .object_begin) break;
+
+                    var got_digest = false;
+                    var layer_size: u64 = 0;
+                    const obj_start = parser.pos;
+
+                    // Find "digest"
                     if (parser.findKey("digest")) {
                         if (parser.expectString()) |d| {
                             layer_digests[layer_count] = d;
-                            layer_count += 1;
+                            got_digest = true;
                         }
                     }
-                    // Skip rest of layer object
+
+                    // Reset and find "size"
+                    parser.pos = obj_start;
+                    if (parser.findKey("size")) {
+                        if (parser.expectInt()) |sz| {
+                            layer_size = if (sz > 0) @intCast(sz) else 0;
+                        }
+                    }
+
+                    // Skip to end of layer object
+                    parser.pos = obj_start;
                     var depth: u32 = 1;
                     while (depth > 0) {
                         const t = parser.next();
                         if (t.kind == .object_begin) depth += 1;
                         if (t.kind == .object_end) depth -= 1;
                         if (t.kind == .eof) break;
+                    }
+                    if (got_digest) {
+                        layer_sizes[layer_count] = layer_size;
+                        layer_count += 1;
                     }
                 }
             }
@@ -2348,56 +2895,128 @@ fn cmdPull(image_str: []const u8) void {
     // http.request() with redirect handling for CDN 307s)
     closePersistent();
 
-    // Step 7: Download and extract layers
+    // Ensure /tmp exists for layer temp files
+    _ = fx.mkdir("/tmp");
+
+    // Step 7: Download and extract layers (parallel for non-TLS, sequential for TLS)
+    var progress: [MAX_LAYERS]LayerProgress = undefined;
+    var contexts: [MAX_LAYERS]DownloadCtx = undefined;
+    var tmp_paths: [MAX_LAYERS][64]u8 = undefined;
+    var tmp_path_lens: [MAX_LAYERS]usize = undefined;
+
+    // Initialize progress and contexts for each layer
     for (0..layer_count) |li| {
-        stderr.print("Layer {d}/{d}: ", .{ li + 1, layer_count });
-
-        // Short digest for display
         const digest = layer_digests[li];
-        if (digest.len > 19) {
-            stderr.puts(digest[7..19]); // skip "sha256:" prefix, show 12 chars
-        } else {
-            stderr.puts(digest);
-        }
-        stderr.puts("...");
 
-        // Build blob path
-        var blob_path: [512]u8 = undefined;
+        // Short digest for display (12 hex chars after "sha256:")
+        var ds: [12]u8 = undefined;
+        if (digest.len > 19) {
+            @memcpy(ds[0..12], digest[7..19]);
+        } else {
+            const copy_len = @min(digest.len, @as(usize, 12));
+            @memcpy(ds[0..copy_len], digest[0..copy_len]);
+            if (copy_len < 12) @memset(ds[copy_len..], '0');
+        }
+
+        progress[li] = .{
+            .state = @intFromEnum(LayerState.pending),
+            .bytes_done = 0,
+            .bytes_total = layer_sizes[li],
+            .digest_short = ds,
+        };
+
+        // Build blob path: /v2/<name>/blobs/<digest>
         var bpos: usize = 0;
         const bp1 = "/v2/";
-        @memcpy(blob_path[bpos..][0..bp1.len], bp1);
+        @memcpy(contexts[li].blob_path_buf[bpos..][0..bp1.len], bp1);
         bpos += bp1.len;
-        @memcpy(blob_path[bpos..][0..ref.name.len], ref.name);
+        @memcpy(contexts[li].blob_path_buf[bpos..][0..ref.name.len], ref.name);
         bpos += ref.name.len;
         const bp2 = "/blobs/";
-        @memcpy(blob_path[bpos..][0..bp2.len], bp2);
+        @memcpy(contexts[li].blob_path_buf[bpos..][0..bp2.len], bp2);
         bpos += bp2.len;
-        @memcpy(blob_path[bpos..][0..digest.len], digest);
+        @memcpy(contexts[li].blob_path_buf[bpos..][0..digest.len], digest);
         bpos += digest.len;
+        contexts[li].blob_path_len = bpos;
 
-        const accept_hdr = [_]http.HeaderEntry{
-            .{ .name = "Accept", .value = "application/vnd.docker.image.rootfs.diff.tar.gzip" },
-        };
-        const opts = makeOpts(&accept_hdr, ref.use_tls);
+        // Build temp path: /tmp/fnx-layer-N
+        var tpos: usize = 0;
+        const tp1 = "/tmp/fnx-layer-";
+        @memcpy(tmp_paths[li][tpos..][0..tp1.len], tp1);
+        tpos += tp1.len;
+        tpos += fmtU64(tmp_paths[li][tpos..], li);
+        tmp_paths[li][tpos] = 0; // for display only
+        tmp_path_lens[li] = tpos;
+        @memcpy(contexts[li].tmp_path_buf[0..tpos], tmp_paths[li][0..tpos]);
+        contexts[li].tmp_path_len = tpos;
 
-        var result = http.request(ref.registry_host, ref.registry_port, "GET", blob_path[0..bpos], opts, &header_buf) orelse {
-            stderr.puts(" failed to connect\n");
-            fx.exit(1);
-        };
+        contexts[li].registry_host = ref.registry_host;
+        contexts[li].registry_port = ref.registry_port;
+        contexts[li].use_tls = ref.use_tls;
+        contexts[li].progress = &progress[li];
+    }
 
-        if (result.resp.status_code < 200 or result.resp.status_code >= 300) {
-            result.conn.close();
-            stderr.print(" HTTP {d}\n", .{result.resp.status_code});
-            fx.exit(1);
+    // Print N blank lines for progress display
+    for (0..layer_count) |_| {
+        stderr.puts("\n");
+    }
+
+    if (!ref.use_tls) {
+        // PARALLEL: Spawn download threads for non-TLS
+        var handles: [MAX_LAYERS]fx.thread.ThreadHandle = undefined;
+        var spawned: [MAX_LAYERS]bool = undefined;
+        for (0..layer_count) |i| {
+            if (fx.thread.spawnThread(downloadThreadFn, @ptrCast(&contexts[i]))) |h| {
+                handles[i] = h;
+                spawned[i] = true;
+            } else |_| {
+                // Fallback: download sequentially inline
+                spawned[i] = false;
+                downloadSequential(&contexts[i]);
+            }
         }
 
-        // Stream: HTTP body → gzip → tar → extract
-        if (extractLayer(&result.resp, rootfs_path)) {
-            stderr.puts(" done\n");
+        // Display loop until all downloaded
+        while (!allDownloaded(progress[0..layer_count], layer_count)) {
+            renderAllLines(progress[0..layer_count], layer_count);
+            fx.sleep(200);
+        }
+        // Final render
+        renderAllLines(progress[0..layer_count], layer_count);
+
+        // Join all threads
+        for (0..layer_count) |i| {
+            if (spawned[i]) {
+                fx.thread.join(&handles[i]);
+            }
+        }
+    } else {
+        // SEQUENTIAL (TLS): Download one at a time with progress
+        for (0..layer_count) |i| {
+            downloadSequential(&contexts[i]);
+            renderAllLines(progress[0..layer_count], layer_count);
+        }
+    }
+
+    // Extract phase (always sequential — reuses BSS globals)
+    var mkdir_cache: [64]u64 = undefined;
+    @memset(&mkdir_cache, 0);
+
+    for (0..layer_count) |i| {
+        @atomicStore(u8, &progress[i].state, @intFromEnum(LayerState.extracting), .release);
+        @atomicStore(u64, &progress[i].bytes_done, 0, .release);
+
+        const tmp_path = tmp_paths[i][0..tmp_path_lens[i]];
+        const fd = fx.open(tmp_path);
+        if (fd >= 0) {
+            _ = extractLayerFromFile(fd, rootfs_path, &progress[i], &mkdir_cache);
+            _ = fx.close(fd);
+            _ = fx.remove(tmp_path);
+            @atomicStore(u8, &progress[i].state, @intFromEnum(LayerState.done), .release);
         } else {
-            stderr.puts(" extraction failed\n");
+            @atomicStore(u8, &progress[i].state, @intFromEnum(LayerState.failed), .release);
         }
-        result.conn.close();
+        renderAllLines(progress[0..layer_count], layer_count);
     }
 
     out.puts("Successfully pulled '");

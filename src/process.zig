@@ -888,6 +888,9 @@ pub fn markReady(proc: *Process) void {
         } else if (arch == .riscv64) {
             const smp = @import("arch/riscv64/smp.zig");
             smp.sendIpi(target_core, smp.IPI_SCHEDULE);
+        } else if (arch == .aarch64) {
+            const smp = @import("arch/aarch64/smp.zig");
+            smp.sendIpi(target_core, smp.IPI_SCHEDULE);
         }
     }
 }
@@ -897,7 +900,7 @@ pub fn markReady(proc: *Process) void {
 /// The current core flushes its own TLB directly; remote cores get an IPI.
 pub fn tlbShootdown(proc: *const Process) void {
     const arch = @import("builtin").cpu.arch;
-    if (arch != .x86_64 and arch != .riscv64) return;
+    if (arch != .x86_64 and arch != .riscv64 and arch != .aarch64) return;
     if (percpu.cores_online <= 1) return;
 
     const my_core = percpu.getCoreId();
@@ -912,6 +915,8 @@ pub fn tlbShootdown(proc: *const Process) void {
                 @import("arch/x86_64/cpu.zig").flushTlb();
             } else if (arch == .riscv64) {
                 cpu.sfenceVma();
+            } else if (arch == .aarch64) {
+                @import("arch/aarch64/cpu.zig").flushTlb();
             }
         } else {
             // Set pending flag and send IPI
@@ -921,6 +926,9 @@ pub fn tlbShootdown(proc: *const Process) void {
                 apic.sendIpi(apic.lapic_ids[core], apic.IPI_TLB_SHOOTDOWN);
             } else if (arch == .riscv64) {
                 const smp = @import("arch/riscv64/smp.zig");
+                smp.sendIpi(core, smp.IPI_TLB_SHOOTDOWN);
+            } else if (arch == .aarch64) {
+                const smp = @import("arch/aarch64/smp.zig");
                 smp.sendIpi(core, smp.IPI_TLB_SHOOTDOWN);
             }
         }
@@ -1059,6 +1067,17 @@ pub fn scheduleNext() noreturn {
             const sched_top = percpu.asm_states[core_id].scheduler_stack_top;
             if (sched_top != 0) {
                 asm volatile ("mv sp, %[stack]"
+                    :
+                    : [stack] "r" (sched_top),
+                );
+                percpu.asm_states[core_id].kernel_stack_top = sched_top;
+            }
+        },
+        .aarch64 => {
+            const core_id = percpu.getCoreId();
+            const sched_top = percpu.asm_states[core_id].scheduler_stack_top;
+            if (sched_top != 0) {
+                asm volatile ("mov sp, %[stack]"
                     :
                     : [stack] "r" (sched_top),
                 );

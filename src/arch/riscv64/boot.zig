@@ -16,15 +16,16 @@ const heap = @import("../../heap.zig");
 const klog = @import("../../klog.zig");
 const initrd_mod = @import("../../initrd.zig");
 const main = @import("../../main.zig");
+const fdt = @import("fdt.zig");
 
 /// QEMU virt: RAM starts at 0x80000000 (2 GiB).
 const RAM_BASE: u64 = 0x8000_0000;
 
-/// Default RAM size (matches QEMU -m 256M).
+/// Default RAM size (fallback if FDT parsing fails).
 const RAM_SIZE: u64 = 256 * 1024 * 1024;
 
-/// Reserve first 32 MB for OpenSBI + kernel + boot data.
-const RESERVED_END: u64 = RAM_BASE + 32 * 1024 * 1024;
+/// Reservation for OpenSBI + kernel + boot data (32 MB from RAM base).
+const RESERVED_SIZE: u64 = 32 * 1024 * 1024;
 
 /// Well-known initrd load address. QEMU script uses:
 ///   -device loader,file=INITRD,addr=0x8400_0000,force-raw=on
@@ -46,8 +47,8 @@ comptime {
 pub var boot_hartid: u64 = 0;
 
 /// Kernel entry point called from _start in entry.S.
-/// a0 = hartid, a1 = FDT pointer (currently unused).
-export fn riscv64KernelMain(hartid: u64, _: u64) callconv(.c) noreturn {
+/// a0 = hartid, a1 = FDT pointer (passed by OpenSBI).
+export fn riscv64KernelMain(hartid: u64, dtb_ptr: u64) callconv(.c) noreturn {
     boot_hartid = hartid;
 
     // Serial console first — earliest possible output
@@ -59,8 +60,26 @@ export fn riscv64KernelMain(hartid: u64, _: u64) callconv(.c) noreturn {
     // Skip console.init() so console stays uninitialized — putChar
     // will output to serial only.
 
-    // Physical memory manager from hardcoded QEMU virt layout
-    pmm.initDirect(RAM_BASE, RAM_SIZE, RESERVED_END);
+    // Detect RAM from FDT, fall back to hardcoded values
+    var ram_base = RAM_BASE;
+    var ram_size = RAM_SIZE;
+
+    if (fdt.probeMemory(dtb_ptr)) |mem_region| {
+        ram_base = mem_region.base;
+        ram_size = mem_region.size;
+        klog.info("FDT: RAM at 0x");
+        klog.infoHex(ram_base);
+        klog.info(" size ");
+        klog.infoDec(ram_size / (1024 * 1024));
+        klog.info(" MB\n");
+    } else {
+        klog.warn("FDT: memory probe failed, using defaults (");
+        klog.warnDec(RAM_SIZE / (1024 * 1024));
+        klog.warn(" MB)\n");
+    }
+
+    const reserved_end = ram_base + RESERVED_SIZE;
+    pmm.initDirect(ram_base, ram_size, reserved_end);
 
     // Kernel heap
     heap.init();

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const boot = @import("boot.zig");
+const mem = @import("mem.zig");
 const klog = @import("klog.zig");
 const SpinLock = @import("spinlock.zig").SpinLock;
 
@@ -24,7 +25,9 @@ pub const PmmError = error{
 pub fn init(memory_map: boot.MemoryMap) PmmError!void {
     const map = memory_map.slice;
 
-    // Pass 1: Find highest physical address to determine bitmap size
+    // Pass 1: Find highest physical address to determine bitmap size.
+    // Cap at KERNEL_MAP_SIZE — the paging code only identity-maps this much,
+    // so pages above it would be inaccessible via physPtr() and cause faults.
     var highest_addr: u64 = 0;
     {
         var it = map.iterator();
@@ -35,17 +38,23 @@ pub fn init(memory_map: boot.MemoryMap) PmmError!void {
             }
         }
     }
+    if (highest_addr > mem.KERNEL_MAP_SIZE) {
+        highest_addr = mem.KERNEL_MAP_SIZE;
+    }
 
     total_pages = @intCast(highest_addr / page_size);
     bitmap_size = (total_pages + 7) / 8;
 
-    // Pass 2: Find a large enough conventional memory region to place the bitmap
+    // Pass 2: Find a large enough conventional memory region to place the bitmap.
+    // Skip regions starting at address 0 — @ptrFromInt(0) is a null pointer in Zig,
+    // and page 0 should remain reserved regardless.
     var bitmap_phys: u64 = 0;
     var found = false;
     {
         var it = map.iterator();
         while (it.next()) |desc| {
             if (desc.type != .conventional_memory) continue;
+            if (desc.physical_start == 0) continue;
             const region_size = desc.number_of_pages * page_size;
             if (region_size >= bitmap_size) {
                 bitmap_phys = desc.physical_start;
@@ -63,14 +72,16 @@ pub fn init(memory_map: boot.MemoryMap) PmmError!void {
     // Mark everything as used (bit = 0 means free, bit = 1 means used)
     @memset(bitmap[0..bitmap_size], 0xFF);
 
-    // Pass 3: Mark conventional memory as free
+    // Pass 3: Mark conventional memory as free (clamped to total_pages)
     {
         var it = map.iterator();
         while (it.next()) |desc| {
             if (desc.type != .conventional_memory) continue;
             const start_page: usize = @intCast(desc.physical_start / page_size);
             const num_pages: usize = @intCast(desc.number_of_pages);
-            for (start_page..start_page + num_pages) |page| {
+            const end_page = @min(start_page + num_pages, total_pages);
+            if (start_page >= total_pages) continue;
+            for (start_page..end_page) |page| {
                 markFree(page);
             }
         }
@@ -107,7 +118,8 @@ pub fn init(memory_map: boot.MemoryMap) PmmError!void {
 /// `reserved_end`: everything below this address is reserved (firmware + kernel + initrd).
 /// The bitmap is placed at `reserved_end`, free memory starts after it.
 pub fn initDirect(ram_base: u64, ram_size: u64, reserved_end: u64) void {
-    const ram_end = ram_base + ram_size;
+    const raw_end = ram_base + ram_size;
+    const ram_end = if (raw_end > mem.KERNEL_MAP_SIZE) mem.KERNEL_MAP_SIZE else raw_end;
 
     total_pages = @intCast(ram_end / page_size);
     bitmap_size = (total_pages + 7) / 8;

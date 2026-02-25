@@ -63,6 +63,7 @@ def run_test_session(session_name, ovmf, build_flags, tests, tmpdir,
     passed = 0
     failed = 0
     qemu = None
+    disk_subdir = None
     full_log = b""
 
     # Set arch/session for test log output
@@ -162,7 +163,7 @@ def run_test_session(session_name, ovmf, build_flags, tests, tmpdir,
             qemu.stop()
         # Clean up disk image to free space for subsequent sessions
         import shutil
-        if os.path.isdir(disk_subdir):
+        if disk_subdir and os.path.isdir(disk_subdir):
             shutil.rmtree(disk_subdir, ignore_errors=True)
 
     log("SESSION", f"{session_name}: {passed} passed, {failed} failed\n")

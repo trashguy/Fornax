@@ -165,27 +165,16 @@ user_sync_entry:
     mrs     x0, spsr_el1
     str     x0, [sp, #33*8]
 
-    // Save kernel RSP to global (for resume_from_kernel_frame)
-    adrp    x1, saved_kernel_rsp
-    add     x1, x1, :lo12:saved_kernel_rsp
+    // Save per-CPU state via TPIDR_EL1 (per-CPU AsmState pointer)
+    mrs     x1, tpidr_el1                     // per-CPU AsmState ptr
     mov     x0, sp
-    str     x0, [x1]
-
-    // Save user context to globals (for process.zig saveCurrentContext)
-    adrp    x1, saved_user_rip
-    add     x1, x1, :lo12:saved_user_rip
-    ldr     x0, [sp, #32*8]    // ELR_EL1
-    str     x0, [x1]
-
-    adrp    x1, saved_user_rsp
-    add     x1, x1, :lo12:saved_user_rsp
-    ldr     x0, [sp, #31*8]    // SP_EL0
-    str     x0, [x1]
-
-    adrp    x1, saved_user_rflags
-    add     x1, x1, :lo12:saved_user_rflags
-    ldr     x0, [sp, #33*8]    // SPSR_EL1
-    str     x0, [x1]
+    str     x0, [x1, #32]                     // saved_kernel_rsp
+    ldr     x0, [sp, #32*8]                   // ELR_EL1
+    str     x0, [x1, #16]                     // saved_user_rip
+    ldr     x0, [sp, #31*8]                   // SP_EL0
+    str     x0, [x1, #8]                      // saved_user_rsp
+    ldr     x0, [sp, #33*8]                   // SPSR_EL1
+    str     x0, [x1, #24]                     // saved_user_rflags
 
     // Check exception class (ESR_EL1 bits [31:26])
     mrs     x0, esr_el1
@@ -255,27 +244,16 @@ user_irq_entry:
     mrs     x0, spsr_el1
     str     x0, [sp, #33*8]
 
-    // Save kernel RSP
-    adrp    x1, saved_kernel_rsp
-    add     x1, x1, :lo12:saved_kernel_rsp
+    // Save per-CPU state via TPIDR_EL1
+    mrs     x1, tpidr_el1
     mov     x0, sp
-    str     x0, [x1]
-
-    // Save user context to globals
-    adrp    x1, saved_user_rip
-    add     x1, x1, :lo12:saved_user_rip
+    str     x0, [x1, #32]                     // saved_kernel_rsp
     ldr     x0, [sp, #32*8]
-    str     x0, [x1]
-
-    adrp    x1, saved_user_rsp
-    add     x1, x1, :lo12:saved_user_rsp
+    str     x0, [x1, #16]                     // saved_user_rip
     ldr     x0, [sp, #31*8]
-    str     x0, [x1]
-
-    adrp    x1, saved_user_rflags
-    add     x1, x1, :lo12:saved_user_rflags
+    str     x0, [x1, #8]                      // saved_user_rsp
     ldr     x0, [sp, #33*8]
-    str     x0, [x1]
+    str     x0, [x1, #24]                     // saved_user_rflags
 
     // Dispatch interrupt
     bl      handleInterruptAa64
@@ -336,9 +314,8 @@ resume_user_mode:
 
     // Set SP_EL1 to this process's kernel stack top so the next
     // EL0→EL1 trap uses the correct kernel stack (not the scheduler's).
-    adrp    x4, kernel_stack_top
-    add     x4, x4, :lo12:kernel_stack_top
-    ldr     x4, [x4]
+    mrs     x4, tpidr_el1
+    ldr     x4, [x4, #0]                      // ASM_KERNEL_STACK_TOP
     mov     sp, x4
 
     // Return value in x0
@@ -386,3 +363,109 @@ resume_user_mode:
 resume_from_kernel_frame:
     mov     sp, x0
     b       trap_return
+
+// ──────────────────────────────────────────────────────────────────────
+// ap_entry_asm — AP entry point for PSCI CPU_ON (naked trampoline)
+// ──────────────────────────────────────────────────────────────────────
+// PSCI delivers AP at EL1 with MMU OFF, x0 = context_id (core_id).
+// BSP sets globals: ap_stack_top (phys), ap_ttbr0, ap_ttbr1, ap_mair,
+// ap_tcr, ap_sctlr.
+//
+// Sequence: set SP, configure MMU, enable MMU, convert SP to virtual, call Zig.
+    .global ap_entry_asm
+    .balign 64
+ap_entry_asm:
+    // x0 = core_id (context_id from PSCI CPU_ON)
+    // Save core_id in x19 (callee-saved, survives function calls)
+    mov     x19, x0
+
+    // Load physical stack top
+    adrp    x1, ap_stack_top
+    add     x1, x1, :lo12:ap_stack_top
+    ldr     x1, [x1]
+    mov     sp, x1
+
+    // Configure MAIR_EL1
+    adrp    x1, ap_mair
+    add     x1, x1, :lo12:ap_mair
+    ldr     x1, [x1]
+    msr     mair_el1, x1
+
+    // Configure TCR_EL1
+    adrp    x1, ap_tcr
+    add     x1, x1, :lo12:ap_tcr
+    ldr     x1, [x1]
+    msr     tcr_el1, x1
+
+    // Set TTBR0_EL1 (identity map — needed for PC-relative code after MMU on)
+    adrp    x1, ap_ttbr0
+    add     x1, x1, :lo12:ap_ttbr0
+    ldr     x1, [x1]
+    msr     ttbr0_el1, x1
+
+    // Set TTBR1_EL1 (higher-half kernel map)
+    adrp    x1, ap_ttbr1
+    add     x1, x1, :lo12:ap_ttbr1
+    ldr     x1, [x1]
+    msr     ttbr1_el1, x1
+
+    // Synchronize
+    isb
+    tlbi    vmalle1is
+    dsb     sy
+    isb
+
+    // Enable MMU via SCTLR_EL1
+    adrp    x1, ap_sctlr
+    add     x1, x1, :lo12:ap_sctlr
+    ldr     x1, [x1]
+    msr     sctlr_el1, x1
+    isb
+
+    // Convert SP from physical to higher-half virtual address.
+    // KERNEL_VIRT_BASE = 0xFFFF_8000_0000_0000
+    // Must do this BEFORE calling Zig — function prologue sets frame pointer
+    // from SP. Changing SP mid-function corrupts stack frames.
+    mov     x1, #0x8000
+    movk    x1, #0xFFFF, lsl #16
+    lsl     x1, x1, #32             // x1 = 0xFFFF_8000_0000_0000
+    add     sp, sp, x1
+
+    // Use SP_EL1 in EL1 mode
+    msr     spsel, #1
+    isb
+
+    // Call Zig AP init: apEntryZig(core_id)
+    mov     x0, x19
+    bl      apEntryZig
+
+    // Should not return
+1:  wfi
+    b       1b
+
+// AP trampoline data — written by BSP before PSCI CPU_ON
+    .section .data
+    .balign 8
+    .global ap_stack_top
+ap_stack_top:
+    .quad 0
+
+    .global ap_ttbr0
+ap_ttbr0:
+    .quad 0
+
+    .global ap_ttbr1
+ap_ttbr1:
+    .quad 0
+
+    .global ap_mair
+ap_mair:
+    .quad 0
+
+    .global ap_tcr
+ap_tcr:
+    .quad 0
+
+    .global ap_sctlr
+ap_sctlr:
+    .quad 0

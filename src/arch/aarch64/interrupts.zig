@@ -52,20 +52,32 @@ fn dispatchSlot(slot: usize) void {
 
 /// Main interrupt handler — called from entry.S for both user and kernel IRQs.
 export fn handleInterruptAa64() callconv(.c) void {
+    const percpu = @import("../../percpu.zig");
+    const cpu = @import("cpu.zig");
+
     // Increment per-core interrupt counter
     {
-        const percpu = @import("../../percpu.zig");
         const core_id = percpu.getCoreId();
         percpu.percpu_array[core_id].interrupts += 1;
     }
 
     while (true) {
-        const irq = gic.claim();
+        const iar = gic.claim();
+        const irq = iar & 0x3FF; // IRQ ID is bits [9:0]
         if (irq >= 1020) break; // 1023 = spurious, 1022 = group 1
 
         @import("../../trace.zig").trace(.irq_enter, @truncate(irq));
 
-        if (irq == 30) {
+        if (irq < 16) {
+            // SGI (Software Generated Interrupt) — IPI
+            // Check for TLB shootdown request
+            const core_id = percpu.getCoreId();
+            if (@atomicLoad(bool, &percpu.percpu_array[core_id].tlb_flush_pending, .acquire)) {
+                cpu.flushTlb();
+                @atomicStore(bool, &percpu.percpu_array[core_id].tlb_flush_pending, false, .release);
+            }
+            // Schedule IPI: nothing to do — scheduleNext checks run queue naturally
+        } else if (irq == 30) {
             // PPI 30 = physical timer → dispatch as slot 0 (timer)
             dispatchSlot(0);
         } else if (irq < 64) {
@@ -77,7 +89,8 @@ export fn handleInterruptAa64() callconv(.c) void {
             klog.debug(": unhandled (>63)\n");
         }
 
-        gic.complete(irq);
+        // Pass full IAR value to EOIR (includes source CPU bits for SGIs)
+        gic.complete(iar);
 
         @import("../../trace.zig").trace(.irq_exit, @truncate(irq));
     }

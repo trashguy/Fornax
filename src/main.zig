@@ -130,6 +130,10 @@ pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize, rsdp: ?[*]const
         // riscv64: Start secondary harts via SBI HSM
         const smp = @import("arch/riscv64/smp.zig");
         smp.init();
+    } else if (builtin.cpu.arch == .aarch64) {
+        // aarch64: Start secondary CPUs via PSCI CPU_ON
+        const smp = @import("arch/aarch64/smp.zig");
+        smp.init();
     }
 
     // Phase 23: Serial console input (COM1 IRQ 4 on x86_64, UART PLIC IRQ 10 on riscv64)

@@ -223,3 +223,64 @@ pub fn resetSystem() noreturn {
     );
     halt();
 }
+
+/// PSCI CPU_ON (0xC4000003) — start a secondary CPU.
+/// target_cpu = MPIDR affinity value, entry_point = physical address,
+/// context_id = opaque value passed to the target CPU.
+/// Returns 0 on success, negative PSCI error code on failure.
+pub fn psciCpuOn(target_cpu: u64, entry_point: u64, context_id: u64) i64 {
+    return asm volatile (
+        \\hvc #0
+        : [ret] "={x0}" (-> i64),
+        : [fid] "{x0}" (@as(u64, 0xC4000003)),
+          [cpu] "{x1}" (target_cpu),
+          [ep] "{x2}" (entry_point),
+          [ctx] "{x3}" (context_id),
+        : .{.memory = true});
+}
+
+/// PSCI AFFINITY_INFO (0xC4000004) — query CPU power state.
+/// Returns 0=ON, 1=OFF, 2=ON_PENDING.
+pub fn psciAffinityInfo(target_cpu: u64) i64 {
+    return asm volatile (
+        \\hvc #0
+        : [ret] "={x0}" (-> i64),
+        : [fid] "{x0}" (@as(u64, 0xC4000004)),
+          [cpu] "{x1}" (target_cpu),
+          [aff] "{x2}" (@as(u64, 0)), // lowest affinity level
+        : .{.memory = true});
+}
+
+// ── Per-CPU register (TPIDR_EL1) ────────────────────────────────────
+
+/// Read TPIDR_EL1 — kernel-only per-CPU pointer register.
+pub inline fn readTpidrEl1() u64 {
+    return asm volatile ("mrs %[ret], tpidr_el1"
+        : [ret] "=r" (-> u64),
+    );
+}
+
+/// Write TPIDR_EL1 — set per-CPU pointer for this core.
+pub inline fn writeTpidrEl1(val: u64) void {
+    asm volatile ("msr tpidr_el1, %[val]"
+        :
+        : [val] "r" (val),
+    );
+}
+
+// ── MPIDR (core identification) ─────────────────────────────────────
+
+/// Read MPIDR_EL1 — multiprocessor affinity register.
+/// On QEMU virt, bits [7:0] (Aff0) = core ID.
+pub inline fn readMpidr() u64 {
+    return asm volatile ("mrs %[ret], mpidr_el1"
+        : [ret] "=r" (-> u64),
+    );
+}
+
+// ── TLB flush (naming consistency with x86_64/riscv64) ──────────────
+
+/// Flush entire TLB — alias for tlbiAll().
+pub fn flushTlb() void {
+    tlbiAll();
+}
