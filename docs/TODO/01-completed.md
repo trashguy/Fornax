@@ -24,8 +24,9 @@
 | 100 | TCP (full connection lifecycle, `/net/tcp` file interface) |
 | 101 | DNS resolver (`/net/dns` file server) |
 | — | Pipes, core utilities (echo, cat, ls, rm, mkdir, wc), shell enhancements |
-| 150 | Login / getty, users, groups, /etc/passwd, su |
-| 200 | Kernel `/proc` file tree (process info, meminfo, kill via ctl) |
+| 130 | VMS-style fault supervisor (backoff, dependencies, health probes, cascade, `/proc/supervisor` ctl) |
+| 150 | Login / getty, users, groups, /etc/passwd, su, adduser |
+| 200 | Kernel `/proc` file tree (status, ctl, meminfo, supervisor) |
 | 201 | `seek` + `getpid` syscalls |
 | 203 | Text processing (grep, sed, awk, less) |
 | 204 | Process & system management (ps, kill, du, top) |
@@ -36,6 +37,8 @@
 | 300-305 | fxfs filesystem, GPT partitions, virtio-blk, pread/pwrite |
 | 306-313 | fxfs feature-complete (B-tree splitting, multi-extent, rename, truncate, timestamps, multi-block bitmap, CRC32, virtual devices, dd) |
 | 400-405 | xHCI USB (keyboard + mouse, PCI MMIO, boot protocol) |
+| 500 | NVMe block device driver (PCIe NVM, admin+I/O queues) |
+| 501 | AHCI/SATA block device driver (DMA, IDENTIFY DEVICE) |
 | A-G | SMP (ticket spinlocks, per-CPU state, AP startup, run queues, work stealing, TLB shootdown) |
 | H-K | Kernel threads (clone, futex, thread groups, POSIX pthread support) |
 | 1000 | C/POSIX realms (native C via fornax.h, musl libc + syscall shim) |
@@ -43,6 +46,14 @@
 | 1001i | TCC cross-compiled as POSIX program |
 | 1002 | Container system (fnx CLI, Containerfile, Linux compat, bridge + NAT) |
 | 3A-3D | Userspace networking (netd, per-realm stacks, /dev/ether0, bridge server) |
+| — | Kernel trace buffer (`/dev/trace`, per-CPU ring buffers, ktrace command) |
+| — | Time subsystem + cron (RTC, wallclock, `/dev/time`, date/uptime, crond) |
+| — | System-wide ctl files (`/dev/sysname`, `/dev/time`, `/dev/kmesg`, `/dev/reboot`, `/dev/drivers`, `/dev/sysstat`, etc.) |
+| — | OCI registry pull (Docker Registry v2, bearer auth, manifest list, streaming extraction) |
+| — | TLS via BearSSL (TlsConnection, PEM trust anchors, CA bundle) |
+| — | RISC-V 64 port (Sv48, PLIC, PCI ECAM, MMIO UART, virtio-net/blk) |
+| — | lspci, lscpu, lsblk, lsusb, df device utilities |
+| — | Multi-threaded fxfs (4 worker threads, fs_lock Mutex) |
 
 ## Milestones Reached
 
@@ -65,3 +76,6 @@
 | 14 | Container runs with Linux binary compat | 1002 |
 | 15 | C program compiled and run on Fornax | 1000 |
 | 16 | Userspace TCP/IP stack serves per-realm networking | 3A-3D |
+| 17 | Crashed server transparently restarts with dependency ordering | 130 |
+| 18 | NVMe + AHCI/SATA block device support | 500-501 |
+| 19 | TLS-secured OCI image pull from Docker Hub | TLS + OCI |

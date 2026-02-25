@@ -4,7 +4,6 @@
 
 | Phase | Description | Depends On |
 |-------|-------------|------------|
-| 130 | VMS-style fault supervisor (backoff, dependencies, health probes, ctl) | 13, 200 |
 | 202 | File management (cp/mv/rmdir/touch) | 24 |
 | 207 | envfs — environment variable virtual filesystem | 24 |
 
@@ -71,6 +70,7 @@ Build with: `zig build x86_64 -Dviceroy=true`
 
 ```
 Phases 1-24, 100-101 (done)
+├── 130 VMS supervisor (done)
 ├── 150 login/getty (done)
 ├── 200 /proc (done) ── 201 seek+getpid (done) ── 204 ps/kill/top (done)
 ├── 203 text processing (done)
@@ -80,14 +80,16 @@ Phases 1-24, 100-101 (done)
 ├── 215 virtual consoles (done)
 ├── 300-313 fxfs filesystem (done)
 ├── 400-405 xHCI USB (done)
+├── 500-501 NVMe + AHCI/SATA (done)
 ├── A-G SMP (done) ── H-K threads (done)
 ├── 1000 POSIX realms (done) ── 1001i TCC (done)
-├── 1001a-d foundation libs (done)
+├── 1001a-d,l foundation libs (done)
 ├── 1002 containers (done)
 ├── 3A-3D userspace networking (done)
+├── TLS + OCI registry pull (done)
+├── Kernel trace, time/cron, ctl files, RISC-V port (done)
 │
 ├── Next:
-│   ├── 130 VMS supervisor (backoff, deps, health, ctl)
 │   ├── 202 file management
 │   ├── 207 envfs
 │   └── 1001e-k fay package manager
@@ -115,13 +117,12 @@ Phases 1-24, 100-101 (done)
 
 | # | Goal | Phases | Status |
 |---|------|--------|--------|
-| 17 | Crashed server transparently restarts with client reconnection | 130 | Not started |
-| 18 | `fay install` fetches and installs a package | 1001e-k | Not started |
-| 19a | RTL8125 NIC driver serves /dev/ether0 on real hardware | 2100 | Not started |
-| 19 | Framebuffer accessible from userspace srv/gpu | 2000 | Not started |
-| 20 | Native app draws in a window | 2004 | Not started |
-| 21 | Chrome renders in a Fornax window | 2007 | Not started |
-| 22 | Two Fornax nodes discover each other | 3000 | Not started (requires `-Dcluster=true`) |
-| 23 | Mount remote node's namespace | 3001 | Not started (requires `-Dcluster=true`) |
-| 24 | `deploy apply` schedules a service across cluster | 3003 | Not started (requires `-Dviceroy=true`) |
-| 25 | Zero-downtime rolling update | 3005 | Not started (requires `-Dviceroy=true`) |
+| 20 | `fay install` fetches and installs a package | 1001e-k | Not started |
+| 21 | RTL8125 NIC driver serves /dev/ether0 on real hardware | 2100 | Not started |
+| 22 | Framebuffer accessible from userspace srv/gpu | 2000 | Not started |
+| 23 | Native app draws in a window | 2004 | Not started |
+| 24 | Chrome renders in a Fornax window | 2007 | Not started |
+| 25 | Two Fornax nodes discover each other | 3000 | Not started (requires `-Dcluster=true`) |
+| 26 | Mount remote node's namespace | 3001 | Not started (requires `-Dcluster=true`) |
+| 27 | `deploy apply` schedules a service across cluster | 3003 | Not started (requires `-Dviceroy=true`) |
+| 28 | Zero-downtime rolling update | 3005 | Not started (requires `-Dviceroy=true`) |

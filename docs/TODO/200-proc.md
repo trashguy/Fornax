@@ -12,50 +12,98 @@ Intercept `/proc/*` paths in `sysOpen`/`sysRead`/`sysWrite` exactly like `/net/*
 
 ---
 
-## 200.1: `/proc` directory listing
+## Implementation
 
-**File:** `src/syscall.zig` (add `/proc` interception alongside `/net`)
+All `/proc` handling is in `src/devfiles.zig` (`procRead` / `procWrite`), dispatched by `ProcFdKind` stored in each fd.
 
-- `open("/proc")` → allocate fd with new `NetFdKind` variant `.proc_dir`
-- `read(proc_dir_fd, buf)` → serialize active process PIDs as `DirEntry` structs (same format `ls` already parses)
-- Follows exact pattern of `netfs.netOpen()` dispatch
+### 200.1: `/proc` directory listing
 
-## 200.2: `/proc/N/status` — per-process info
+- `open("/proc")` → allocate fd with `ProcFdKind.dir`
+- `read()` → serializes active process PIDs as `ProcDirEntry` structs (same format `ls` parses)
+- Also lists `meminfo` and `supervisor` entries
 
-- `open("/proc/5/status")` → fd with `.proc_status` kind, stores target PID
-- `read()` → returns text: `pid 5\nppid 2\nstate running\npages 12\n`
-- Read from `process.process_table[N]` directly (kernel code, has access)
+### 200.2: `/proc/N` — per-process directory
 
-## 200.3: `/proc/N/ctl` — process control
+- `open("/proc/5")` → fd with `ProcFdKind.pid_dir`
+- `read()` → lists `status` and `ctl` as directory entries
 
-- `open("/proc/5/ctl")` → fd with `.proc_ctl` kind
-- `write(fd, "kill")` → terminate target process (mark zombie, wake parent, clean up fds/pipes)
-- Only allowed if caller is parent/ancestor (or no restriction for now — teaching OS)
-- This is the Plan 9 way — no `kill` syscall needed
+### 200.3: `/proc/N/status` — per-process info
 
-## 200.4: `/proc/meminfo` — system memory
+- `open("/proc/5/status")` → fd with `ProcFdKind.status`, stores target PID
+- `read()` → returns key-value text:
 
-- `open("/proc/meminfo")` → fd with `.proc_meminfo` kind
-- `read()` → returns text: `total_pages 32768\nfree_pages 24576\npage_size 4096\n`
-- Reads directly from `pmm.free_pages` / `pmm.total_pages`
+```
+pid 5
+ppid 2
+state running
+pages 12
+uid 0
+gid 0
+core 1
+affinity any
+vt 0
+name fsh
+```
+
+Fields: pid, ppid, state (free/running/ready/blocked/zombie/dead), pages, uid, gid, assigned core, core affinity (number or "any"), virtual terminal, process name.
+
+### 200.4: `/proc/N/ctl` — process control (write-only)
+
+Commands written to ctl:
+
+| Command | Effect |
+|---------|--------|
+| `kill` | Terminate process (exit status 137), kill children, wake waiting parent |
+| `stop` | Suspend process (set blocked with no pending_op) |
+| `start` | Resume a stopped process (markReady) |
+| `killgrp` | Kill all children of target process |
+| `wired N` | Pin process to core N |
+| `wired any` | Clear core affinity (allow any core) |
+| `close N` | Close fd N in target process |
+
+Plan 9 style — no `kill` syscall needed.
+
+### 200.5: `/proc/meminfo` — system memory
+
+- `open("/proc/meminfo")` → fd with `ProcFdKind.meminfo`
+- `read()` → returns:
+
+```
+total_pages 32768
+free_pages 24576
+page_size 4096
+total_bytes 134217728
+free_bytes 100663296
+used_pages 8192
+```
+
+Reads directly from `pmm.getTotalPages()` / `pmm.getFreePages()`.
+
+### 200.6: `/proc/supervisor` — fault supervisor status
+
+See Phase 130. `ProcFdKind.supervisor` (read) and `.supervisor_ctl` (write).
 
 ---
 
-## Files to Modify
+## Files Modified
 
 | File | Change |
 |------|--------|
-| `src/syscall.zig` | Add `/proc` interception in `sysOpen`, handlers in `sysRead`/`sysWrite` |
-| `src/process.zig` | Add `pub fn getByPid(pid: u32) ?*Process` helper if not exists |
-| `lib/syscall.zig` | No changes needed (uses existing open/read/write) |
+| `src/devfiles.zig` | `procRead()` / `procWrite()` — all `/proc` read/write handlers |
+| `src/process.zig` | `ProcFdKind` enum, `FdType.proc`, `allocProcFd()`, `getByPid()` |
+| `src/syscall/fs.zig` | `/proc` path interception in `sysOpen` |
 
-**Est: ~150 lines added to kernel. Zero new syscall numbers.**
+**Zero new syscall numbers. Uses existing open/read/write.**
 
 ---
 
 ## Verify
 
-1. `ls /proc` → lists PIDs of active processes
-2. `cat /proc/1/status` → shows PID/state/pages
-3. `cat /proc/meminfo` → shows memory stats
-4. `echo kill > /proc/5/ctl` → terminates PID 5 (via shell redirect)
+1. `ls /proc` → lists PIDs of active processes + meminfo + supervisor
+2. `cat /proc/1/status` → shows pid/ppid/state/pages/uid/gid/core/affinity/vt/name
+3. `cat /proc/meminfo` → shows memory stats (pages + bytes)
+4. `echo kill > /proc/5/ctl` → terminates PID 5
+5. `echo stop > /proc/3/ctl` / `echo start > /proc/3/ctl` → suspend/resume
+6. `echo wired 2 > /proc/3/ctl` → pin to core 2
+7. `echo killgrp > /proc/3/ctl` → kill all children
+8. `cat /proc/supervisor` → shows supervised services table

@@ -1,45 +1,56 @@
-# Phase 150: Login / Getty
+# Phase 150: Login / Getty / Users & Groups
 
-**Moved from phase 25.** Deferred until after networking (TCP, phase 100).
+## Status: Done
 
 ## Goal
 
-Add an authentication layer before the shell. Plan 9-style: authentication
-is handled by an auth server (network service), not local `/etc/passwd` files.
+Add authentication, user identity, and multi-user support. Init spawns login on each VT, which authenticates against `/etc/passwd` and spawns the user's shell with proper uid/gid.
 
 ## Depends On
 
 - Phase 24 (shell) — done
-- Phase 100 (TCP) — needed for auth server communication
+- Phase 215 (virtual consoles) — done
 
-## Design (Plan 9-style)
+---
 
-```
-init spawns: getty /dev/console
+## Implementation Summary
 
-getty:
-  1. Print "fornax login: "
-  2. Read username
-  3. exec login {username}
+### Authentication
 
-login:
-  1. Contact auth server (factotum-style) over network
-  2. Verify credentials
-  3. exec /bin/fsh
-```
+- `cmd/login/main.zig` — prompts for username/password, authenticates against `/etc/passwd`, calls `setuid(uid, gid)`, execs user's shell
+- `lib/crypt.zig` — FNV-1a salted password hashing (`$fx$` format)
+- `lib/passwd.zig` — `/etc/passwd` parser (format: `user:hash:uid:gid:gecos:home:shell`)
+- `lib/group.zig` — `/etc/group` parser
+- Root has `x` hash (no password check)
 
-For MVP, login can just accept any username and spawn fsh (no real auth).
-Real authentication comes when we have an auth server.
+### Kernel Support
 
-## Decision Points
+- SYS 30 `setuid(uid, gid)` — sets `Process.uid` and `Process.gid`
+- SYS 31 `getuid` — returns packed `uid | (gid << 16)`
+- `Process.uid` (u16) and `Process.gid` (u16) fields, inherited by children via `sysSpawn`
 
-- **Auth server vs local**: Plan 9 uses factotum + auth server. Do we
-  follow that exactly, or start with simple local auth?
-- **User identity**: Do we need UIDs/permissions, or just identity for
-  namespace separation?
+### Init + VT Integration
+
+- Init spawns login on each VT (0-3) with respawn loop
+- Login reads credentials, authenticates, sets uid/gid, execs shell
+- Shell displays dynamic prompt: `user@fornax#` (root) or `user@fornax$` (normal)
+- HOME/USER/PWD environment set from passwd entry
+
+### User Management Commands
+
+- `adduser` — creates new user (appends to /etc/passwd)
+- `su` — switch user (re-authenticate + setuid + exec shell)
+- `id` / `whoami` — display current user identity
+- `chown` / `chgrp` — change file ownership (accepts usernames via passwd lookup)
+- `ls -l` — shows owner/group names from passwd/group files
+
+---
 
 ## Verify
 
-1. Boot → see "fornax login: " prompt
-2. Type username → see shell prompt
-3. Exit shell → getty restarts, shows login prompt again
+1. Boot → see login prompt on each VT
+2. Login as root (no password) → `root@fornax#` prompt
+3. `adduser alice` → create user with password
+4. Login as alice → `alice@fornax$` prompt
+5. `id` → shows uid/gid
+6. Exit shell → login respawns
