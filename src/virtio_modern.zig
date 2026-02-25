@@ -7,6 +7,7 @@ const klog = @import("klog.zig");
 const pci = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/pci.zig"),
     .riscv64 => @import("arch/riscv64/pci.zig"),
+    .aarch64 => @import("arch/aarch64/pci.zig"),
     else => @compileError("unsupported architecture"),
 };
 const pmm = @import("pmm.zig");

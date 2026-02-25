@@ -19,8 +19,8 @@ pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFF0_0000;
 /// x86_64:  RSP ≡ 8 (mod 16) at function entry (as if `call` pushed RA) → TOP - 8
 /// riscv64: SP ≡ 0 (mod 16) at function entry → TOP
 pub const USER_STACK_INIT: u64 = switch (@import("builtin").cpu.arch) {
-    .riscv64 => USER_STACK_TOP,
-    else => USER_STACK_TOP - 8,
+    .riscv64, .aarch64 => USER_STACK_TOP, // SP mod 16 == 0 at function entry
+    else => USER_STACK_TOP - 8, // x86_64: RSP mod 16 == 8 at function entry
 };
 
 /// Base address for argv layout (one page below USER_STACK_TOP).

@@ -1723,15 +1723,124 @@ const touch_bin = b.addExecutable(.{
     });
 
     aarch64_bin.root_module.addOptions("build_options", build_options);
+    aarch64_bin.addAssemblyFile(b.path("src/arch/aarch64/entry.S"));
 
     const aarch64_install = b.addInstallArtifact(aarch64_bin, .{
         .dest_dir = .{ .override = .{ .custom = "esp-aarch64/EFI/BOOT" } },
         .dest_sub_path = "BOOTAA64.EFI",
     });
 
-    // aarch64 initrd: empty for now (no aarch64 userspace yet)
-    const aarch64_initrd = addInitrdStep(b, mkinitrd, "esp-aarch64/EFI/BOOT", &.{});
+    // aarch64 userspace (UEFI target, same as x86_64)
+    const aarch64_freestanding = b.resolveTargetQuery(.{
+        .cpu_arch = .aarch64,
+        .os_tag = .freestanding,
+        .abi = .none,
+    });
+
+    const aa64_fornax_module = b.createModule(.{
+        .root_source_file = b.path("lib/root.zig"),
+        .target = aarch64_freestanding,
+        .optimize = user_optimize,
+    });
+
+    const aa64_user_programs = .{
+        .{ "init", "cmd/init/main.zig" },
+        .{ "fsh", "cmd/fsh/main.zig" },
+        .{ "hello", "cmd/hello/main.zig" },
+        .{ "echo", "cmd/echo/main.zig" },
+        .{ "cat", "cmd/cat/main.zig" },
+        .{ "ls", "cmd/ls/main.zig" },
+        .{ "rm", "cmd/rm/main.zig" },
+        .{ "mkdir", "cmd/mkdir/main.zig" },
+        .{ "wc", "cmd/wc/main.zig" },
+        .{ "lsblk", "cmd/lsblk/main.zig" },
+        .{ "df", "cmd/df/main.zig" },
+        .{ "dmesg", "cmd/dmesg/main.zig" },
+        .{ "head", "cmd/head/main.zig" },
+        .{ "tail", "cmd/tail/main.zig" },
+        .{ "tree", "cmd/tree/main.zig" },
+        .{ "free", "cmd/free/main.zig" },
+        .{ "ping", "cmd/ping/main.zig" },
+        .{ "tcptest", "cmd/tcptest/main.zig" },
+        .{ "dnstest", "cmd/dnstest/main.zig" },
+        .{ "shutdown", "cmd/shutdown/main.zig" },
+        .{ "reboot", "cmd/reboot/main.zig" },
+        .{ "ps", "cmd/ps/main.zig" },
+        .{ "kill", "cmd/kill/main.zig" },
+        .{ "du", "cmd/du/main.zig" },
+        .{ "top", "cmd/top/main.zig" },
+        .{ "cp", "cmd/cp/main.zig" },
+        .{ "mv", "cmd/mv/main.zig" },
+        .{ "touch", "cmd/touch/main.zig" },
+        .{ "truncate", "cmd/truncate/main.zig" },
+        .{ "dd", "cmd/dd/main.zig" },
+        .{ "chmod", "cmd/chmod/main.zig" },
+        .{ "chown", "cmd/chown/main.zig" },
+        .{ "chgrp", "cmd/chgrp/main.zig" },
+        .{ "ip", "cmd/ip/main.zig" },
+        .{ "grep", "cmd/grep/main.zig" },
+        .{ "sed", "cmd/sed/main.zig" },
+        .{ "awk", "cmd/awk/main.zig" },
+        .{ "less", "cmd/less/main.zig" },
+        .{ "fe", "cmd/fe/main.zig" },
+        .{ "lspci", "cmd/lspci/main.zig" },
+        .{ "lsusb", "cmd/lsusb/main.zig" },
+        .{ "lscpu", "cmd/lscpu/main.zig" },
+        .{ "login", "cmd/login/main.zig" },
+        .{ "id", "cmd/id/main.zig" },
+        .{ "whoami", "cmd/whoami/main.zig" },
+        .{ "adduser", "cmd/adduser/main.zig" },
+        .{ "su", "cmd/su/main.zig" },
+        .{ "unzip", "cmd/unzip/main.zig" },
+        .{ "tar", "cmd/tar/main.zig" },
+        .{ "fay", "cmd/fay/main.zig" },
+        .{ "fxfs", "srv/fxfs/main.zig" },
+        .{ "partfs", "srv/partfs/main.zig" },
+        .{ "ktrace", "cmd/ktrace/main.zig" },
+        .{ "smp-test", "cmd/smp-test/main.zig" },
+    };
+
+    var aa64_initrd_bins: [3]*std.Build.Step.Compile = undefined;
+    var aa64_disk_bin_buf: [64]*std.Build.Step.Compile = undefined;
+    var aa64_disk_bin_count: usize = 0;
+
+    inline for (aa64_user_programs) |prog_info| {
+        const aa64_prog = b.addExecutable(.{
+            .name = prog_info[0],
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(prog_info[1]),
+                .target = aarch64_freestanding,
+                .optimize = user_optimize,
+                .strip = if (user_strip) true else null,
+                .imports = &.{
+                    .{ .name = "fornax", .module = aa64_fornax_module },
+                },
+            }),
+        });
+        aa64_prog.image_base = user_image_base;
+
+        const name: []const u8 = prog_info[0];
+        if (std.mem.eql(u8, name, "init")) {
+            aa64_initrd_bins[0] = aa64_prog;
+        } else if (std.mem.eql(u8, name, "partfs")) {
+            aa64_initrd_bins[1] = aa64_prog;
+        } else if (std.mem.eql(u8, name, "fxfs")) {
+            aa64_initrd_bins[2] = aa64_prog;
+        } else {
+            aa64_disk_bin_buf[aa64_disk_bin_count] = aa64_prog;
+            aa64_disk_bin_count += 1;
+        }
+    }
+
+    const aarch64_initrd = addInitrdStep(b, mkinitrd, "esp-aarch64/EFI/BOOT", &aa64_initrd_bins);
     aarch64_initrd.step.dependOn(&aarch64_install.step);
+
+    for (aa64_disk_bin_buf[0..aa64_disk_bin_count]) |prog| {
+        const install = b.addInstallArtifact(prog, .{
+            .dest_dir = .{ .override = .{ .custom = "rootfs-aarch64/bin" } },
+        });
+        aarch64_initrd.step.dependOn(&install.step);
+    }
 
     // ── riscv64 freestanding kernel ─────────────────────────────────
     // RISC-V boots via OpenSBI + direct kernel load (not UEFI PE/COFF,
@@ -1885,7 +1994,7 @@ const touch_bin = b.addExecutable(.{
     x86_step.dependOn(&x86_install.step);
     x86_step.dependOn(&x86_initrd.step);
 
-    const aarch64_step = b.step("aarch64", "Build aarch64 UEFI kernel");
+    const aarch64_step = b.step("aarch64", "Build aarch64 UEFI kernel + userspace");
     aarch64_step.dependOn(&aarch64_install.step);
     aarch64_step.dependOn(&aarch64_initrd.step);
 

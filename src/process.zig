@@ -14,6 +14,7 @@ pub const thread_group = @import("thread_group.zig");
 const paging = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/paging.zig"),
     .riscv64 => @import("arch/riscv64/paging.zig"),
+    .aarch64 => @import("arch/aarch64/paging.zig"),
     else => struct {
         pub const PageTable = struct { entries: [512]u64 };
         pub fn createAddressSpace() ?*PageTable {
@@ -55,6 +56,7 @@ const percpu = @import("percpu.zig");
 const syscall_entry = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/syscall_entry.zig"),
     .riscv64 => @import("arch/riscv64/syscall_entry.zig"),
+    .aarch64 => @import("arch/aarch64/syscall_entry.zig"),
     else => struct {
         pub fn setKernelStack(_: u64) void {}
         pub fn getSavedUserRip() u64 { return 0; }
@@ -71,6 +73,7 @@ const syscall_entry = switch (@import("builtin").cpu.arch) {
 /// x86_64: frame[RET_SLOT] = RAX slot, riscv64: frame[9] = a0 slot
 const RET_SLOT: usize = switch (@import("builtin").cpu.arch) {
     .riscv64 => 9,
+    .aarch64 => 0, // x0 at frame offset 0
     else => 12,
 };
 
@@ -482,6 +485,7 @@ pub fn init() void {
         p.user_rsp = 0;
         p.user_rflags = switch (@import("builtin").cpu.arch) {
             .riscv64 => @import("arch/riscv64/cpu.zig").SSTATUS_SPIE | @import("arch/riscv64/cpu.zig").SSTATUS_SUM, // SPIE + SUM
+            .aarch64 => 0x0, // SPSR for EL0t: all interrupts unmasked
             else => 0x202, // IF=1
         };
         p.syscall_ret = 0;
@@ -636,6 +640,7 @@ pub fn create() ?*Process {
     proc.user_rsp = 0;
     proc.user_rflags = switch (@import("builtin").cpu.arch) {
         .riscv64 => @import("arch/riscv64/cpu.zig").SSTATUS_SPIE | @import("arch/riscv64/cpu.zig").SSTATUS_SUM,
+        .aarch64 => 0x0, // SPSR for EL0t
         else => 0x202,
     };
     proc.syscall_ret = 0;
@@ -757,6 +762,7 @@ pub fn createThread(parent: *Process) ?*Process {
     proc.user_rsp = 0;
     proc.user_rflags = switch (@import("builtin").cpu.arch) {
         .riscv64 => @import("arch/riscv64/cpu.zig").SSTATUS_SPIE | @import("arch/riscv64/cpu.zig").SSTATUS_SUM,
+        .aarch64 => 0x0, // SPSR for EL0t
         else => 0x202,
     };
     proc.syscall_ret = 0;
@@ -1119,6 +1125,11 @@ fn scheduleNextImpl() noreturn {
                     asm volatile ("wfi");
                     asm volatile ("csrci sstatus, 0x2"); // SIE=0
                 },
+                .aarch64 => {
+                    asm volatile ("msr daifclr, #0xF"); // enable IRQs
+                    asm volatile ("wfi");
+                    asm volatile ("msr daifset, #0xF"); // disable IRQs
+                },
                 else => {
                     asm volatile ("sti");
                     asm volatile ("hlt");
@@ -1131,9 +1142,9 @@ fn scheduleNextImpl() noreturn {
             if (my_core != 0) {
                 setCurrentInternal(null);
                 while (true) {
-                    asm volatile ("sti");
-                    asm volatile ("hlt");
-                    asm volatile ("cli");
+                    cpu.enableInterrupts();
+                    cpu.hltOnce();
+                    cpu.disableInterrupts();
                     // Check if new work appeared
                     if (!my_queue.isEmpty()) break;
                 }

@@ -89,6 +89,26 @@ pub fn spawnThread(comptime func: fn (*anyopaque) callconv(.c) void, arg: ?*anyo
               [a3] "{x13}" (@as(u64, 0)),
               [a4] "{x14}" (@as(u64, 0)),
             : .{ .memory = true }),
+        .aarch64 => asm volatile (
+            \\ svc #0
+            \\ cbnz x0, 1f
+            // ── Child path ── (SP = child_rsp, func at [SP], arg at [SP+8])
+            \\ ldr x9, [sp, #0]
+            \\ ldr x0, [sp, #8]
+            \\ add sp, sp, #16
+            \\ blr x9
+            \\ mov x8, #14
+            \\ mov x0, #0
+            \\ svc #0
+            \\ 1:
+            : [ret] "={x0}" (-> u64),
+            : [nr] "{x8}" (@intFromEnum(fx.SYS.clone)),
+              [a0] "{x0}" (child_rsp),
+              [a1] "{x1}" (@as(u64, 0)),
+              [a2] "{x2}" (ctid_addr),
+              [a3] "{x3}" (@as(u64, 0)),
+              [a4] "{x4}" (@as(u64, 0)),
+            : .{ .memory = true }),
         else => @compileError("unsupported arch for spawnThread"),
     };
 

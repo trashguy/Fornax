@@ -13,6 +13,7 @@ const builtin = @import("builtin");
 const paging = switch (builtin.cpu.arch) {
     .x86_64 => @import("arch/x86_64/paging.zig"),
     .riscv64 => @import("arch/riscv64/paging.zig"),
+    .aarch64 => @import("arch/aarch64/paging.zig"),
     else => struct {
         pub fn physPtr(_: u64) [*]u8 {
             return @ptrFromInt(0);
@@ -36,6 +37,7 @@ const paging = switch (builtin.cpu.arch) {
 const pci = switch (builtin.cpu.arch) {
     .x86_64 => @import("arch/x86_64/pci.zig"),
     .riscv64 => @import("arch/riscv64/pci.zig"),
+    .aarch64 => @import("arch/aarch64/pci.zig"),
     else => struct {
         pub const PciDevice = struct {
             pub fn memBase(_: *const @This(), _: u3) ?u64 {
@@ -52,6 +54,7 @@ const pci = switch (builtin.cpu.arch) {
 const cpu = switch (builtin.cpu.arch) {
     .x86_64 => @import("arch/x86_64/cpu.zig"),
     .riscv64 => @import("arch/riscv64/cpu.zig"),
+    .aarch64 => @import("arch/aarch64/cpu.zig"),
     else => struct {
         pub fn spinHint() void {}
     },
@@ -429,7 +432,7 @@ fn setupCommand(data_phys: u64, byte_count: u32, is_write: bool) void {
 // ── Public API ──────────────────────────────────────────────────────────
 
 pub fn init() bool {
-    if (builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .riscv64) return false;
+    if (builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .riscv64 and builtin.cpu.arch != .aarch64) return false;
 
     const dev = pci.findAhci() orelse {
         klog.debug("ahci: no controller found\n");

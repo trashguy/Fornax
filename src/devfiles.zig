@@ -658,6 +658,7 @@ pub fn pciRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
     const pci = switch (@import("builtin").cpu.arch) {
         .x86_64 => @import("arch/x86_64/pci.zig"),
         .riscv64 => @import("arch/riscv64/pci.zig"),
+        .aarch64 => @import("arch/aarch64/pci.zig"),
         else => @compileError("unsupported arch"),
     };
     const devs = pci.getDevices();
@@ -809,6 +810,26 @@ pub fn cpuInfoRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
         pos = appendKV(&text_buf, pos, "mvendorid", mvendorid);
         pos = appendKV(&text_buf, pos, "marchid", marchid);
         pos = appendKV(&text_buf, pos, "mimpid", mimpid);
+    }
+
+    if (builtin.cpu.arch == .aarch64) {
+        const cpu = @import("arch/aarch64/cpu.zig");
+
+        pos = appendStr(&text_buf, pos, "arch aarch64\n");
+
+        // MIDR_EL1: Main ID Register
+        const midr = cpu.readMidr();
+        const implementer = (midr >> 24) & 0xFF;
+        const variant = (midr >> 20) & 0xF;
+        const architecture = (midr >> 16) & 0xF;
+        const partnum = (midr >> 4) & 0xFFF;
+        const revision = midr & 0xF;
+
+        pos = appendKV(&text_buf, pos, "implementer", implementer);
+        pos = appendKV(&text_buf, pos, "variant", variant);
+        pos = appendKV(&text_buf, pos, "architecture", architecture);
+        pos = appendKV(&text_buf, pos, "partnum", partnum);
+        pos = appendKV(&text_buf, pos, "revision", revision);
     }
 
     const dest: [*]u8 = @ptrFromInt(buf_ptr);

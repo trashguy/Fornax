@@ -22,6 +22,7 @@ const timer = @import("timer.zig");
 const paging = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/paging.zig"),
     .riscv64 => @import("arch/riscv64/paging.zig"),
+    .aarch64 => @import("arch/aarch64/paging.zig"),
     else => struct {
         pub const Flags = struct {
             pub const WRITABLE: u64 = 2;

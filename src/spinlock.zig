@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const cpu = switch (builtin.cpu.arch) {
     .x86_64 => @import("arch/x86_64/cpu.zig"),
     .riscv64 => @import("arch/riscv64/cpu.zig"),
+    .aarch64 => @import("arch/aarch64/cpu.zig"),
     else => struct {
         pub inline fn spinHint() void {}
     },

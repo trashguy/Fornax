@@ -6,7 +6,9 @@ import sys
 import tempfile
 
 from . import config
-from .config import PROJECT_DIR, GREEN, RED, YELLOW, RESET, BOLD, log, find_ovmf
+from .config import (PROJECT_DIR, GREEN, RED, YELLOW, RESET, BOLD, log, find_ovmf,
+                      find_aavmf, progress_init, progress_set_test,
+                      progress_advance, progress_skip, progress_cleanup)
 from .qemu import QemuDriver
 from .disk import create_test_disk, prepare_rootfs, create_linux_hello_elf
 from .packages import build_xxd_package, generate_repo_json, start_http_server
@@ -79,8 +81,9 @@ def run_test_session(session_name, ovmf, build_flags, tests, tmpdir,
         log("SESSION", sep, BOLD)
 
         # Build
-        build_cmd = ["zig", "build", "x86_64"] + build_flags
-        log("BUILD", f"Building ({' '.join(build_flags)})...")
+        build_target = {"aarch64": "aarch64", "riscv64": "riscv64"}.get(arch, "x86_64")
+        build_cmd = ["zig", "build", build_target] + build_flags
+        log("BUILD", f"Building {build_target} ({' '.join(build_flags)})...")
         result = subprocess.run(
             build_cmd,
             cwd=PROJECT_DIR,
@@ -104,7 +107,8 @@ def run_test_session(session_name, ovmf, build_flags, tests, tmpdir,
             return 0, 1, b""
 
         # Prepare rootfs and disk
-        rootfs_dir = os.path.join(PROJECT_DIR, "zig-out", "rootfs")
+        rootfs_suffix = {"aarch64": "-aarch64", "riscv64": "-riscv64"}.get(arch, "")
+        rootfs_dir = os.path.join(PROJECT_DIR, "zig-out", f"rootfs{rootfs_suffix}")
         prepare_rootfs(rootfs_dir)
 
         if pre_disk_hook:
@@ -116,8 +120,13 @@ def run_test_session(session_name, ovmf, build_flags, tests, tmpdir,
         log("DISK", "OK")
 
         # Boot QEMU
-        esp_dir = os.path.join(PROJECT_DIR, "zig-out", "esp")
-        qemu = QemuDriver(ovmf, esp_dir, disk_img, smp=smp, memory=memory)
+        esp_suffix = {"aarch64": "-aarch64"}.get(arch, "")
+        esp_dir = os.path.join(PROJECT_DIR, "zig-out", f"esp{esp_suffix}")
+        extra_kw = {}
+        if arch == "riscv64":
+            extra_kw["kernel"] = os.path.join(PROJECT_DIR, "zig-out", "esp-riscv64", "fornax-riscv64")
+            extra_kw["initrd"] = os.path.join(PROJECT_DIR, "zig-out", "esp-riscv64", "INITRD")
+        qemu = QemuDriver(ovmf, esp_dir, disk_img, smp=smp, memory=memory, arch=arch, **extra_kw)
         qemu.start()
         log("QEMU", f"Starting Fornax ({session_name}, {smp} cores, {memory} RAM, {qemu._accel})...")
 
@@ -125,13 +134,20 @@ def run_test_session(session_name, ovmf, build_flags, tests, tmpdir,
             pre_test_hook(qemu)
 
         # Run tests sequentially, stop on first failure
-        for test_fn in tests:
+        for i, test_fn in enumerate(tests):
             if failed > 0:
+                # Skip remaining tests in this session
+                remaining = len(tests) - i
+                progress_skip(remaining)
                 break
+            test_name = test_fn.__name__.replace("test_", "")
+            progress_set_test(session_name, test_name)
             if test_fn(qemu):
                 passed += 1
+                progress_advance(True)
             else:
                 failed += 1
+                progress_advance(False)
 
         full_log = qemu.full_log
 
@@ -179,7 +195,7 @@ def parse_args():
     import argparse
     p = argparse.ArgumentParser(description="Fornax integration tests")
     p.add_argument("--filter", "-f", help="Comma-separated test names or substring (e.g. 'container' or 'container_native,container_net')")
-    p.add_argument("--session", "-s", choices=["core", "posix", "tls", "all"], default="all", help="Which session to run (default: all)")
+    p.add_argument("--session", "-s", choices=["core", "posix", "aarch64", "riscv64", "all"], default="all", help="Which session to run (default: all)")
     p.add_argument("--smp", type=int, default=4, help="Number of QEMU vCPUs (default: 4)")
     p.add_argument("--list", "-l", action="store_true", help="List available test names and exit")
     return p.parse_args()
@@ -287,6 +303,7 @@ def main():
                 test_container_build,
                 test_container_networking,
                 test_container_pull,
+                test_container_pull_dockerhub,
             ]
             if has_real_registry:
                 core_tests_list.append(test_container_pull_real)
@@ -313,24 +330,60 @@ def main():
             posix_tests_list.append(test_shutdown)
             posix_tests = filter_tests(posix_tests_list, cli.filter)
 
-            tls_tests_list = [
+            aa64_tests_list = [
                 test_boot_login,
-                test_container_pull_dockerhub,
+                test_basic_commands,
+                test_supervisor_status,
+                test_time_subsystem,
+                test_host_networking,
+                test_filesystem,
+                test_container_native,
+                test_container_build,
+                test_container_networking,
+                test_container_pull,
                 test_shutdown,
             ]
-            tls_tests = filter_tests(tls_tests_list, cli.filter)
+            aa64_tests = filter_tests(aa64_tests_list, cli.filter)
+
+            rv64_tests_list = [
+                test_boot_login,
+                test_basic_commands,
+                test_supervisor_status,
+                test_time_subsystem,
+                test_host_networking,
+                test_filesystem,
+                test_container_native,
+                test_container_build,
+                test_container_networking,
+                test_container_pull,
+                test_shutdown,
+            ]
+            rv64_tests = filter_tests(rv64_tests_list, cli.filter)
 
             smp = cli.smp
             run_core = cli.session in ("core", "all")
             run_posix = cli.session in ("posix", "all")
-            run_tls = cli.session in ("tls", "all")
+            run_aarch64 = cli.session in ("aarch64", "all")
+            run_riscv64 = cli.session in ("riscv64", "all")
 
-            # ── Session 1: Core + Containers (no POSIX) ──────────
+            # Count total tests for progress bar
+            planned_total = 0
+            if run_core:
+                planned_total += len(core_tests)
+            if run_posix:
+                planned_total += len(posix_tests)
+            if run_aarch64:
+                planned_total += len(aa64_tests)
+            if run_riscv64:
+                planned_total += len(rv64_tests)
+            progress_init(planned_total)
+
+            # ── Session 1: Core + Containers + TLS ───────────────
             if run_core:
                 p, f, log_data = run_test_session(
                     "core",
                     ovmf,
-                    ["-Dcontainers=true"],
+                    ["-Dcontainers=true", "-Dtls=true"],
                     core_tests,
                     tmpdir,
                     pre_disk_hook=stage_linux_elf,
@@ -343,6 +396,8 @@ def main():
 
             if total_failed > 0:
                 log("SESSION", "Core session failed, skipping POSIX session", RED)
+                if run_posix:
+                    progress_skip(len(posix_tests))
                 run_posix = False
 
             if run_posix:
@@ -385,32 +440,58 @@ def main():
                 if http_server:
                     http_server.shutdown()
 
-            if total_failed > 0:
-                log("SESSION", "Previous session failed, skipping TLS session", RED)
-                run_tls = False
+            # ── Session 3: AArch64 (boot + basic) ──────────────
+            if run_aarch64:
+                aavmf = find_aavmf()
+                if not aavmf:
+                    log("SESSION", "AAVMF firmware not found, skipping aarch64 session", YELLOW)
+                    progress_skip(len(aa64_tests))
+                else:
+                    p, f, log_data = run_test_session(
+                        "aarch64",
+                        aavmf,
+                        ["-Dcontainers=true"],
+                        aa64_tests,
+                        tmpdir,
+                        pre_disk_hook=stage_linux_elf,
+                        smp=1, memory="4G",
+                        arch="aarch64",
+                    )
+                    total_passed += p
+                    total_failed += f
+                    if log_data:
+                        last_log = log_data
 
-            if run_tls:
-                # ── Session 3: TLS + Containers (Docker Hub pull) ─
-                p, f, log_data = run_test_session(
-                    "tls",
-                    ovmf,
-                    ["-Dcontainers=true", "-Dtls=true"],
-                    tls_tests,
-                    tmpdir,
-                    pre_disk_hook=stage_linux_elf,
-                    smp=smp, memory="4G",
-                )
-                total_passed += p
-                total_failed += f
-                if log_data:
-                    last_log = log_data
+            # ── Session 5: RISC-V 64 (boot + basic) ─────────────
+            if run_riscv64:
+                import shutil
+                if not shutil.which("qemu-system-riscv64"):
+                    log("SESSION", "qemu-system-riscv64 not found, skipping riscv64 session", YELLOW)
+                    progress_skip(len(rv64_tests))
+                else:
+                    p, f, log_data = run_test_session(
+                        "riscv64",
+                        None,  # no UEFI firmware for riscv64 (uses -bios default)
+                        ["-Dcontainers=true"],
+                        rv64_tests,
+                        tmpdir,
+                        pre_disk_hook=stage_linux_elf,
+                        smp=1, memory="4G",
+                        arch="riscv64",
+                    )
+                    total_passed += p
+                    total_failed += f
+                    if log_data:
+                        last_log = log_data
 
             registry_server.shutdown()
 
     except KeyboardInterrupt:
+        progress_cleanup()
         print(f"\n{YELLOW}Interrupted.{RESET}", file=sys.stderr)
         total_failed += 1
     except Exception as e:
+        progress_cleanup()
         print(f"{RED}Unexpected error: {e}{RESET}", file=sys.stderr)
         total_failed += 1
     finally:
@@ -419,6 +500,9 @@ def main():
             stop_real_registry()
         except Exception:
             pass
+
+    # Clean up progress bar before summary
+    progress_cleanup()
 
     # Summary
     print(file=sys.stderr)

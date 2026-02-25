@@ -8,6 +8,7 @@ const klog = @import("klog.zig");
 const pci = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/pci.zig"),
     .riscv64 => @import("arch/riscv64/pci.zig"),
+    .aarch64 => @import("arch/aarch64/pci.zig"),
     else => @compileError("unsupported architecture"),
 };
 const virtio = @import("virtio.zig");
@@ -18,6 +19,7 @@ const keyboard = @import("keyboard.zig");
 const interrupts = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("arch/x86_64/interrupts.zig"),
     .riscv64 => @import("arch/riscv64/interrupts.zig"),
+    .aarch64 => @import("arch/aarch64/interrupts.zig"),
     else => @compileError("unsupported architecture"),
 };
 

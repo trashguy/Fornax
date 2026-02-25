@@ -27,6 +27,7 @@ const percpu = @import("percpu.zig");
 const paging = switch (builtin.cpu.arch) {
     .x86_64 => @import("arch/x86_64/paging.zig"),
     .riscv64 => @import("arch/riscv64/paging.zig"),
+    .aarch64 => @import("arch/aarch64/paging.zig"),
     else => struct {
         pub fn mapPage(_: anytype, _: u64, _: u64, _: u64) ?void {}
         pub const Flags = struct {
@@ -48,7 +49,7 @@ const cpu = switch (builtin.cpu.arch) {
 
 const arch = switch (builtin.cpu.arch) {
     .x86_64 => @import("arch/x86_64/interrupts.zig"),
-    .aarch64 => @import("arch/aarch64/exceptions.zig"),
+    .aarch64 => @import("arch/aarch64/interrupts.zig"),
     .riscv64 => @import("arch/riscv64/interrupts.zig"),
     else => @compileError("unsupported architecture"),
 };
@@ -135,7 +136,7 @@ pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize, rsdp: ?[*]const
     // Phase 10: Process manager
     process.init();
 
-    // Architecture-specific: SYSCALL/ECALL setup
+    // Architecture-specific: SYSCALL/ECALL/SVC setup
     switch (builtin.cpu.arch) {
         .x86_64 => {
             const syscall_entry = @import("arch/x86_64/syscall_entry.zig");
@@ -143,6 +144,10 @@ pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize, rsdp: ?[*]const
         },
         .riscv64 => {
             const syscall_entry = @import("arch/riscv64/syscall_entry.zig");
+            syscall_entry.init();
+        },
+        .aarch64 => {
+            const syscall_entry = @import("arch/aarch64/syscall_entry.zig");
             syscall_entry.init();
         },
         else => {},
@@ -155,10 +160,11 @@ pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize, rsdp: ?[*]const
     container.init();
 
     // Phase 15: PCI + virtio-net
-    if (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .riscv64) {
+    if (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .riscv64 or builtin.cpu.arch == .aarch64) {
         const pci_mod = switch (builtin.cpu.arch) {
             .x86_64 => @import("arch/x86_64/pci.zig"),
             .riscv64 => @import("arch/riscv64/pci.zig"),
+            .aarch64 => @import("arch/aarch64/pci.zig"),
             else => unreachable,
         };
         pci_mod.enumerate();
@@ -213,6 +219,7 @@ pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize, rsdp: ?[*]const
         rtc.init();
         time.init(rtc.boot_epoch);
     } else {
+        // aarch64: no RTC driver yet, start with epoch 0
         time.init(0);
     }
 

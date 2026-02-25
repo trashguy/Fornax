@@ -229,7 +229,7 @@ pub fn spawn(elf_data: []const u8, fd_map: []const FdMapping, argv_block: ?[]con
 }
 
 pub fn exec(elf_data: []const u8) i32 {
-    const result = syscall2(.exec, @intFromPtr(elf_data.ptr), elf_data.len);
+    const result = syscall3(.exec, @intFromPtr(elf_data.ptr), elf_data.len, 0);
     return @bitCast(@as(u32, @truncate(result)));
 }
 
@@ -450,6 +450,11 @@ fn syscall1(nr: SYS, a0: u64) u64 {
             : [nr] "{a7}" (@intFromEnum(nr)),
               [a0] "{a0}" (a0),
             : .{ .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> u64),
+            : [nr] "{x8}" (@intFromEnum(nr)),
+              [a0] "{x0}" (a0),
+            : .{ .memory = true }),
         else => @compileError("unsupported arch for syscall"),
     };
 }
@@ -467,6 +472,12 @@ fn syscall2(nr: SYS, a0: u64, a1: u64) u64 {
             : [nr] "{a7}" (@intFromEnum(nr)),
               [a0] "{a0}" (a0),
               [a1] "{a1}" (a1),
+            : .{ .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> u64),
+            : [nr] "{x8}" (@intFromEnum(nr)),
+              [a0] "{x0}" (a0),
+              [a1] "{x1}" (a1),
             : .{ .memory = true }),
         else => @compileError("unsupported arch for syscall"),
     };
@@ -487,6 +498,13 @@ fn syscall3(nr: SYS, a0: u64, a1: u64, a2: u64) u64 {
               [a0] "{a0}" (a0),
               [a1] "{a1}" (a1),
               [a2] "{a2}" (a2),
+            : .{ .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> u64),
+            : [nr] "{x8}" (@intFromEnum(nr)),
+              [a0] "{x0}" (a0),
+              [a1] "{x1}" (a1),
+              [a2] "{x2}" (a2),
             : .{ .memory = true }),
         else => @compileError("unsupported arch for syscall"),
     };
@@ -509,6 +527,14 @@ fn syscall4(nr: SYS, a0: u64, a1: u64, a2: u64, a3: u64) u64 {
               [a1] "{a1}" (a1),
               [a2] "{a2}" (a2),
               [a3] "{a3}" (a3),
+            : .{ .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> u64),
+            : [nr] "{x8}" (@intFromEnum(nr)),
+              [a0] "{x0}" (a0),
+              [a1] "{x1}" (a1),
+              [a2] "{x2}" (a2),
+              [a3] "{x3}" (a3),
             : .{ .memory = true }),
         else => @compileError("unsupported arch for syscall"),
     };
@@ -533,6 +559,15 @@ fn syscall5(nr: SYS, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
               [a2] "{a2}" (a2),
               [a3] "{a3}" (a3),
               [a4] "{a4}" (a4),
+            : .{ .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> u64),
+            : [nr] "{x8}" (@intFromEnum(nr)),
+              [a0] "{x0}" (a0),
+              [a1] "{x1}" (a1),
+              [a2] "{x2}" (a2),
+              [a3] "{x3}" (a3),
+              [a4] "{x4}" (a4),
             : .{ .memory = true }),
         else => @compileError("unsupported arch for syscall"),
     };

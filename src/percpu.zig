@@ -200,6 +200,7 @@ pub fn init() void {
     const paging = switch (builtin.cpu.arch) {
         .x86_64 => @import("arch/x86_64/paging.zig"),
         .riscv64 => @import("arch/riscv64/paging.zig"),
+        .aarch64 => @import("arch/aarch64/paging.zig"),
         else => unreachable,
     };
     if (pmm.allocContiguousPages(process.KERNEL_STACK_PAGES)) |phys_base| {

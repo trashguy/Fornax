@@ -1,73 +1,91 @@
+/// AArch64 exception handlers called from entry.S.
+///
+/// The vector table is in entry.S. These Zig functions handle the dispatched
+/// exceptions for kernel faults and user-mode faults.
 const klog = @import("../../klog.zig");
 const cpu = @import("cpu.zig");
+const serial = @import("../../serial.zig");
 
-/// AArch64 exception vector table.
-/// Must be 2048-byte aligned, with 16 entries at 128-byte intervals.
-/// Each entry can hold up to 32 instructions.
-///
-/// Layout (4 groups of 4 vectors):
-///   - Current EL with SP_EL0: Synchronous, IRQ, FIQ, SError
-///   - Current EL with SP_ELx: Synchronous, IRQ, FIQ, SError
-///   - Lower EL using AArch64:  Synchronous, IRQ, FIQ, SError
-///   - Lower EL using AArch32:  Synchronous, IRQ, FIQ, SError
-fn vectorTable() callconv(.naked) void {
-    // We generate 16 vector entries, each 128 bytes (32 instructions) apart.
-    // Each entry saves x0, x1, loads its vector index into x0, and branches to the common handler.
-    comptime var i: u32 = 0;
-    inline while (i < 16) : (i += 1) {
-        asm volatile (
-            \\.balign 128
-            \\stp x29, x30, [sp, #-16]!
-            \\mov x0, %[idx]
-            \\bl exceptionEntry
-            \\ldp x29, x30, [sp], #16
-            \\eret
-            :
-            : [idx] "i" (i),
-        );
-    }
-}
+/// Handle a kernel-mode synchronous exception.
+/// Called from entry.S vector 4 (Current EL, SP_ELx, Sync).
+export fn handleKernelException(esr: u64, elr: u64, far: u64) callconv(.c) void {
+    serial.putChar('\n');
+    klog.err("--- KERNEL EXCEPTION ---\n");
 
-export fn exceptionEntry(vector_index: u64) void {
-    handleException(vector_index);
-}
-
-const vector_names = [16][]const u8{
-    "Sync (EL1t)",   "IRQ (EL1t)",   "FIQ (EL1t)",   "SError (EL1t)",
-    "Sync (EL1h)",   "IRQ (EL1h)",   "FIQ (EL1h)",   "SError (EL1h)",
-    "Sync (EL0/64)", "IRQ (EL0/64)", "FIQ (EL0/64)", "SError (EL0/64)",
-    "Sync (EL0/32)", "IRQ (EL0/32)", "FIQ (EL0/32)", "SError (EL0/32)",
-};
-
-fn handleException(vector_index: u64) void {
-    const esr = cpu.readEsr();
-    const elr = cpu.readElr();
-    const far = cpu.readFar();
-
-    klog.err("\n--- EXCEPTION ---\n");
-
-    if (vector_index < 16) {
-        klog.err("Type: ");
-        klog.err(vector_names[vector_index]);
-    } else {
-        klog.err("Vector: ");
-        klog.errDec(vector_index);
-    }
-    klog.err("\n");
-
-    klog.err("ESR_EL1: ");
-    klog.errHex(esr);
-    klog.err("\nELR_EL1: ");
-    klog.errHex(elr);
-    klog.err("\nFAR_EL1: ");
-    klog.errHex(far);
-
-    // Decode exception class from ESR bits [31:26]
     const ec = (esr >> 26) & 0x3F;
-    klog.err("\nException class: ");
+    klog.err("EC: ");
     klog.errHex(ec);
     klog.err(" (");
-    klog.err(switch (ec) {
+    klog.err(ecName(ec));
+    klog.err(")\n");
+
+    klog.err("ESR: ");
+    klog.errHex(esr);
+    klog.err("\nELR: ");
+    klog.errHex(elr);
+    klog.err("\nFAR: ");
+    klog.errHex(far);
+    klog.err("\n--- Halting ---\n");
+
+    cpu.halt();
+}
+
+/// Handle a user-mode synchronous exception (non-SVC).
+/// Called from entry.S for data aborts, instruction aborts, etc.
+export fn handleUserException(esr: u64, elr: u64, far: u64, frame_ptr: u64) callconv(.c) void {
+    _ = frame_ptr;
+
+    const process = @import("../../process.zig");
+    const supervisor = @import("../../supervisor.zig");
+
+    const proc = process.getCurrent() orelse {
+        klog.err("User exception with no current process!\n");
+        cpu.halt();
+        return;
+    };
+
+    // Silently discard faults from already-exited processes
+    if (proc.state == .zombie or proc.state == .dead or proc.state == .free) {
+        process.scheduleNext();
+    }
+
+    const ec = (esr >> 26) & 0x3F;
+    klog.err("[PID ");
+    klog.errDec(proc.pid);
+    klog.err("] ");
+    klog.err(ecName(ec));
+    klog.err(" at ");
+    klog.errHex(elr);
+    klog.err(" (FAR=");
+    klog.errHex(far);
+    klog.err(")\n");
+
+    // Attempt supervisor recovery
+    _ = supervisor.handleProcessFault(proc.pid);
+
+    // Kill the process
+    proc.state = .dead;
+    proc.exit_status = 128;
+
+    // Wake parent if waiting
+    if (proc.parent_pid) |ppid| {
+        const table = process.getProcessTable();
+        if (ppid < process.MAX_PROCESSES) {
+            const parent = &table[ppid];
+            if (parent.state == .blocked and parent.waiting_for_pid != null) {
+                const wait_pid = parent.waiting_for_pid.?;
+                if (wait_pid == 0 or wait_pid == proc.pid) {
+                    process.markReady(parent);
+                }
+            }
+        }
+    }
+
+    process.scheduleNext();
+}
+
+fn ecName(ec: u64) []const u8 {
+    return switch (ec) {
         0x00 => "Unknown",
         0x01 => "WFI/WFE trapped",
         0x15 => "SVC (AArch64)",
@@ -78,21 +96,5 @@ fn handleException(vector_index: u64) void {
         0x25 => "Data abort (same EL)",
         0x2C => "FP/SIMD trapped",
         else => "Other",
-    });
-    klog.err(")\n");
-
-    klog.err("--- Halting ---\n");
-    cpu.halt();
-}
-
-pub fn init() void {
-    // Install the vector table
-    const vbar = @intFromPtr(&vectorTable);
-    asm volatile ("msr vbar_el1, %[vbar]"
-        :
-        : [vbar] "r" (vbar),
-    );
-    cpu.isb();
-
-    klog.info("aarch64: exception vectors installed\n");
+    };
 }

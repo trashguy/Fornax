@@ -73,6 +73,10 @@ inline fn rdtsc() u64 {
               [hi] "={edx}" (hi),
         );
         return (@as(u64, hi) << 32) | lo;
+    } else if (builtin.cpu.arch == .aarch64) {
+        return asm volatile ("mrs %[ret], cntvct_el0"
+            : [ret] "=r" (-> u64),
+        );
     } else {
         // riscv64: use rdtime
         return asm volatile ("rdtime %[ret]"

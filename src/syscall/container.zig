@@ -8,6 +8,7 @@ const klog = @import("../klog.zig");
 const paging = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("../arch/x86_64/paging.zig"),
     .riscv64 => @import("../arch/riscv64/paging.zig"),
+    .aarch64 => @import("../arch/aarch64/paging.zig"),
     else => struct {},
 };
 const root = @import("root.zig");

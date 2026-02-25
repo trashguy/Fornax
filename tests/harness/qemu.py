@@ -8,14 +8,21 @@ import subprocess
 import sys
 import time
 
+from .config import sanitize_serial
+
+
 
 class QemuDriver:
-    def __init__(self, ovmf, esp_dir, disk_img, smp=1, memory="4G"):
+    def __init__(self, ovmf, esp_dir, disk_img, smp=1, memory="4G", arch="x86_64",
+                 kernel=None, initrd=None):
         self.ovmf = ovmf
         self.esp_dir = esp_dir
         self.disk_img = disk_img
         self.smp = smp
         self.memory = memory
+        self.arch = arch
+        self.kernel = kernel      # riscv64: path to kernel ELF
+        self.initrd = initrd      # riscv64: path to initrd
         self.proc = None
         self.buf = b""
         self.full_log = b""
@@ -29,24 +36,58 @@ class QemuDriver:
             return False
 
     def start(self):
-        cmd = [
-            "qemu-system-x86_64",
-            "-smp", str(self.smp),
-            "-drive", f"if=pflash,format=raw,readonly=on,file={self.ovmf}",
-            "-drive", f"format=raw,file=fat:rw:{self.esp_dir}",
-            "-m", self.memory,
-            "-serial", "stdio",
-            "-display", "none",
-            "-no-reboot",
-            "-device", "virtio-net-pci,netdev=net0",
-            "-netdev", "user,id=net0",
-            "-device", "virtio-keyboard-pci",
-            "-device", "nec-usb-xhci,id=xhci",
-            "-device", "usb-kbd,bus=xhci.0",
-            "-device", "usb-mouse,bus=xhci.0",
-            "-drive", f"file={self.disk_img},format=raw,if=none,id=blk0,cache=writeback",
-            "-device", "virtio-blk-pci,drive=blk0",
-        ]
+        if self.arch == "aarch64":
+            cmd = [
+                "qemu-system-aarch64",
+                "-machine", "virt",
+                "-cpu", "cortex-a72",
+                "-drive", f"if=pflash,format=raw,readonly=on,file={self.ovmf}",
+                "-drive", f"format=raw,file=fat:rw:{self.esp_dir}",
+                "-device", "ramfb",
+                "-m", self.memory,
+                "-serial", "stdio",
+                "-display", "none",
+                "-no-reboot",
+                "-no-shutdown",
+                "-device", "virtio-net-pci,netdev=net0",
+                "-netdev", "user,id=net0",
+                "-drive", f"file={self.disk_img},format=raw,if=none,id=blk0,cache=writeback",
+                "-device", "virtio-blk-pci,drive=blk0",
+            ]
+        elif self.arch == "riscv64":
+            cmd = [
+                "qemu-system-riscv64",
+                "-machine", "virt",
+                "-cpu", "rv64",
+                "-m", self.memory,
+                "-bios", "default",
+                "-kernel", self.kernel,
+                "-device", f"loader,file={self.initrd},addr=0x84000000,force-raw=on",
+                "-nographic",
+                "-drive", f"file={self.disk_img},format=raw,if=none,id=blk0,cache=writeback",
+                "-device", "virtio-blk-pci,drive=blk0",
+                "-netdev", "user,id=net0",
+                "-device", "virtio-net-pci,netdev=net0",
+            ]
+        else:
+            cmd = [
+                "qemu-system-x86_64",
+                "-smp", str(self.smp),
+                "-drive", f"if=pflash,format=raw,readonly=on,file={self.ovmf}",
+                "-drive", f"format=raw,file=fat:rw:{self.esp_dir}",
+                "-m", self.memory,
+                "-serial", "stdio",
+                "-display", "none",
+                "-no-reboot",
+                "-device", "virtio-net-pci,netdev=net0",
+                "-netdev", "user,id=net0",
+                "-device", "virtio-keyboard-pci",
+                "-device", "nec-usb-xhci,id=xhci",
+                "-device", "usb-kbd,bus=xhci.0",
+                "-device", "usb-mouse,bus=xhci.0",
+                "-drive", f"file={self.disk_img},format=raw,if=none,id=blk0,cache=writeback",
+                "-device", "virtio-blk-pci,drive=blk0",
+            ]
         # KVM gives correct SMP semantics but exposes a kernel SMP race that
         # intermittently crashes during boot.  Default TCG multi-threaded is
         # more forgiving (halted core doesn't block others).
@@ -110,7 +151,8 @@ class QemuDriver:
                         self.buf += chunk
                         self.full_log += chunk
                         # Print to stderr for live monitoring
-                        sys.stderr.buffer.write(chunk)
+                        # Strip all ANSI so serial can't corrupt scroll region
+                        sys.stderr.buffer.write(sanitize_serial(chunk))
                         sys.stderr.buffer.flush()
                 except BlockingIOError:
                     pass

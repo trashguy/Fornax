@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const cpu = switch (builtin.cpu.arch) {
     .x86_64 => @import("arch/x86_64/cpu.zig"),
     .riscv64 => @import("arch/riscv64/cpu.zig"),
+    .aarch64 => @import("arch/aarch64/cpu.zig"),
     else => struct {
         pub fn outb(_: u16, _: u8) void {}
         pub fn inb(_: u16) u8 {
@@ -17,10 +18,23 @@ const cpu = switch (builtin.cpu.arch) {
 const COM1: u16 = 0x3F8;
 
 // QEMU virt UART base address
-const UART_BASE: u64 = 0x1000_0000;
+const UART_BASE: u64 = switch (builtin.cpu.arch) {
+    .riscv64 => 0x1000_0000, // 16550 UART
+    .aarch64 => 0x0900_0000, // PL011 UART
+    else => 0x1000_0000,
+};
+
+// PL011 register offsets (aarch64)
+const PL011_DR: u64 = 0x000; // Data Register
+const PL011_FR: u64 = 0x018; // Flag Register
+const PL011_LCR_H: u64 = 0x02C; // Line Control Register
+const PL011_CR: u64 = 0x030; // Control Register
+const PL011_IMSC: u64 = 0x038; // Interrupt Mask Set/Clear
+const PL011_ICR: u64 = 0x044; // Interrupt Clear Register
 
 const paging = switch (builtin.cpu.arch) {
     .riscv64 => @import("arch/riscv64/paging.zig"),
+    .aarch64 => @import("arch/aarch64/paging.zig"),
     else => struct {
         pub fn isInitialized() bool {
             return false;
@@ -63,6 +77,13 @@ pub fn init() void {
             cpu.mmioWrite8(uartAddr(2), 0x07); // Enable FIFO, 1-byte trigger
             cpu.mmioWrite8(uartAddr(4), 0x0B); // IRQs enabled, RTS/DSR
         },
+        .aarch64 => {
+            // PL011 UART — disable, configure 8N1, re-enable TX+RX
+            const base = uartAddr(0);
+            cpu.mmioWrite32(base + PL011_CR, 0x00); // Disable UART
+            cpu.mmioWrite32(base + PL011_LCR_H, 0x70); // 8N1, FIFO enable
+            cpu.mmioWrite32(base + PL011_CR, 0x301); // Enable UART + TX + RX
+        },
         else => return,
     }
 
@@ -98,6 +119,20 @@ pub fn enableRxInterrupt() void {
             // Enable IRQ 10 on PLIC
             plic.enable(10);
         },
+        .aarch64 => {
+            const gic = @import("arch/aarch64/gic.zig");
+            const interrupts = @import("arch/aarch64/interrupts.zig");
+
+            // Enable RX interrupt (RXIM, bit 4 of IMSC)
+            const base = uartAddr(0);
+            cpu.mmioWrite32(base + PL011_IMSC, 0x10);
+
+            // Register GIC SPI 33 (UART0 on QEMU virt aarch64)
+            _ = interrupts.registerIrqHandler(33, handleIrq);
+
+            // Enable IRQ 33 on GIC
+            gic.enable(33);
+        },
         else => {},
     }
 }
@@ -128,6 +163,20 @@ fn handleIrq() bool {
             }
             return true;
         },
+        .aarch64 => {
+            const keyboard = @import("keyboard.zig");
+            const base = uartAddr(0);
+            var count: u32 = 0;
+            // Read while RXFE (bit 4 of FR) is clear (data available)
+            while (cpu.mmioRead32(base + PL011_FR) & 0x10 == 0 and count < 16) {
+                const byte: u8 = @truncate(cpu.mmioRead32(base + PL011_DR));
+                keyboard.handleChar(byte);
+                count += 1;
+            }
+            // Clear all pending interrupts
+            cpu.mmioWrite32(base + PL011_ICR, 0x7FF);
+            return true;
+        },
         else => return false,
     }
 }
@@ -153,6 +202,12 @@ pub fn putChar(c: u8) void {
         .riscv64 => {
             while (cpu.mmioRead8(uartAddr(5)) & 0x20 == 0) {}
             cpu.mmioWrite8(uartAddr(0), c);
+        },
+        .aarch64 => {
+            const base = uartAddr(0);
+            // Wait while TXFF (bit 5 of FR) is set (TX FIFO full)
+            while (cpu.mmioRead32(base + PL011_FR) & 0x20 != 0) {}
+            cpu.mmioWrite32(base + PL011_DR, c);
         },
         else => {},
     }

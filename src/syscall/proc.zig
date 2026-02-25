@@ -10,6 +10,7 @@ const namespace = @import("../namespace.zig");
 const paging = switch (@import("builtin").cpu.arch) {
     .x86_64 => @import("../arch/x86_64/paging.zig"),
     .riscv64 => @import("../arch/riscv64/paging.zig"),
+    .aarch64 => @import("../arch/aarch64/paging.zig"),
     else => struct {},
 };
 const root = @import("root.zig");
@@ -493,8 +494,14 @@ pub fn sysClone(stack_top: u64, tls: u64, ctid_ptr: u64, ptid_ptr: u64, flags: u
 
     const child = process.createThread(parent) orelse return ENOMEM;
 
-    // Child resumes at same instruction as parent (after the syscall instruction)
-    child.user_rip = parent.user_rip;
+    // Child resumes at instruction after the syscall.
+    // On x86_64, user_rip already points past SYSCALL (hardware sets RCX = next RIP).
+    // On aarch64, hardware sets ELR_EL1 past SVC (preferred return address), same as x86_64.
+    // On riscv64, SEPC points AT the ecall instruction, so add 4 to skip it.
+    child.user_rip = parent.user_rip + switch (@import("builtin").cpu.arch) {
+        .riscv64 => 4,
+        else => 0,
+    };
     child.user_rsp = stack_top;
     child.user_rflags = parent.user_rflags;
     child.syscall_ret = 0; // child sees RAX=0
@@ -791,6 +798,7 @@ pub fn sysExec(elf_ptr: u64, elf_len: u64, argv_ptr: u64) u64 {
     proc.user_rsp = mem.ARGV_BASE - 8;
     proc.user_rflags = switch (@import("builtin").cpu.arch) {
         .riscv64 => @import("../arch/riscv64/cpu.zig").SSTATUS_SPIE | @import("../arch/riscv64/cpu.zig").SSTATUS_SUM,
+        .aarch64 => 0x0, // SPSR for EL0t — all interrupts unmasked
         else => 0x202, // IF=1
     };
     proc.brk = load_result.brk;

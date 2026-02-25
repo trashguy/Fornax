@@ -89,6 +89,7 @@ pub fn sysShutdown(flags: u64) noreturn {
     const cpu = switch (@import("builtin").cpu.arch) {
         .x86_64 => @import("../arch/x86_64/cpu.zig"),
         .riscv64 => @import("../arch/riscv64/cpu.zig"),
+        .aarch64 => @import("../arch/aarch64/cpu.zig"),
         else => @compileError("unsupported arch for shutdown"),
     };
     // Container processes cannot shut down the host
