@@ -31,9 +31,9 @@ Requires [Zig 0.15.x](https://ziglang.org/download/).
 ```sh
 zig build x86_64     # x86_64 UEFI kernel
 zig build riscv64    # riscv64 freestanding kernel
-zig build aarch64    # aarch64 UEFI kernel (WIP — no userspace yet)
+zig build aarch64    # aarch64 UEFI kernel
 
-# Feature flags
+# Feature flags (apply to any arch)
 zig build x86_64 -Dposix=true         # C/POSIX realm support (musl libc)
 zig build x86_64 -Dtcc=true           # TCC compiler (implies -Dposix=true)
 zig build x86_64 -Dcontainers=true    # Container system + fnx CLI
@@ -51,6 +51,9 @@ Requires QEMU with OVMF firmware.
 make run                 # x86_64, single core
 make run-smp             # x86_64, 4 cores
 make run-riscv64         # riscv64 on QEMU virt
+make run-smp-riscv64     # riscv64, 4 harts
+make run-aarch64         # aarch64 on QEMU virt
+make run-smp-aarch64     # aarch64, 4 cores
 make run-release         # ReleaseSafe kernel
 make run-posix           # with POSIX realm support
 make run-tcc             # with TCC compiler
