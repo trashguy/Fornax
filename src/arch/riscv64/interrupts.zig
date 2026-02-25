@@ -48,7 +48,7 @@ inline fn inlineHex(val: u64) void {
 /// Exception handler — called from entry.S for synchronous exceptions.
 /// a0=frame_ptr, a1=scause, a2=stval
 export fn handleExceptionRv(frame_ptr: u64, scause: u64, stval: u64) callconv(.c) void {
-    _ = frame_ptr; // frame is on the stack, entry.S manages it
+    const frame: [*]const u64 = @ptrFromInt(frame_ptr);
 
     // Check if the fault came from user mode (SSTATUS.SPP == 0)
     const sstatus = cpu.csrRead(cpu.CSR_SSTATUS);
@@ -128,6 +128,28 @@ export fn handleExceptionRv(frame_ptr: u64, scause: u64, stval: u64) callconv(.c
         inlineHex(stval);
         serial.putChar('\r');
         serial.putChar('\n');
+        // Print RA (return address), S0 (frame pointer), A0 (first arg) from trap frame
+        serial.putChar('r');
+        serial.putChar('a');
+        serial.putChar('=');
+        inlineHex(frame[0]); // ra = x1
+        serial.putChar(' ');
+        serial.putChar('s');
+        serial.putChar('0');
+        serial.putChar('=');
+        inlineHex(frame[7]); // s0 = x8
+        serial.putChar(' ');
+        serial.putChar('a');
+        serial.putChar('0');
+        serial.putChar('=');
+        inlineHex(frame[9]); // a0 = x10
+        serial.putChar(' ');
+        serial.putChar('a');
+        serial.putChar('1');
+        serial.putChar('=');
+        inlineHex(frame[10]); // a1 = x11
+        serial.putChar('\r');
+        serial.putChar('\n');
 
         // Try to recover instead of halting.
         const percpu = @import("../../percpu.zig");
@@ -162,6 +184,20 @@ export fn handleInterruptRv(scause: u64, frame_ptr: u64) callconv(.c) void {
     @import("../../trace.zig").trace(.irq_enter, @truncate(cause));
 
     switch (cause) {
+        1 => {
+            // Supervisor software interrupt (IPI from SBI sIPI)
+            // Clear SSIP to acknowledge
+            cpu.csrClear(cpu.CSR_SIP, cpu.SIE_SSIE);
+            // Check TLB shootdown request
+            const percpu = @import("../../percpu.zig");
+            const core_id = percpu.getCoreId();
+            if (@atomicLoad(bool, &percpu.percpu_array[core_id].tlb_flush_pending, .acquire)) {
+                cpu.sfenceVma();
+                @atomicStore(bool, &percpu.percpu_array[core_id].tlb_flush_pending, false, .release);
+            }
+            // Schedule IPI: no explicit action needed — returning from interrupt
+            // allows the core to call scheduleNext on its next scheduling point.
+        },
         5 => {
             // Supervisor timer interrupt
             // Dispatch to IRQ 0 handlers (timer, compatible with x86_64 PIT)

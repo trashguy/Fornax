@@ -879,11 +879,15 @@ pub fn markReady(proc: *Process) void {
     }
     _ = percpu.percpu_array[target_core].run_queue.push(procIndex(proc));
 
-    // Send IPI if target core is remote (and LAPIC is available)
-    if (@import("builtin").cpu.arch == .x86_64) {
-        if (percpu.cores_online > 1 and target_core != percpu.getCoreId()) {
+    // Send IPI if target core is remote
+    if (percpu.cores_online > 1 and target_core != percpu.getCoreId()) {
+        const arch = @import("builtin").cpu.arch;
+        if (arch == .x86_64) {
             const apic = @import("arch/x86_64/apic.zig");
             apic.sendIpi(apic.lapic_ids[target_core], apic.IPI_SCHEDULE);
+        } else if (arch == .riscv64) {
+            const smp = @import("arch/riscv64/smp.zig");
+            smp.sendIpi(target_core, smp.IPI_SCHEDULE);
         }
     }
 }
@@ -892,24 +896,33 @@ pub fn markReady(proc: *Process) void {
 /// Called when tearing down page tables (process exit, exec).
 /// The current core flushes its own TLB directly; remote cores get an IPI.
 pub fn tlbShootdown(proc: *const Process) void {
-    if (@import("builtin").cpu.arch != .x86_64) return;
+    const arch = @import("builtin").cpu.arch;
+    if (arch != .x86_64 and arch != .riscv64) return;
     if (percpu.cores_online <= 1) return;
 
     const my_core = percpu.getCoreId();
     const bitmap = proc.cores_ran_on;
-    const apic = @import("arch/x86_64/apic.zig");
-    const cpu_mod = @import("arch/x86_64/cpu.zig");
 
     var core: u8 = 0;
     while (core < percpu.cores_online) : (core += 1) {
         if (bitmap & (@as(u128, 1) << @intCast(core)) == 0) continue;
         if (core == my_core) {
-            // Flush own TLB by reloading CR3
-            cpu_mod.flushTlb();
+            // Flush own TLB
+            if (arch == .x86_64) {
+                @import("arch/x86_64/cpu.zig").flushTlb();
+            } else if (arch == .riscv64) {
+                cpu.sfenceVma();
+            }
         } else {
             // Set pending flag and send IPI
             @atomicStore(bool, &percpu.percpu_array[core].tlb_flush_pending, true, .release);
-            apic.sendIpi(apic.lapic_ids[core], apic.IPI_TLB_SHOOTDOWN);
+            if (arch == .x86_64) {
+                const apic = @import("arch/x86_64/apic.zig");
+                apic.sendIpi(apic.lapic_ids[core], apic.IPI_TLB_SHOOTDOWN);
+            } else if (arch == .riscv64) {
+                const smp = @import("arch/riscv64/smp.zig");
+                smp.sendIpi(core, smp.IPI_TLB_SHOOTDOWN);
+            }
         }
     }
 
@@ -922,7 +935,7 @@ pub fn tlbShootdown(proc: *const Process) void {
         // Spin until the remote core clears the flag
         var spins: u32 = 0;
         while (@atomicLoad(bool, &percpu.percpu_array[core].tlb_flush_pending, .acquire)) {
-            cpu_mod.spinHint();
+            cpu.spinHint();
             spins += 1;
             if (spins > 10_000_000) {
                 // Safety valve — don't hang forever if core is stuck
@@ -1039,6 +1052,17 @@ pub fn scheduleNext() noreturn {
                     :
                     : [stack] "r" (sched_top),
                 );
+            }
+        },
+        .riscv64 => {
+            const core_id = percpu.getCoreId();
+            const sched_top = percpu.asm_states[core_id].scheduler_stack_top;
+            if (sched_top != 0) {
+                asm volatile ("mv sp, %[stack]"
+                    :
+                    : [stack] "r" (sched_top),
+                );
+                percpu.asm_states[core_id].kernel_stack_top = sched_top;
             }
         },
         else => {},
@@ -1158,12 +1182,31 @@ fn scheduleNextImpl() noreturn {
 }
 
 /// Assembly entry point defined in entry.S — returns to userspace.
-/// x86_64: IRETQ. riscv64: SRET.
-/// Args: rip, rsp, flags, ret_val
-extern fn resume_user_mode(rip: u64, rsp: u64, flags: u64, ret_val: u64) callconv(switch (@import("builtin").cpu.arch) {
-    .x86_64 => .{ .x86_64_sysv = .{} },
-    else => .c,
-}) noreturn;
+/// x86_64: IRETQ (4 args). riscv64: SRET (5 args: rip, rsp, flags, ret_val, user_tp).
+/// aarch64: ERET (4 args).
+const resume_user_mode_asm = switch (@import("builtin").cpu.arch) {
+    .riscv64 => struct {
+        extern fn resume_user_mode(rip: u64, rsp: u64, flags: u64, ret_val: u64, user_tp: u64) callconv(.c) noreturn;
+    },
+    else => struct {
+        extern fn resume_user_mode(rip: u64, rsp: u64, flags: u64, ret_val: u64) callconv(switch (@import("builtin").cpu.arch) {
+            .x86_64 => .{ .x86_64_sysv = .{} },
+            else => .c,
+        }) noreturn;
+    },
+};
+
+/// Wrapper: resume user mode, passing user TP on riscv64.
+fn resume_user_mode(rip: u64, rsp: u64, flags: u64, ret_val: u64) noreturn {
+    if (@import("builtin").cpu.arch == .riscv64) {
+        // On riscv64, pass the current process's fs_base as user TP (5th arg).
+        // If fs_base is 0, user TP will be 0 (no TLS set up).
+        const user_tp = if (getCurrent()) |p| p.fs_base else 0;
+        resume_user_mode_asm.resume_user_mode(rip, rsp, flags, ret_val, user_tp);
+    } else {
+        resume_user_mode_asm.resume_user_mode(rip, rsp, flags, ret_val);
+    }
+}
 
 /// Inline hex output for crash diagnostics (no locks, no .rodata access).
 pub fn inlineHex(val: u64) void {
@@ -1229,9 +1272,21 @@ fn switchTo(proc: *Process) noreturn {
         paging.switchAddressSpace(pml4);
     }
 
-    // Restore FS_BASE MSR for TLS (used by musl libc errno, etc.)
-    if (@import("builtin").cpu.arch == .x86_64 and proc.fs_base != 0) {
-        cpu.wrmsr(0xC0000100, proc.fs_base);
+    // Restore TLS register for musl libc errno, etc.
+    // riscv64 SMP: TP is the kernel percpu pointer — do NOT set it here.
+    // User TP is restored by entry.S trap_return (from frame[3]) or by
+    // resume_user_mode (5th arg). We write fs_base into the saved frame's
+    // TP slot below, before resume_from_kernel_frame.
+    if (proc.fs_base != 0) {
+        const arch = @import("builtin").cpu.arch;
+        if (arch == .x86_64) {
+            cpu.wrmsr(0xC0000100, proc.fs_base); // IA32_FS_BASE
+        } else if (arch == .aarch64) {
+            asm volatile ("msr tpidr_el0, %[v]"
+                :
+                : [v] "r" (proc.fs_base),
+            );
+        }
     }
 
     // Sleep delivery — check if the sleep timer has elapsed
@@ -1565,6 +1620,11 @@ fn switchTo(proc: *Process) noreturn {
         const frame: [*]u64 = @ptrFromInt(saved_ksp);
 
         frame[RET_SLOT] = proc.syscall_ret;
+        // riscv64 SMP: patch frame's TP slot (3) with user TLS pointer.
+        // trap_return restores user TP from frame[3] on U-mode return.
+        if (@import("builtin").cpu.arch == .riscv64 and proc.fs_base != 0) {
+            frame[3] = proc.fs_base;
+        }
         proc.saved_kernel_rsp = 0;
         syscall_entry.resume_from_kernel_frame(@intFromPtr(frame));
     } else {

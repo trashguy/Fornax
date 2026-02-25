@@ -1,77 +1,92 @@
 /// Linux syscall compatibility layer for Fornax containers.
 ///
-/// Translates Linux x86_64 syscall numbers and conventions to Fornax equivalents.
-/// Ported from lib/posix/shim.c — same translation table, but runs in kernel
-/// instead of userspace. Enables running unmodified Linux/musl binaries inside
-/// containers without recompilation.
+/// Translates Linux syscall numbers and conventions to Fornax equivalents.
+/// Per-arch syscall numbers: x86_64 uses legacy numbers, riscv64/aarch64
+/// use the generic Linux ABI (no legacy syscalls like open/stat/pipe).
 ///
 /// Detection: Process.compat == 1 (set via container config or ELF detection).
 /// Dispatch: syscall.dispatch() routes here before Fornax SYS enum lookup.
 const process = @import("process.zig");
 const ipc = @import("ipc.zig");
+const builtin = @import("builtin");
 
-// ── Linux syscall numbers (x86_64) ────────────────────────────────────────
+// ── Linux syscall numbers (per-arch) ──────────────────────────────────────
+// x86_64 has legacy syscalls (open=2, stat=4, pipe=22, etc.)
+// riscv64/aarch64 use the generic Linux ABI (openat=56, fstatat=79, pipe2=59, etc.)
+// Some syscalls share numbers across all arches (e.g. clone=220 on generic).
 
-const LNX_READ: u64 = 0;
-const LNX_WRITE: u64 = 1;
-const LNX_OPEN: u64 = 2;
-const LNX_CLOSE: u64 = 3;
-const LNX_STAT: u64 = 4;
-const LNX_FSTAT: u64 = 5;
-const LNX_LSTAT: u64 = 6;
-const LNX_LSEEK: u64 = 8;
-const LNX_MMAP: u64 = 9;
-const LNX_MPROTECT: u64 = 10;
-const LNX_MUNMAP: u64 = 11;
-const LNX_BRK: u64 = 12;
-const LNX_RT_SIGACTION: u64 = 13;
-const LNX_RT_SIGPROCMASK: u64 = 14;
-const LNX_IOCTL: u64 = 16;
-const LNX_READV: u64 = 19;
-const LNX_WRITEV: u64 = 20;
-const LNX_ACCESS: u64 = 21;
-const LNX_PIPE: u64 = 22;
-const LNX_MADVISE: u64 = 28;
-const LNX_DUP: u64 = 32;
-const LNX_DUP2: u64 = 33;
-const LNX_GETPID: u64 = 39;
-const LNX_CLONE: u64 = 56;
-const LNX_FORK: u64 = 57;
-const LNX_VFORK: u64 = 58;
-const LNX_EXECVE: u64 = 59;
-const LNX_EXIT: u64 = 60;
-const LNX_WAIT4: u64 = 61;
-const LNX_UNAME: u64 = 63;
-const LNX_FCNTL: u64 = 72;
-const LNX_FTRUNCATE: u64 = 77;
-const LNX_GETCWD: u64 = 79;
-const LNX_RENAME: u64 = 82;
-const LNX_MKDIR: u64 = 83;
-const LNX_RMDIR: u64 = 84;
-const LNX_CREAT: u64 = 85;
-const LNX_UNLINK: u64 = 87;
-const LNX_READLINK: u64 = 89;
-const LNX_FCHMOD: u64 = 91;
-const LNX_GETPPID: u64 = 110;
-const LNX_SETPGID: u64 = 109;
-const LNX_SETSID: u64 = 112;
-const LNX_ARCH_PRCTL: u64 = 158;
-const LNX_GETTID: u64 = 186;
-const LNX_FUTEX: u64 = 202;
-const LNX_GETDENTS64: u64 = 217;
-const LNX_SET_TID_ADDRESS: u64 = 218;
-const LNX_CLOCK_GETTIME: u64 = 228;
-const LNX_EXIT_GROUP: u64 = 231;
-const LNX_OPENAT: u64 = 257;
-const LNX_MKDIRAT: u64 = 258;
-const LNX_NEWFSTATAT: u64 = 262;
-const LNX_UNLINKAT: u64 = 263;
-const LNX_RENAMEAT: u64 = 264;
-const LNX_SET_ROBUST_LIST: u64 = 273;
-const LNX_PIPE2: u64 = 293;
-const LNX_PRLIMIT64: u64 = 302;
-const LNX_RENAMEAT2: u64 = 316;
-const LNX_GETRANDOM: u64 = 318;
+const is_x86_64 = builtin.cpu.arch == .x86_64;
+const is_generic = builtin.cpu.arch == .riscv64 or builtin.cpu.arch == .aarch64;
+
+// I/O
+const LNX_READ: u64 = if (is_x86_64) 0 else 63;
+const LNX_WRITE: u64 = if (is_x86_64) 1 else 64;
+const LNX_CLOSE: u64 = if (is_x86_64) 3 else 57;
+const LNX_FSTAT: u64 = if (is_x86_64) 5 else 80;
+const LNX_LSEEK: u64 = if (is_x86_64) 8 else 62;
+const LNX_MMAP: u64 = if (is_x86_64) 9 else 222;
+const LNX_MPROTECT: u64 = if (is_x86_64) 10 else 226;
+const LNX_MUNMAP: u64 = if (is_x86_64) 11 else 215;
+const LNX_BRK: u64 = if (is_x86_64) 12 else 214;
+const LNX_RT_SIGACTION: u64 = if (is_x86_64) 13 else 134;
+const LNX_RT_SIGPROCMASK: u64 = if (is_x86_64) 14 else 135;
+const LNX_IOCTL: u64 = if (is_x86_64) 16 else 29;
+const LNX_READV: u64 = if (is_x86_64) 19 else 65;
+const LNX_WRITEV: u64 = if (is_x86_64) 20 else 66;
+const LNX_MADVISE: u64 = if (is_x86_64) 28 else 233;
+const LNX_DUP: u64 = if (is_x86_64) 32 else 23;
+const LNX_GETPID: u64 = if (is_x86_64) 39 else 172;
+const LNX_CLONE: u64 = if (is_x86_64) 56 else 220;
+const LNX_EXECVE: u64 = if (is_x86_64) 59 else 221;
+const LNX_EXIT: u64 = if (is_x86_64) 60 else 93;
+const LNX_WAIT4: u64 = if (is_x86_64) 61 else 260;
+const LNX_UNAME: u64 = if (is_x86_64) 63 else 160;
+const LNX_FCNTL: u64 = if (is_x86_64) 72 else 25;
+const LNX_FTRUNCATE: u64 = if (is_x86_64) 77 else 46;
+const LNX_GETCWD: u64 = if (is_x86_64) 79 else 17;
+const LNX_FCHMOD: u64 = if (is_x86_64) 91 else 52;
+const LNX_GETPPID: u64 = if (is_x86_64) 110 else 173;
+const LNX_SETPGID: u64 = if (is_x86_64) 109 else 154;
+const LNX_SETSID: u64 = if (is_x86_64) 112 else 157;
+const LNX_GETTID: u64 = if (is_x86_64) 186 else 178;
+const LNX_FUTEX: u64 = if (is_x86_64) 202 else 98;
+const LNX_GETDENTS64: u64 = if (is_x86_64) 217 else 61;
+const LNX_SET_TID_ADDRESS: u64 = if (is_x86_64) 218 else 96;
+const LNX_CLOCK_GETTIME: u64 = if (is_x86_64) 228 else 113;
+const LNX_EXIT_GROUP: u64 = if (is_x86_64) 231 else 94;
+const LNX_OPENAT: u64 = if (is_x86_64) 257 else 56;
+const LNX_MKDIRAT: u64 = if (is_x86_64) 258 else 34;
+const LNX_NEWFSTATAT: u64 = if (is_x86_64) 262 else 79;
+const LNX_UNLINKAT: u64 = if (is_x86_64) 263 else 35;
+const LNX_SET_ROBUST_LIST: u64 = if (is_x86_64) 273 else 99;
+const LNX_PIPE2: u64 = if (is_x86_64) 293 else 59;
+const LNX_PRLIMIT64: u64 = if (is_x86_64) 302 else 261;
+const LNX_RENAMEAT2: u64 = if (is_x86_64) 316 else 276;
+const LNX_GETRANDOM: u64 = if (is_x86_64) 318 else 278;
+
+// x86_64-only legacy syscalls. On generic arches, each gets a unique
+// high sentinel value that never matches real syscall numbers, so the
+// switch arms compile but never fire.
+const LNX_OPEN: u64 = if (is_x86_64) 2 else 0x8000_0001;
+const LNX_STAT: u64 = if (is_x86_64) 4 else 0x8000_0002;
+const LNX_LSTAT: u64 = if (is_x86_64) 6 else 0x8000_0003;
+const LNX_ACCESS: u64 = if (is_x86_64) 21 else 0x8000_0004;
+const LNX_PIPE: u64 = if (is_x86_64) 22 else 0x8000_0005;
+const LNX_DUP2: u64 = if (is_x86_64) 33 else 0x8000_0006;
+const LNX_FORK: u64 = if (is_x86_64) 57 else 0x8000_0007;
+const LNX_VFORK: u64 = if (is_x86_64) 58 else 0x8000_0008;
+const LNX_RENAME: u64 = if (is_x86_64) 82 else 0x8000_0009;
+const LNX_MKDIR: u64 = if (is_x86_64) 83 else 0x8000_000A;
+const LNX_RMDIR: u64 = if (is_x86_64) 84 else 0x8000_000B;
+const LNX_CREAT: u64 = if (is_x86_64) 85 else 0x8000_000C;
+const LNX_UNLINK: u64 = if (is_x86_64) 87 else 0x8000_000D;
+const LNX_READLINK: u64 = if (is_x86_64) 89 else 0x8000_000E;
+const LNX_ARCH_PRCTL: u64 = if (is_x86_64) 158 else 0x8000_000F;
+const LNX_RENAMEAT: u64 = if (is_x86_64) 264 else 0x8000_0010;
+
+// Generic-only syscalls (riscv64/aarch64). On x86_64, unique sentinels.
+const LNX_DUP3: u64 = if (is_x86_64) 0x8000_0011 else 24;
+const LNX_FACCESSAT: u64 = if (is_x86_64) 0x8000_0012 else 48;
 
 // Linux constants
 const AT_FDCWD: u64 = @bitCast(@as(i64, -100));
@@ -106,8 +121,9 @@ const ERANGE: u64 = @bitCast(@as(i64, -34));
 
 // ── Main dispatch ─────────────────────────────────────────────────────────
 
-/// Translates a Linux x86_64 syscall to Fornax equivalents.
+/// Translates a Linux syscall to Fornax equivalents.
 /// Called from syscall.dispatch() when proc.compat == 1.
+/// Handles both x86_64 legacy and riscv64/aarch64 generic ABI numbers.
 pub fn linuxDispatch(nr: u64, a: u64, b: u64, c: u64, d: u64, e: u64) u64 {
     return switch (nr) {
         // ── I/O ───────────────────────────────────────────────────
@@ -135,6 +151,7 @@ pub fn linuxDispatch(nr: u64, a: u64, b: u64, c: u64, d: u64, e: u64) u64 {
         // ── File descriptors ──────────────────────────────────────
         LNX_DUP => syscall.sysDup(a),
         LNX_DUP2 => syscall.sysDup2(a, b),
+        LNX_DUP3 => syscall.sysDup2(a, b), // dup3 flags ignored
         LNX_PIPE => syscall.sysPipe(a),
         LNX_PIPE2 => syscall.sysPipe(a),
         LNX_FCNTL => linuxFcntl(a, b),
@@ -149,6 +166,7 @@ pub fn linuxDispatch(nr: u64, a: u64, b: u64, c: u64, d: u64, e: u64) u64 {
         LNX_CREAT => linuxCreat(a),
         LNX_FTRUNCATE => syscall.sysTruncate(a, b),
         LNX_ACCESS => linuxAccess(a),
+        LNX_FACCESSAT => linuxFaccessat(a, b),
         LNX_READLINK => EINVAL, // no symlinks
         LNX_FCHMOD => 0, // no-op for now
 
@@ -183,7 +201,7 @@ pub fn linuxDispatch(nr: u64, a: u64, b: u64, c: u64, d: u64, e: u64) u64 {
         LNX_GETCWD => linuxGetcwd(a, b),
         LNX_UNAME => linuxUname(a),
         LNX_PRLIMIT64 => ENOSYS,
-        LNX_GETDENTS64 => ENOSYS,
+        LNX_GETDENTS64 => linuxGetdents64(a, b, c),
 
         // ── Random ────────────────────────────────────────────────
         LNX_GETRANDOM => linuxGetrandom(a, b),
@@ -318,6 +336,23 @@ fn linuxAccess(path_ptr: u64) u64 {
     if (isError(fd)) return ENOENT;
     _ = syscall.sysClose(fd);
     return 0;
+}
+
+fn linuxFaccessat(dirfd: u64, path_ptr: u64) u64 {
+    if (dirfd != AT_FDCWD) return ENOSYS;
+    return linuxAccess(path_ptr);
+}
+
+fn linuxGetdents64(fd: u64, buf_ptr: u64, buf_size: u64) u64 {
+    _ = buf_size;
+    // Read Fornax dir entries, then convert to Linux dirent64 format.
+    // For now, return ENOSYS — full implementation would require
+    // reading Fornax DirEntry structs and converting to Linux dirent64.
+    // Container binaries typically use opendir/readdir which go through
+    // the POSIX shim's getdents64 handler.
+    _ = fd;
+    _ = buf_ptr;
+    return ENOSYS;
 }
 
 fn linuxFcntl(fd: u64, cmd: u64) u64 {
@@ -456,7 +491,12 @@ fn linuxUname(buf_ptr: u64) u64 {
     const version = "Phase 1002";
     @memcpy(dest[195..][0..version.len], version);
     // machine at offset 260
-    const machine = "x86_64";
+    const machine = switch (builtin.cpu.arch) {
+        .x86_64 => "x86_64",
+        .riscv64 => "riscv64",
+        .aarch64 => "aarch64",
+        else => "unknown",
+    };
     @memcpy(dest[260..][0..machine.len], machine);
     return 0;
 }

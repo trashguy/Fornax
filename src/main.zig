@@ -121,10 +121,15 @@ pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize, rsdp: ?[*]const
         pic_mod.init();
     }
 
-    // SMP: ACPI MADT parsing + LAPIC init + AP startup (x86_64 only)
+    // SMP: AP startup
     if (builtin.cpu.arch == .x86_64) {
+        // x86_64: ACPI MADT parsing + LAPIC init + AP startup (INIT-SIPI-SIPI)
         const apic = @import("arch/x86_64/apic.zig");
         apic.init(rsdp);
+    } else if (builtin.cpu.arch == .riscv64) {
+        // riscv64: Start secondary harts via SBI HSM
+        const smp = @import("arch/riscv64/smp.zig");
+        smp.init();
     }
 
     // Phase 23: Serial console input (COM1 IRQ 4 on x86_64, UART PLIC IRQ 10 on riscv64)

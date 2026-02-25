@@ -92,6 +92,8 @@ struct fx_sysinfo {
 
 /* ── Inline syscall wrappers ─────────────────────────────────────── */
 
+#if defined(__x86_64__)
+
 static inline long __fx_syscall1(long nr, long a0) {
     long ret;
     __asm__ volatile ("syscall"
@@ -139,6 +141,134 @@ static inline long __fx_syscall5(long nr, long a0, long a1, long a2, long a3, lo
         : "rcx", "r11", "memory");
     return ret;
 }
+
+#elif defined(__riscv)
+
+static inline long __fx_syscall1(long nr, long a0) {
+    register long _a7 __asm__("a7") = nr;
+    register long _a0 __asm__("a0") = a0;
+    __asm__ volatile ("ecall"
+        : "+r"(_a0)
+        : "r"(_a7)
+        : "memory");
+    return _a0;
+}
+
+static inline long __fx_syscall2(long nr, long a0, long a1) {
+    register long _a7 __asm__("a7") = nr;
+    register long _a0 __asm__("a0") = a0;
+    register long _a1 __asm__("a1") = a1;
+    __asm__ volatile ("ecall"
+        : "+r"(_a0)
+        : "r"(_a7), "r"(_a1)
+        : "memory");
+    return _a0;
+}
+
+static inline long __fx_syscall3(long nr, long a0, long a1, long a2) {
+    register long _a7 __asm__("a7") = nr;
+    register long _a0 __asm__("a0") = a0;
+    register long _a1 __asm__("a1") = a1;
+    register long _a2 __asm__("a2") = a2;
+    __asm__ volatile ("ecall"
+        : "+r"(_a0)
+        : "r"(_a7), "r"(_a1), "r"(_a2)
+        : "memory");
+    return _a0;
+}
+
+static inline long __fx_syscall4(long nr, long a0, long a1, long a2, long a3) {
+    register long _a7 __asm__("a7") = nr;
+    register long _a0 __asm__("a0") = a0;
+    register long _a1 __asm__("a1") = a1;
+    register long _a2 __asm__("a2") = a2;
+    register long _a3 __asm__("a3") = a3;
+    __asm__ volatile ("ecall"
+        : "+r"(_a0)
+        : "r"(_a7), "r"(_a1), "r"(_a2), "r"(_a3)
+        : "memory");
+    return _a0;
+}
+
+static inline long __fx_syscall5(long nr, long a0, long a1, long a2, long a3, long a4) {
+    register long _a7 __asm__("a7") = nr;
+    register long _a0 __asm__("a0") = a0;
+    register long _a1 __asm__("a1") = a1;
+    register long _a2 __asm__("a2") = a2;
+    register long _a3 __asm__("a3") = a3;
+    register long _a4 __asm__("a4") = a4;
+    __asm__ volatile ("ecall"
+        : "+r"(_a0)
+        : "r"(_a7), "r"(_a1), "r"(_a2), "r"(_a3), "r"(_a4)
+        : "memory");
+    return _a0;
+}
+
+#elif defined(__aarch64__)
+
+static inline long __fx_syscall1(long nr, long a0) {
+    register long _x8 __asm__("x8") = nr;
+    register long _x0 __asm__("x0") = a0;
+    __asm__ volatile ("svc #0"
+        : "+r"(_x0)
+        : "r"(_x8)
+        : "memory");
+    return _x0;
+}
+
+static inline long __fx_syscall2(long nr, long a0, long a1) {
+    register long _x8 __asm__("x8") = nr;
+    register long _x0 __asm__("x0") = a0;
+    register long _x1 __asm__("x1") = a1;
+    __asm__ volatile ("svc #0"
+        : "+r"(_x0)
+        : "r"(_x8), "r"(_x1)
+        : "memory");
+    return _x0;
+}
+
+static inline long __fx_syscall3(long nr, long a0, long a1, long a2) {
+    register long _x8 __asm__("x8") = nr;
+    register long _x0 __asm__("x0") = a0;
+    register long _x1 __asm__("x1") = a1;
+    register long _x2 __asm__("x2") = a2;
+    __asm__ volatile ("svc #0"
+        : "+r"(_x0)
+        : "r"(_x8), "r"(_x1), "r"(_x2)
+        : "memory");
+    return _x0;
+}
+
+static inline long __fx_syscall4(long nr, long a0, long a1, long a2, long a3) {
+    register long _x8 __asm__("x8") = nr;
+    register long _x0 __asm__("x0") = a0;
+    register long _x1 __asm__("x1") = a1;
+    register long _x2 __asm__("x2") = a2;
+    register long _x3 __asm__("x3") = a3;
+    __asm__ volatile ("svc #0"
+        : "+r"(_x0)
+        : "r"(_x8), "r"(_x1), "r"(_x2), "r"(_x3)
+        : "memory");
+    return _x0;
+}
+
+static inline long __fx_syscall5(long nr, long a0, long a1, long a2, long a3, long a4) {
+    register long _x8 __asm__("x8") = nr;
+    register long _x0 __asm__("x0") = a0;
+    register long _x1 __asm__("x1") = a1;
+    register long _x2 __asm__("x2") = a2;
+    register long _x3 __asm__("x3") = a3;
+    register long _x4 __asm__("x4") = a4;
+    __asm__ volatile ("svc #0"
+        : "+r"(_x0)
+        : "r"(_x8), "r"(_x1), "r"(_x2), "r"(_x3), "r"(_x4)
+        : "memory");
+    return _x0;
+}
+
+#else
+#error "Unsupported architecture for Fornax syscalls"
+#endif
 
 /* ── Typed syscall functions ─────────────────────────────────────── */
 

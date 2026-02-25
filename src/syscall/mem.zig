@@ -152,14 +152,28 @@ pub fn sysDup2(old_fd: u64, new_fd: u64) u64 {
 /// SYS 36: arch_prctl — Set/get architecture-specific thread state.
 /// cmd: ARCH_SET_FS (0x1002) to set FS base for TLS.
 pub fn sysArchPrctl(cmd: u64, addr: u64) u64 {
-    if (@import("builtin").cpu.arch != .x86_64) return ENOSYS;
-    const cpu = @import("../arch/x86_64/cpu.zig");
+    const arch = @import("builtin").cpu.arch;
     const proc = process.getCurrent() orelse return ENOSYS;
 
     const ARCH_SET_FS: u64 = 0x1002;
     if (cmd == ARCH_SET_FS) {
         proc.fs_base = addr;
-        cpu.wrmsr(0xC0000100, addr); // IA32_FS_BASE
+        if (arch == .x86_64) {
+            const cpu = @import("../arch/x86_64/cpu.zig");
+            cpu.wrmsr(0xC0000100, addr); // IA32_FS_BASE
+        } else if (arch == .riscv64) {
+            asm volatile ("mv tp, %[v]"
+                :
+                : [v] "r" (addr),
+            );
+        } else if (arch == .aarch64) {
+            asm volatile ("msr tpidr_el0, %[v]"
+                :
+                : [v] "r" (addr),
+            );
+        } else {
+            return ENOSYS;
+        }
         return 0;
     }
     return EINVAL;

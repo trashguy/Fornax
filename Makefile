@@ -1,8 +1,8 @@
-.PHONY: all x86_64 aarch64 riscv64 run run-x86_64 run-smp run-aarch64 run-riscv64 disk disk-x86_64 disk-aarch64 clean clean-disk help
+.PHONY: all x86_64 aarch64 riscv64 run run-x86_64 run-smp run-smp-riscv64 run-aarch64 run-riscv64 disk disk-x86_64 disk-aarch64 clean clean-disk help
 .PHONY: release release-x86_64 release-aarch64 release-riscv64 run-release disk-img disk-format
-.PHONY: run-posix run-posix-release run-tcc
+.PHONY: run-posix run-posix-release run-tcc run-posix-riscv64 run-posix-aarch64
 .PHONY: run-tls run-tls-smp
-.PHONY: run-containers run-containers-dev
+.PHONY: run-containers run-containers-dev run-containers-riscv64 run-containers-aarch64
 .PHONY: run-dev run-dev-posix run-nvme run-ahci test unit-test integration-test
 .PHONY: debug debug-smp debug-dev debug-containers
 
@@ -36,6 +36,9 @@ run-x86_64: x86_64
 
 run-smp: x86_64
 	./scripts/run-x86_64.sh -smp 4
+
+run-smp-riscv64: riscv64
+	./scripts/run-riscv64.sh -smp 4
 
 run-nvme: x86_64
 	./scripts/run-x86_64.sh --nvme
@@ -73,6 +76,22 @@ run-containers:
 run-containers-dev:
 	zig build x86_64 -Dcontainers=true
 	./scripts/run-x86_64.sh -smp 8 -m 8192
+
+run-posix-riscv64:
+	zig build riscv64 -Dposix=true
+	./scripts/run-riscv64.sh
+
+run-posix-aarch64:
+	zig build aarch64 -Dposix=true
+	./scripts/run-aarch64.sh
+
+run-containers-riscv64:
+	zig build riscv64 -Dcontainers=true
+	./scripts/run-riscv64.sh
+
+run-containers-aarch64:
+	zig build aarch64 -Dcontainers=true
+	./scripts/run-aarch64.sh
 
 # Debug targets: QEMU with GDB server (connect with: gdb -x fornax.gdb)
 # Auto-generates fornax-syms.gdb from PDB before launching.
@@ -150,6 +169,7 @@ help:
 	@echo "  make release        Build both architectures (ReleaseSafe everywhere)"
 	@echo "  make run             Run x86_64 in QEMU"
 	@echo "  make run-smp         Run x86_64 in QEMU with 4 cores"
+	@echo "  make run-smp-riscv64 Run riscv64 in QEMU with 4 cores"
 	@echo "  make run-nvme        Run x86_64 in QEMU with NVMe block device"
 	@echo "  make run-ahci        Run x86_64 in QEMU with AHCI/SATA block device"
 	@echo "  make run-release     Run x86_64 in QEMU (ReleaseSafe kernel)"
@@ -157,10 +177,14 @@ help:
 	@echo "  make run-riscv64     Run riscv64 in QEMU"
 	@echo "  make run-tcc         Run x86_64 with POSIX + TCC compiler"
 	@echo "  make run-posix       Run x86_64 with C/POSIX realm support"
+	@echo "  make run-posix-riscv64  Run riscv64 with C/POSIX realm support"
+	@echo "  make run-posix-aarch64  Run aarch64 with C/POSIX realm support"
 	@echo "  make run-posix-release  Run x86_64 with POSIX (ReleaseSafe kernel)"
 	@echo "  make run-tls         Run x86_64 with TLS + containers (4 cores, 2GB)"
 	@echo "  make run-tls-smp     Run x86_64 with TLS + containers (8 cores, 4GB)"
 	@echo "  make run-containers  Run x86_64 with container support (4 cores, 2GB)"
+	@echo "  make run-containers-riscv64  Run riscv64 with container support"
+	@echo "  make run-containers-aarch64  Run aarch64 with container support"
 	@echo "  make run-containers-dev  Run x86_64 with containers (8 cores, 8GB)"
 	@echo "  make debug           Run x86_64 with GDB server (connect: gdb -x fornax.gdb)"
 	@echo "  make debug-smp       Run x86_64 with GDB server + 4 cores"

@@ -226,3 +226,64 @@ pub fn sbiGetMimpid() u64 {
     const r = sbiBaseCall(6);
     return if (r.err == 0) r.val else 0;
 }
+
+// ── SBI HSM (Hart State Management) ──────────────────────────────────
+// Extension ID 0x48534D ("HSM")
+
+/// SBI HSM hart_start — start a hart at the given physical address.
+/// Returns 0 on success, SBI error code otherwise.
+pub fn sbiHartStart(hartid: u64, start_addr: u64, priv_val: u64) i64 {
+    var err: i64 = undefined;
+    asm volatile ("ecall"
+        : [a0] "={a0}" (err),
+        : [a7] "{a7}" (@as(u64, 0x48534D)), // SBI extension: HSM
+          [a6] "{a6}" (@as(u64, 0)), // function: hart_start
+          [arg0] "{a0}" (hartid),
+          [arg1] "{a1}" (start_addr),
+          [arg2] "{a2}" (priv_val),
+        : .{ .memory = true }
+    );
+    return err;
+}
+
+/// SBI HSM hart_get_status — query the state of a hart.
+/// Returns: 0=STARTED, 1=STOPPED, 2=START_PENDING, 3=STOP_PENDING, etc.
+/// Returns negative SBI error on failure.
+pub fn sbiHartGetStatus(hartid: u64) i64 {
+    var err: i64 = undefined;
+    var val: i64 = undefined;
+    asm volatile ("ecall"
+        : [a0] "={a0}" (err),
+          [a1] "={a1}" (val),
+        : [a7] "{a7}" (@as(u64, 0x48534D)), // SBI extension: HSM
+          [a6] "{a6}" (@as(u64, 2)), // function: hart_get_status
+          [arg0] "{a0}" (hartid),
+        : .{ .memory = true }
+    );
+    if (err < 0) return err; // SBI error
+    return val; // Hart status
+}
+
+// ── SBI sPI (Send IPI) ──────────────────────────────────────────────
+// Extension ID 0x735049 ("sPI")
+
+/// SBI send IPI — send software interrupt to harts specified by mask.
+/// hart_mask: bitmask of harts relative to hart_mask_base.
+pub fn sbiSendIpi(hart_mask: u64, hart_mask_base: u64) void {
+    asm volatile ("ecall"
+        :
+        : [a7] "{a7}" (@as(u64, 0x735049)), // SBI extension: sPI
+          [a6] "{a6}" (@as(u64, 0)), // function: send_ipi
+          [a0] "{a0}" (hart_mask),
+          [a1] "{a1}" (hart_mask_base),
+        : .{ .memory = true }
+    );
+}
+
+// ── SCAUSE software interrupt ────────────────────────────────────────
+pub const SCAUSE_S_SOFT: u64 = SCAUSE_INT_BIT | 1;
+
+/// Full TLB flush (all ASIDs, all addresses).
+pub inline fn sfenceVma() void {
+    asm volatile ("sfence.vma" ::: .{ .memory = true });
+}

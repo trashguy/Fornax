@@ -10,7 +10,8 @@ from .config import (PROJECT_DIR, GREEN, RED, YELLOW, RESET, BOLD, log, find_ovm
                       find_aavmf, progress_init, progress_set_test,
                       progress_advance, progress_skip, progress_cleanup)
 from .qemu import QemuDriver
-from .disk import create_test_disk, prepare_rootfs, create_linux_hello_elf
+from .disk import (create_test_disk, prepare_rootfs, create_linux_hello_elf,
+                    create_linux_hello_elf_riscv64, create_linux_hello_elf_aarch64)
 from .packages import build_xxd_package, generate_repo_json, start_http_server
 
 from .test_boot import test_boot_login, test_shutdown
@@ -264,15 +265,23 @@ def main():
                 print(f"Stop the process using port {check_port} and try again.", file=sys.stderr)
                 return 1
 
-        def stage_linux_elf(rootfs_dir):
-            """Stage minimal Linux hello ELF for container compat test."""
-            tmp_dir = os.path.join(rootfs_dir, "tmp")
-            os.makedirs(tmp_dir, exist_ok=True)
-            path = os.path.join(tmp_dir, "hello-linux")
-            with open(path, "wb") as f:
-                f.write(create_linux_hello_elf())
-            os.chmod(path, 0o755)
-            log("CONTAINER", "Staged hello-linux ELF")
+        def make_stage_linux_elf(arch="x86_64"):
+            """Return a pre_disk_hook that stages the correct arch's Linux ELF."""
+            def stage_linux_elf(rootfs_dir):
+                tmp_dir = os.path.join(rootfs_dir, "tmp")
+                os.makedirs(tmp_dir, exist_ok=True)
+                path = os.path.join(tmp_dir, "hello-linux")
+                elf_builders = {
+                    "x86_64": create_linux_hello_elf,
+                    "riscv64": create_linux_hello_elf_riscv64,
+                    "aarch64": create_linux_hello_elf_aarch64,
+                }
+                builder = elf_builders.get(arch, create_linux_hello_elf)
+                with open(path, "wb") as f:
+                    f.write(builder())
+                os.chmod(path, 0o755)
+                log("CONTAINER", f"Staged hello-linux ELF ({arch})")
+            return stage_linux_elf
 
         with tempfile.TemporaryDirectory(prefix="fornax-test-") as tmpdir:
 
@@ -338,6 +347,7 @@ def main():
                 test_host_networking,
                 test_filesystem,
                 test_container_native,
+                test_container_linux_compat,
                 test_container_build,
                 test_container_networking,
                 test_container_pull,
@@ -353,6 +363,7 @@ def main():
                 test_host_networking,
                 test_filesystem,
                 test_container_native,
+                test_container_linux_compat,
                 test_container_build,
                 test_container_networking,
                 test_container_pull,
@@ -386,7 +397,7 @@ def main():
                     ["-Dcontainers=true", "-Dtls=true"],
                     core_tests,
                     tmpdir,
-                    pre_disk_hook=stage_linux_elf,
+                    pre_disk_hook=make_stage_linux_elf("x86_64"),
                     smp=smp, memory="4G",
                 )
                 total_passed += p
@@ -411,7 +422,7 @@ def main():
                 http_server = None
 
                 def setup_posix(rootfs_dir):
-                    stage_linux_elf(rootfs_dir)
+                    make_stage_linux_elf("x86_64")(rootfs_dir)
 
                 def start_pkg_server(qemu):
                     nonlocal http_server
@@ -453,7 +464,7 @@ def main():
                         ["-Dcontainers=true"],
                         aa64_tests,
                         tmpdir,
-                        pre_disk_hook=stage_linux_elf,
+                        pre_disk_hook=make_stage_linux_elf("aarch64"),
                         smp=1, memory="4G",
                         arch="aarch64",
                     )
@@ -475,7 +486,7 @@ def main():
                         ["-Dcontainers=true"],
                         rv64_tests,
                         tmpdir,
-                        pre_disk_hook=stage_linux_elf,
+                        pre_disk_hook=make_stage_linux_elf("riscv64"),
                         smp=1, memory="4G",
                         arch="riscv64",
                     )

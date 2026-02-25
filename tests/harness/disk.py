@@ -98,3 +98,116 @@ def create_linux_hello_elf():
     elf += code
     assert len(elf) == file_size
     return elf
+
+
+def create_linux_hello_elf_riscv64():
+    """Create minimal static riscv64 Linux ELF: write(1,'hello-linux-compat\\n') + exit(0).
+
+    Uses generic Linux syscall numbers (64=write, 93=exit) with ecall.
+    Loaded at 0x40000000 to match Fornax user address space conventions.
+    """
+    msg = b"hello-linux-compat\n"
+    msg_len = len(msg)
+
+    def addi(rd, rs1, imm12):
+        """Encode ADDI rd, rs1, imm12"""
+        return struct.pack('<I', ((imm12 & 0xFFF) << 20) | (rs1 << 15) | (0 << 12) | (rd << 7) | 0x13)
+
+    def auipc(rd, imm20):
+        """Encode AUIPC rd, imm20"""
+        return struct.pack('<I', ((imm20 & 0xFFFFF) << 12) | (rd << 7) | 0x17)
+
+    def ecall():
+        """Encode ECALL"""
+        return struct.pack('<I', 0x00000073)
+
+    # RISC-V register names: a0=x10, a1=x11, a2=x12, a7=x17
+    # 9 instructions × 4 bytes = 36 bytes, msg at offset 36
+    # auipc a1 is at offset 8, so msg offset from there = 36 - 8 = 28
+    code = b''
+    code += addi(17, 0, 64)   # li a7, 64  (sys_write)
+    code += addi(10, 0, 1)    # li a0, 1   (stdout)
+    code += auipc(11, 0)      # auipc a1, 0 (a1 = PC)
+    code += addi(11, 11, 28)  # addi a1, a1, 28 (point to msg)
+    code += addi(12, 0, msg_len)  # li a2, <len>
+    code += ecall()           # ecall
+    code += addi(17, 0, 93)   # li a7, 93  (sys_exit)
+    code += addi(10, 0, 0)    # li a0, 0
+    code += ecall()           # ecall
+    code += msg
+
+    file_size = 64 + 56 + len(code)
+    base = 0x40000000
+    entry = base + 0x78  # code starts after ELF header + phdr
+
+    # ELF header (64 bytes)
+    elf = b'\x7fELF'
+    elf += struct.pack('<BBBBB', 2, 1, 1, 0, 0) + b'\x00' * 7
+    elf += struct.pack('<HHI', 2, 0xF3, 1)           # ET_EXEC, EM_RISCV
+    elf += struct.pack('<QQQ', entry, 64, 0)          # entry, phoff, shoff
+    elf += struct.pack('<IHHHHHH', 0, 64, 56, 1, 0, 0, 0)
+
+    # Program header (56 bytes) — single PT_LOAD
+    elf += struct.pack('<II', 1, 5)                    # PT_LOAD, PF_R|PF_X
+    elf += struct.pack('<QQQQQQ', 0, base, base, file_size, file_size, 0x1000)
+
+    elf += code
+    assert len(elf) == file_size
+    return elf
+
+
+def create_linux_hello_elf_aarch64():
+    """Create minimal static aarch64 Linux ELF: write(1,'hello-linux-compat\\n') + exit(0).
+
+    Uses generic Linux syscall numbers (64=write, 93=exit) with svc #0.
+    Loaded at 0x40000000 to match Fornax user address space conventions.
+    """
+    msg = b"hello-linux-compat\n"
+    msg_len = len(msg)
+
+    def movz(rd, imm16):
+        """Encode MOVZ Xrd, #imm16"""
+        return struct.pack('<I', 0xd2800000 | (imm16 << 5) | rd)
+
+    def adr(rd, offset):
+        """Encode ADR Xrd, offset (PC-relative, ±1MB)"""
+        immlo = offset & 3
+        immhi = (offset >> 2) & 0x7FFFF
+        return struct.pack('<I', 0x10000000 | (immlo << 29) | (immhi << 5) | rd)
+
+    def svc0():
+        """Encode SVC #0"""
+        return struct.pack('<I', 0xd4000001)
+
+    # 9 instructions × 4 bytes = 36 bytes, then msg follows
+    # adr x1 offset: from instruction 2 (offset 8) to msg (offset 36) = 28
+    code = b''
+    code += movz(8, 64)       # mov x8, #64  (sys_write)
+    code += movz(0, 1)        # mov x0, #1   (stdout)
+    code += adr(1, 24)        # adr x1, msg  (24 bytes ahead from PC)
+    code += movz(2, msg_len)  # mov x2, #len
+    code += svc0()            # svc #0
+    code += movz(8, 93)       # mov x8, #93  (sys_exit)
+    code += movz(0, 0)        # mov x0, #0
+    code += svc0()            # svc #0
+    # padding to align (optional, not needed for this)
+    code += msg
+
+    file_size = 64 + 56 + len(code)
+    base = 0x40000000
+    entry = base + 0x78  # code starts after ELF header + phdr
+
+    # ELF header (64 bytes)
+    elf = b'\x7fELF'
+    elf += struct.pack('<BBBBB', 2, 1, 1, 0, 0) + b'\x00' * 7
+    elf += struct.pack('<HHI', 2, 0xB7, 1)           # ET_EXEC, EM_AARCH64
+    elf += struct.pack('<QQQ', entry, 64, 0)          # entry, phoff, shoff
+    elf += struct.pack('<IHHHHHH', 0, 64, 56, 1, 0, 0, 0)
+
+    # Program header (56 bytes) — single PT_LOAD
+    elf += struct.pack('<II', 1, 5)                    # PT_LOAD, PF_R|PF_X
+    elf += struct.pack('<QQQQQQ', 0, base, base, file_size, file_size, 0x1000)
+
+    elf += code
+    assert len(elf) == file_size
+    return elf

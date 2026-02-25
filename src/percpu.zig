@@ -187,6 +187,15 @@ pub fn init() void {
         // Also set GS_BASE directly for initial kernel context (before first swapgs).
         const MSR_GS_BASE = 0xC0000101;
         cpu.wrmsr(MSR_GS_BASE, @intFromPtr(&asm_states[0]));
+    } else if (builtin.cpu.arch == .riscv64) {
+        // Set TP = &asm_states[0] for BSP. Entry.S uses TP as percpu pointer.
+        asm volatile ("mv tp, %[v]"
+            :
+            : [v] "r" (@intFromPtr(&asm_states[0])),
+        );
+        // Also set SSCRATCH for first trap entry from U-mode
+        const rv_cpu = @import("arch/riscv64/cpu.zig");
+        rv_cpu.csrWrite(rv_cpu.CSR_SSCRATCH, @intFromPtr(&asm_states[0]));
     }
 
     // Allocate per-CPU scheduler stack for BSP.
@@ -255,8 +264,34 @@ pub noinline fn getCoreId() u8 {
             }
         }
         return @intCast(idx);
+    } else if (builtin.cpu.arch == .riscv64) {
+        // Before percpu.init() sets TP, we're on BSP (core 0)
+        if (cores_online == 0) return 0;
+        // TP = &asm_states[core_id]. Compute index from pointer offset.
+        const tp_val = asm volatile ("mv %[out], tp"
+            : [out] "=r" (-> u64),
+        );
+        const base = @intFromPtr(&asm_states[0]);
+        const offset = tp_val -% base;
+        const idx = offset / @sizeOf(AsmState);
+        if (idx >= MAX_CORES) {
+            // TP is corrupt — dump diagnostic and halt this core.
+            const serial = @import("serial.zig");
+            const process = @import("process.zig");
+            serial.putChar('\n');
+            serial.putChar('T');
+            serial.putChar('P');
+            serial.putChar('!');
+            process.inlineHex(tp_val);
+            serial.putChar(' ');
+            process.inlineHex(base);
+            serial.putChar('\n');
+            const rv_cpu = @import("arch/riscv64/cpu.zig");
+            rv_cpu.halt();
+        }
+        return @intCast(idx);
     } else {
-        // riscv64: single-core for now
+        // aarch64 etc: single-core for now
         return 0;
     }
 }

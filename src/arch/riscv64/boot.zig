@@ -42,9 +42,14 @@ comptime {
     );
 }
 
+/// Boot hart ID — saved for SMP init so we know which hart is BSP.
+pub var boot_hartid: u64 = 0;
+
 /// Kernel entry point called from _start in entry.S.
 /// a0 = hartid, a1 = FDT pointer (currently unused).
-export fn riscv64KernelMain(_: u64, _: u64) callconv(.c) noreturn {
+export fn riscv64KernelMain(hartid: u64, _: u64) callconv(.c) noreturn {
+    boot_hartid = hartid;
+
     // Serial console first — earliest possible output
     serial.init();
     klog.console_level = .info;

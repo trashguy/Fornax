@@ -1,6 +1,275 @@
 const std = @import("std");
 const Target = std.Target;
 
+/// musl source files needed for basic stdio/stdlib/string functionality.
+/// Shared across all architectures' POSIX builds.
+const musl_sources: []const []const u8 = &.{
+    // -- internal --
+    "src/internal/libc.c",
+    "src/internal/syscall_ret.c",
+    "src/internal/intscan.c",
+    "src/internal/floatscan.c",
+    "src/internal/shgetc.c",
+    // -- errno --
+    "src/errno/__errno_location.c",
+    "src/errno/strerror.c",
+    // -- string --
+    "src/string/memcpy.c",
+    "src/string/memset.c",
+    "src/string/memmove.c",
+    "src/string/memchr.c",
+    "src/string/memcmp.c",
+    "src/string/memrchr.c",
+    "src/string/strlen.c",
+    "src/string/strnlen.c",
+    "src/string/strcmp.c",
+    "src/string/strncmp.c",
+    "src/string/strcpy.c",
+    "src/string/strncpy.c",
+    "src/string/stpcpy.c",
+    "src/string/stpncpy.c",
+    "src/string/strchrnul.c",
+    "src/string/strchr.c",
+    "src/string/strrchr.c",
+    "src/string/strstr.c",
+    "src/string/strdup.c",
+    "src/string/strndup.c",
+    "src/string/strcat.c",
+    "src/string/strncat.c",
+    "src/string/strspn.c",
+    "src/string/strcspn.c",
+    "src/string/strtok.c",
+    "src/string/strtok_r.c",
+    "src/string/strerror_r.c",
+    "src/string/bcopy.c",
+    "src/string/bzero.c",
+    "src/string/strlcpy.c",
+    "src/string/strlcat.c",
+    "src/string/wcschr.c",
+    "src/string/wcslen.c",
+    "src/string/wmemchr.c",
+    "src/string/wmemcpy.c",
+    "src/string/wmemset.c",
+    "src/string/wcsncmp.c",
+    "src/string/wmemcmp.c",
+    // -- stdio --
+    "src/stdio/printf.c",
+    "src/stdio/fprintf.c",
+    "src/stdio/vfprintf.c",
+    "src/stdio/snprintf.c",
+    "src/stdio/vsnprintf.c",
+    "src/stdio/sprintf.c",
+    "src/stdio/vsprintf.c",
+    "src/stdio/sscanf.c",
+    "src/stdio/vsscanf.c",
+    "src/stdio/scanf.c",
+    "src/stdio/vscanf.c",
+    "src/stdio/fscanf.c",
+    "src/stdio/vfscanf.c",
+    "src/stdio/fwrite.c",
+    "src/stdio/fread.c",
+    "src/stdio/fopen.c",
+    "src/stdio/fclose.c",
+    "src/stdio/fflush.c",
+    "src/stdio/fseek.c",
+    "src/stdio/ftell.c",
+    "src/stdio/rewind.c",
+    "src/stdio/feof.c",
+    "src/stdio/ferror.c",
+    "src/stdio/clearerr.c",
+    "src/stdio/fileno.c",
+    "src/stdio/fputc.c",
+    "src/stdio/fputs.c",
+    "src/stdio/puts.c",
+    "src/stdio/putchar.c",
+    "src/stdio/fgetc.c",
+    "src/stdio/fgets.c",
+    "src/stdio/getc.c",
+    "src/stdio/ungetc.c",
+    "src/stdio/perror.c",
+    "src/stdio/stderr.c",
+    "src/stdio/stdout.c",
+    "src/stdio/stdin.c",
+    "src/stdio/__stdio_write.c",
+    "src/stdio/__stdio_read.c",
+    "src/stdio/__stdio_seek.c",
+    "src/stdio/__stdio_close.c",
+    "src/stdio/__stdout_write.c",
+    "src/stdio/__towrite.c",
+    "src/stdio/__toread.c",
+    "src/stdio/__overflow.c",
+    "src/stdio/__uflow.c",
+    "src/stdio/__fdopen.c",
+    "src/stdio/ofl.c",
+    "src/stdio/ofl_add.c",
+    "src/stdio/__lockfile.c",
+    "src/stdio/__fmodeflags.c",
+    "src/stdio/__stdio_exit.c",
+    // -- stdlib --
+    "src/stdlib/abs.c",
+    "src/stdlib/atoi.c",
+    "src/stdlib/atol.c",
+    "src/stdlib/atoll.c",
+    "src/stdlib/strtol.c",
+    "src/stdlib/strtod.c",
+    "src/stdlib/qsort.c",
+    "src/stdlib/bsearch.c",
+    // -- ctype --
+    "src/ctype/__ctype_get_mb_cur_max.c",
+    "src/ctype/isalnum.c",
+    "src/ctype/isalpha.c",
+    "src/ctype/isascii.c",
+    "src/ctype/isblank.c",
+    "src/ctype/iscntrl.c",
+    "src/ctype/isdigit.c",
+    "src/ctype/isgraph.c",
+    "src/ctype/islower.c",
+    "src/ctype/isprint.c",
+    "src/ctype/ispunct.c",
+    "src/ctype/isspace.c",
+    "src/ctype/isupper.c",
+    "src/ctype/isxdigit.c",
+    "src/ctype/tolower.c",
+    "src/ctype/toupper.c",
+    "src/ctype/iswalpha.c",
+    "src/ctype/iswdigit.c",
+    "src/ctype/iswspace.c",
+    "src/ctype/iswprint.c",
+    "src/ctype/iswcntrl.c",
+    "src/ctype/iswupper.c",
+    "src/ctype/iswlower.c",
+    "src/ctype/iswblank.c",
+    "src/ctype/iswpunct.c",
+    "src/ctype/iswgraph.c",
+    "src/ctype/iswxdigit.c",
+    "src/ctype/iswctype.c",
+    "src/ctype/wctrans.c",
+    "src/ctype/towctrans.c",
+    "src/ctype/wcwidth.c",
+    "src/ctype/wcswidth.c",
+    // -- locale --
+    "src/locale/langinfo.c",
+    "src/locale/__lctrans.c",
+    "src/locale/c_locale.c",
+    "src/locale/localeconv.c",
+    "src/locale/uselocale.c",
+    "src/locale/setlocale.c",
+    "src/locale/iconv.c",
+    // -- multibyte --
+    "src/multibyte/mbrtowc.c",
+    "src/multibyte/wcrtomb.c",
+    "src/multibyte/wctomb.c",
+    "src/multibyte/mbtowc.c",
+    "src/multibyte/mbsinit.c",
+    "src/multibyte/mbsrtowcs.c",
+    "src/multibyte/mbsnrtowcs.c",
+    "src/multibyte/wcsrtombs.c",
+    "src/multibyte/wcsnrtombs.c",
+    "src/multibyte/internal.c",
+    // -- exit --
+    "src/exit/exit.c",
+    "src/exit/_Exit.c",
+    "src/exit/atexit.c",
+    // -- process (simple wrappers only, fork/waitpid provided by process_stubs.c) --
+    "src/process/execve.c",
+    "src/unistd/getppid.c",
+    "src/unistd/pipe.c",
+    // -- env --
+    "src/env/__libc_start_main.c",
+    "src/env/__init_tls.c",
+    "src/env/__stack_chk_fail.c",
+    // -- math (needed by printf for float formatting) --
+    "src/math/frexp.c",
+    "src/math/frexpl.c",
+    "src/math/copysignl.c",
+    "src/math/fabs.c",
+    "src/math/fabsl.c",
+    "src/math/scalbn.c",
+    "src/math/scalbnl.c",
+    "src/math/__fpclassify.c",
+    "src/math/__fpclassifyl.c",
+    "src/math/__signbit.c",
+    "src/math/__signbitl.c",
+    "src/math/fmod.c",
+    "src/math/fmodl.c",
+    "src/math/log10.c",
+    "src/math/log2.c",
+    "src/math/ceil.c",
+    "src/math/floor.c",
+    "src/math/round.c",
+    // -- malloc --
+    "src/malloc/mallocng/malloc.c",
+    "src/malloc/mallocng/free.c",
+    "src/malloc/mallocng/realloc.c",
+    "src/malloc/mallocng/aligned_alloc.c",
+    "src/malloc/mallocng/donate.c",
+    "src/malloc/calloc.c",
+    "src/malloc/lite_malloc.c",
+    "src/malloc/free.c",
+    "src/malloc/realloc.c",
+    "src/malloc/replaced.c",
+    // -- stat --
+    "src/stat/fstat.c",
+    "src/stat/stat.c",
+    "src/stat/fstatat.c",
+    "src/stat/lstat.c",
+    // -- unistd --
+    "src/unistd/lseek.c",
+    "src/unistd/read.c",
+    "src/unistd/write.c",
+    "src/unistd/close.c",
+    "src/unistd/getpid.c",
+    "src/unistd/getcwd.c",
+    "src/unistd/access.c",
+    "src/unistd/dup.c",
+    "src/unistd/dup2.c",
+    "src/unistd/readlink.c",
+    "src/unistd/readlinkat.c",
+    "src/unistd/isatty.c",
+    "src/unistd/sleep.c",
+    "src/unistd/usleep.c",
+    // -- fcntl --
+    "src/fcntl/open.c",
+    "src/fcntl/openat.c",
+    "src/fcntl/creat.c",
+    "src/fcntl/fcntl.c",
+    // -- dirent --
+    "src/dirent/opendir.c",
+    "src/dirent/closedir.c",
+    "src/dirent/readdir.c",
+    // -- time --
+    "src/time/clock_gettime.c",
+    "src/time/time.c",
+    "src/time/gettimeofday.c",
+    "src/time/localtime.c",
+    "src/time/localtime_r.c",
+    "src/time/gmtime.c",
+    "src/time/gmtime_r.c",
+    "src/time/mktime.c",
+    "src/time/__secs_to_tm.c",
+    "src/time/__tm_to_secs.c",
+    "src/time/__year_to_secs.c",
+    "src/time/__month_to_secs.c",
+    "src/time/__tz.c",
+    "src/time/strftime.c",
+    "src/time/clock.c",
+    // -- misc --
+    "src/misc/basename.c",
+    "src/misc/dirname.c",
+    // -- mman --
+    "src/mman/mmap.c",
+    "src/mman/munmap.c",
+    "src/mman/mprotect.c",
+    "src/mman/madvise.c",
+    // -- signal stubs --
+    "src/signal/sigaction.c",
+    "src/signal/sigprocmask.c",
+    // -- prng --
+    "src/prng/__rand48_step.c",
+    "src/prng/rand.c",
+    "src/prng/rand_r.c",
+};
+
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const cluster = b.option(bool, "cluster", "Enable clustering support (gossip discovery, remote namespaces, scheduler)") orelse false;
@@ -1081,7 +1350,7 @@ const touch_bin = b.addExecutable(.{
             }),
         });
         hc_bin.addCSourceFile(.{ .file = b.path("cmd/hello-c/main.c"), .flags = &.{ "-ffreestanding", "-nostdlib", "-nostdinc" } });
-        hc_bin.addAssemblyFile(b.path("lib/c/crt0.S"));
+        hc_bin.addAssemblyFile(b.path("lib/c/crt0-x86_64.S"));
         hc_bin.addIncludePath(b.path("lib/c"));
         hc_bin.image_base = user_image_base;
         hello_c_bin = hc_bin;
@@ -1116,271 +1385,6 @@ const touch_bin = b.addExecutable(.{
                 b.fmt("-I{s}", .{musl_dep.path("include").getPath(b)}),
             };
 
-            // musl source files needed for basic stdio/stdlib/string functionality.
-            // This list is built incrementally — add files as link errors appear.
-            const musl_sources: []const []const u8 = &.{
-                // -- internal --
-                "src/internal/libc.c",
-                "src/internal/syscall_ret.c",
-                "src/internal/intscan.c",
-                "src/internal/floatscan.c",
-                "src/internal/shgetc.c",
-                // -- errno --
-                "src/errno/__errno_location.c",
-                "src/errno/strerror.c",
-                // -- string --
-                "src/string/memcpy.c",
-                "src/string/memset.c",
-                "src/string/memmove.c",
-                "src/string/memchr.c",
-                "src/string/memcmp.c",
-                "src/string/memrchr.c",
-                "src/string/strlen.c",
-                "src/string/strnlen.c",
-                "src/string/strcmp.c",
-                "src/string/strncmp.c",
-                "src/string/strcpy.c",
-                "src/string/strncpy.c",
-                "src/string/stpcpy.c",
-                "src/string/stpncpy.c",
-                "src/string/strchrnul.c",
-                "src/string/strchr.c",
-                "src/string/strrchr.c",
-                "src/string/strstr.c",
-                "src/string/strdup.c",
-                "src/string/strndup.c",
-                "src/string/strcat.c",
-                "src/string/strncat.c",
-                "src/string/strspn.c",
-                "src/string/strcspn.c",
-                "src/string/strtok.c",
-                "src/string/strtok_r.c",
-                "src/string/strerror_r.c",
-                "src/string/bcopy.c",
-                "src/string/bzero.c",
-                "src/string/strlcpy.c",
-                "src/string/strlcat.c",
-                "src/string/wcschr.c",
-                "src/string/wcslen.c",
-                "src/string/wmemchr.c",
-                "src/string/wmemcpy.c",
-                "src/string/wmemset.c",
-                "src/string/wcsncmp.c",
-                "src/string/wmemcmp.c",
-                // -- stdio --
-                "src/stdio/printf.c",
-                "src/stdio/fprintf.c",
-                "src/stdio/vfprintf.c",
-                "src/stdio/snprintf.c",
-                "src/stdio/vsnprintf.c",
-                "src/stdio/sprintf.c",
-                "src/stdio/vsprintf.c",
-                "src/stdio/sscanf.c",
-                "src/stdio/vsscanf.c",
-                "src/stdio/scanf.c",
-                "src/stdio/vscanf.c",
-                "src/stdio/fscanf.c",
-                "src/stdio/vfscanf.c",
-                "src/stdio/fwrite.c",
-                "src/stdio/fread.c",
-                "src/stdio/fopen.c",
-                "src/stdio/fclose.c",
-                "src/stdio/fflush.c",
-                "src/stdio/fseek.c",
-                "src/stdio/ftell.c",
-                "src/stdio/rewind.c",
-                "src/stdio/feof.c",
-                "src/stdio/ferror.c",
-                "src/stdio/clearerr.c",
-                "src/stdio/fileno.c",
-                "src/stdio/fputc.c",
-                "src/stdio/fputs.c",
-                "src/stdio/puts.c",
-                "src/stdio/putchar.c",
-                "src/stdio/fgetc.c",
-                "src/stdio/fgets.c",
-                "src/stdio/getc.c",
-                "src/stdio/ungetc.c",
-                "src/stdio/perror.c",
-                "src/stdio/stderr.c",
-                "src/stdio/stdout.c",
-                "src/stdio/stdin.c",
-                "src/stdio/__stdio_write.c",
-                "src/stdio/__stdio_read.c",
-                "src/stdio/__stdio_seek.c",
-                "src/stdio/__stdio_close.c",
-                "src/stdio/__stdout_write.c",
-                "src/stdio/__towrite.c",
-                "src/stdio/__toread.c",
-                "src/stdio/__overflow.c",
-                "src/stdio/__uflow.c",
-                "src/stdio/__fdopen.c",
-                "src/stdio/ofl.c",
-                "src/stdio/ofl_add.c",
-                "src/stdio/__lockfile.c",
-                "src/stdio/__fmodeflags.c",
-                "src/stdio/__stdio_exit.c",
-                // -- stdlib --
-                "src/stdlib/abs.c",
-                "src/stdlib/atoi.c",
-                "src/stdlib/atol.c",
-                "src/stdlib/atoll.c",
-                "src/stdlib/strtol.c",
-                "src/stdlib/strtod.c",
-                "src/stdlib/qsort.c",
-                "src/stdlib/bsearch.c",
-                // -- ctype --
-                "src/ctype/__ctype_get_mb_cur_max.c",
-                "src/ctype/isalnum.c",
-                "src/ctype/isalpha.c",
-                "src/ctype/isascii.c",
-                "src/ctype/isblank.c",
-                "src/ctype/iscntrl.c",
-                "src/ctype/isdigit.c",
-                "src/ctype/isgraph.c",
-                "src/ctype/islower.c",
-                "src/ctype/isprint.c",
-                "src/ctype/ispunct.c",
-                "src/ctype/isspace.c",
-                "src/ctype/isupper.c",
-                "src/ctype/isxdigit.c",
-                "src/ctype/tolower.c",
-                "src/ctype/toupper.c",
-                "src/ctype/iswalpha.c",
-                "src/ctype/iswdigit.c",
-                "src/ctype/iswspace.c",
-                "src/ctype/iswprint.c",
-                "src/ctype/iswcntrl.c",
-                "src/ctype/iswupper.c",
-                "src/ctype/iswlower.c",
-                "src/ctype/iswblank.c",
-                "src/ctype/iswpunct.c",
-                "src/ctype/iswgraph.c",
-                "src/ctype/iswxdigit.c",
-                "src/ctype/iswctype.c",
-                "src/ctype/wctrans.c",
-                "src/ctype/towctrans.c",
-                "src/ctype/wcwidth.c",
-                "src/ctype/wcswidth.c",
-                // -- locale --
-                "src/locale/langinfo.c",
-                "src/locale/__lctrans.c",
-                "src/locale/c_locale.c",
-                "src/locale/localeconv.c",
-                "src/locale/uselocale.c",
-                "src/locale/setlocale.c",
-                "src/locale/iconv.c",
-                // -- multibyte --
-                "src/multibyte/mbrtowc.c",
-                "src/multibyte/wcrtomb.c",
-                "src/multibyte/wctomb.c",
-                "src/multibyte/mbtowc.c",
-                "src/multibyte/mbsinit.c",
-                "src/multibyte/mbsrtowcs.c",
-                "src/multibyte/mbsnrtowcs.c",
-                "src/multibyte/wcsrtombs.c",
-                "src/multibyte/wcsnrtombs.c",
-                "src/multibyte/internal.c",
-                // -- exit --
-                "src/exit/exit.c",
-                "src/exit/_Exit.c",
-                "src/exit/atexit.c",
-                // -- env --
-                "src/env/__libc_start_main.c",
-                "src/env/__init_tls.c",
-                "src/env/__stack_chk_fail.c",
-                // -- math (needed by printf for float formatting) --
-                "src/math/frexp.c",
-                "src/math/frexpl.c",
-                "src/math/copysignl.c",
-                "src/math/fabs.c",
-                "src/math/fabsl.c",
-                "src/math/scalbn.c",
-                "src/math/scalbnl.c",
-                "src/math/__fpclassify.c",
-                "src/math/__fpclassifyl.c",
-                "src/math/__signbit.c",
-                "src/math/__signbitl.c",
-                "src/math/fmod.c",
-                "src/math/fmodl.c",
-                "src/math/log10.c",
-                "src/math/log2.c",
-                "src/math/ceil.c",
-                "src/math/floor.c",
-                "src/math/round.c",
-                // -- malloc --
-                "src/malloc/mallocng/malloc.c",
-                "src/malloc/mallocng/free.c",
-                "src/malloc/mallocng/realloc.c",
-                "src/malloc/mallocng/aligned_alloc.c",
-                "src/malloc/mallocng/donate.c",
-                "src/malloc/calloc.c",
-                "src/malloc/lite_malloc.c",
-                "src/malloc/free.c",
-                "src/malloc/realloc.c",
-                "src/malloc/replaced.c",
-                // -- stat --
-                "src/stat/fstat.c",
-                "src/stat/stat.c",
-                "src/stat/fstatat.c",
-                "src/stat/lstat.c",
-                // -- unistd --
-                "src/unistd/lseek.c",
-                "src/unistd/read.c",
-                "src/unistd/write.c",
-                "src/unistd/close.c",
-                "src/unistd/getpid.c",
-                "src/unistd/getcwd.c",
-                "src/unistd/access.c",
-                "src/unistd/dup.c",
-                "src/unistd/dup2.c",
-                "src/unistd/readlink.c",
-                "src/unistd/readlinkat.c",
-                "src/unistd/isatty.c",
-                "src/unistd/sleep.c",
-                "src/unistd/usleep.c",
-                // -- fcntl --
-                "src/fcntl/open.c",
-                "src/fcntl/openat.c",
-                "src/fcntl/creat.c",
-                "src/fcntl/fcntl.c",
-                // -- dirent --
-                "src/dirent/opendir.c",
-                "src/dirent/closedir.c",
-                "src/dirent/readdir.c",
-                // -- time --
-                "src/time/clock_gettime.c",
-                "src/time/time.c",
-                "src/time/gettimeofday.c",
-                "src/time/localtime.c",
-                "src/time/localtime_r.c",
-                "src/time/gmtime.c",
-                "src/time/gmtime_r.c",
-                "src/time/mktime.c",
-                "src/time/__secs_to_tm.c",
-                "src/time/__tm_to_secs.c",
-                "src/time/__year_to_secs.c",
-                "src/time/__month_to_secs.c",
-                "src/time/__tz.c",
-                "src/time/strftime.c",
-                "src/time/clock.c",
-                // -- misc --
-                "src/misc/basename.c",
-                "src/misc/dirname.c",
-                // -- mman --
-                "src/mman/mmap.c",
-                "src/mman/munmap.c",
-                "src/mman/mprotect.c",
-                "src/mman/madvise.c",
-                // -- signal stubs --
-                "src/signal/sigaction.c",
-                "src/signal/sigprocmask.c",
-                // -- prng --
-                "src/prng/__rand48_step.c",
-                "src/prng/rand.c",
-                "src/prng/rand_r.c",
-            };
-
             // Helper to create a POSIX program linked with musl
             const posix_programs: []const struct { name: []const u8, src: []const u8 } = &.{
                 .{ .name = "hello-posix", .src = "cmd/hello-posix/main.c" },
@@ -1402,11 +1406,15 @@ const touch_bin = b.addExecutable(.{
                 });
 
                 // Add POSIX crt0 (includes rfork for namespace isolation)
-                exe.addAssemblyFile(b.path("lib/posix/crt0.S"));
+                exe.addAssemblyFile(b.path("lib/posix/crt0-x86_64.S"));
 
                 // Add the shim (Linux → Fornax translation)
                 exe.addCSourceFile(.{
                     .file = b.path("lib/posix/shim.c"),
+                    .flags = c_flags,
+                });
+                exe.addCSourceFile(.{
+                    .file = b.path("lib/posix/process_stubs.c"),
                     .flags = c_flags,
                 });
 
@@ -1444,9 +1452,13 @@ const touch_bin = b.addExecutable(.{
                         }),
                     });
 
-                    tcc_exe.addAssemblyFile(b.path("lib/posix/crt0.S"));
+                    tcc_exe.addAssemblyFile(b.path("lib/posix/crt0-x86_64.S"));
                     tcc_exe.addCSourceFile(.{
                         .file = b.path("lib/posix/shim.c"),
+                        .flags = c_flags,
+                    });
+                    tcc_exe.addCSourceFile(.{
+                        .file = b.path("lib/posix/process_stubs.c"),
                         .flags = c_flags,
                     });
 
@@ -1549,8 +1561,9 @@ const touch_bin = b.addExecutable(.{
                         .strip = if (user_strip) true else null,
                     }),
                 });
-                xxd_exe.addAssemblyFile(b.path("lib/posix/crt0.S"));
+                xxd_exe.addAssemblyFile(b.path("lib/posix/crt0-x86_64.S"));
                 xxd_exe.addCSourceFile(.{ .file = b.path("lib/posix/shim.c"), .flags = c_flags });
+                xxd_exe.addCSourceFile(.{ .file = b.path("lib/posix/process_stubs.c"), .flags = c_flags });
                 xxd_exe.addCSourceFile(.{ .file = b.path("../fornax-ports/posix/xxd/xxd.c"), .flags = c_flags });
                 for (musl_sources) |src| {
                     xxd_exe.addCSourceFile(.{ .file = musl_dep.path(src), .flags = c_flags });
@@ -1842,6 +1855,125 @@ const touch_bin = b.addExecutable(.{
         aarch64_initrd.step.dependOn(&install.step);
     }
 
+    // aarch64 POSIX programs (gated behind -Dposix=true)
+    if (posix) {
+        // hello-c: freestanding C test program (no musl)
+        const aa64_hc = b.addExecutable(.{
+            .name = "hello-c",
+            .root_module = b.createModule(.{
+                .target = aarch64_freestanding,
+                .optimize = user_optimize,
+                .strip = if (user_strip) true else null,
+            }),
+        });
+        aa64_hc.addCSourceFile(.{ .file = b.path("cmd/hello-c/main.c"), .flags = &.{ "-ffreestanding", "-nostdlib", "-nostdinc" } });
+        aa64_hc.addAssemblyFile(b.path("lib/c/crt0-aarch64.S"));
+        aa64_hc.addIncludePath(b.path("lib/c"));
+        aa64_hc.image_base = user_image_base;
+        const aa64_hc_install = b.addInstallArtifact(aa64_hc, .{
+            .dest_dir = .{ .override = .{ .custom = "rootfs-aarch64/bin" } },
+        });
+        aarch64_initrd.step.dependOn(&aa64_hc_install.step);
+
+        if (b.lazyDependency("musl", .{})) |musl_dep_aa64| {
+            const aa64_c_flags = &[_][]const u8{
+                "-std=c99",
+                "-ffreestanding",
+                "-nostdinc",
+                "-fno-sanitize=all",
+                "-D_XOPEN_SOURCE=700",
+                "-D_FORNAX",
+                "-DSINGLE_THREADED",
+                "-Wno-bitwise-op-parentheses",
+                "-Wno-shift-op-parentheses",
+                "-Wno-ignored-attributes",
+                "-Wno-string-plus-int",
+                "-Wno-dangling-else",
+                "-Wno-parentheses",
+                "-Wno-logical-op-parentheses",
+                b.fmt("-I{s}", .{b.path("lib/posix/overlay").getPath(b)}),
+                b.fmt("-I{s}", .{musl_dep_aa64.path("arch/aarch64").getPath(b)}),
+                b.fmt("-I{s}", .{musl_dep_aa64.path("arch/generic").getPath(b)}),
+                b.fmt("-I{s}", .{musl_dep_aa64.path("src/include").getPath(b)}),
+                b.fmt("-I{s}", .{musl_dep_aa64.path("src/internal").getPath(b)}),
+                b.fmt("-I{s}", .{musl_dep_aa64.path("include").getPath(b)}),
+            };
+
+            const aa64_posix_programs: []const struct { name: []const u8, src: []const u8 } = &.{
+                .{ .name = "hello-posix", .src = "cmd/hello-posix/main.c" },
+                .{ .name = "cat-posix", .src = "cmd/cat-posix/main.c" },
+                .{ .name = "malloc-test", .src = "cmd/malloc-test/main.c" },
+                .{ .name = "fork-test", .src = "cmd/fork-test/main.c" },
+            };
+
+            for (aa64_posix_programs) |prog| {
+                const aa64_px = b.addExecutable(.{
+                    .name = prog.name,
+                    .root_module = b.createModule(.{
+                        .target = aarch64_freestanding,
+                        .optimize = user_optimize,
+                        .strip = if (user_strip) true else null,
+                    }),
+                });
+                aa64_px.addAssemblyFile(b.path("lib/posix/crt0-aarch64.S"));
+                aa64_px.addCSourceFile(.{ .file = b.path("lib/posix/shim.c"), .flags = aa64_c_flags });
+                aa64_px.addCSourceFile(.{ .file = b.path("lib/posix/process_stubs.c"), .flags = aa64_c_flags });
+                aa64_px.addCSourceFile(.{ .file = b.path(prog.src), .flags = aa64_c_flags });
+                for (musl_sources) |src| {
+                    aa64_px.addCSourceFile(.{ .file = musl_dep_aa64.path(src), .flags = aa64_c_flags });
+                }
+                aa64_px.image_base = user_image_base;
+                const aa64_px_install = b.addInstallArtifact(aa64_px, .{
+                    .dest_dir = .{ .override = .{ .custom = "rootfs-aarch64/bin" } },
+                });
+                aarch64_initrd.step.dependOn(&aa64_px_install.step);
+            }
+        }
+    }
+
+    // aarch64 container programs (gated behind -Dcontainers=true)
+    if (containers) {
+        const aa64_bridge = b.addExecutable(.{
+            .name = "bridge",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("srv/bridge/main.zig"),
+                .target = aarch64_freestanding,
+                .optimize = user_optimize,
+                .strip = if (user_strip) true else null,
+                .imports = &.{
+                    .{ .name = "fornax", .module = aa64_fornax_module },
+                },
+            }),
+        });
+        aa64_bridge.image_base = user_image_base;
+        const aa64_bridge_install = b.addInstallArtifact(aa64_bridge, .{
+            .dest_dir = .{ .override = .{ .custom = "rootfs-aarch64/bin" } },
+        });
+        aarch64_initrd.step.dependOn(&aa64_bridge_install.step);
+
+        const aa64_fnx_options = b.addOptions();
+        aa64_fnx_options.addOption(bool, "has_tls", false); // TLS not yet on aarch64
+
+        const aa64_fnx = b.addExecutable(.{
+            .name = "fnx",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("cmd/fnx/main.zig"),
+                .target = aarch64_freestanding,
+                .optimize = user_optimize,
+                .strip = if (user_strip) true else null,
+                .imports = &.{
+                    .{ .name = "fornax", .module = aa64_fornax_module },
+                    .{ .name = "fnx_options", .module = aa64_fnx_options.createModule() },
+                },
+            }),
+        });
+        aa64_fnx.image_base = user_image_base;
+        const aa64_fnx_install = b.addInstallArtifact(aa64_fnx, .{
+            .dest_dir = .{ .override = .{ .custom = "rootfs-aarch64/bin" } },
+        });
+        aarch64_initrd.step.dependOn(&aa64_fnx_install.step);
+    }
+
     // ── riscv64 freestanding kernel ─────────────────────────────────
     // RISC-V boots via OpenSBI + direct kernel load (not UEFI PE/COFF,
     // which Zig's linker doesn't support for riscv64).
@@ -1975,6 +2107,125 @@ const touch_bin = b.addExecutable(.{
             .dest_dir = .{ .override = .{ .custom = "rootfs-riscv64/bin" } },
         });
         rv_initrd.step.dependOn(&install.step);
+    }
+
+    // riscv64 POSIX programs (gated behind -Dposix=true)
+    if (posix) {
+        // hello-c: freestanding C test program (no musl)
+        const rv_hc = b.addExecutable(.{
+            .name = "hello-c",
+            .root_module = b.createModule(.{
+                .target = riscv64_freestanding,
+                .optimize = user_optimize,
+                .strip = if (user_strip) true else null,
+            }),
+        });
+        rv_hc.addCSourceFile(.{ .file = b.path("cmd/hello-c/main.c"), .flags = &.{ "-ffreestanding", "-nostdlib", "-nostdinc" } });
+        rv_hc.addAssemblyFile(b.path("lib/c/crt0-riscv64.S"));
+        rv_hc.addIncludePath(b.path("lib/c"));
+        rv_hc.image_base = user_image_base;
+        const rv_hc_install = b.addInstallArtifact(rv_hc, .{
+            .dest_dir = .{ .override = .{ .custom = "rootfs-riscv64/bin" } },
+        });
+        rv_initrd.step.dependOn(&rv_hc_install.step);
+
+        if (b.lazyDependency("musl", .{})) |musl_dep_rv| {
+            const rv_c_flags = &[_][]const u8{
+                "-std=c99",
+                "-ffreestanding",
+                "-nostdinc",
+                "-fno-sanitize=all",
+                "-D_XOPEN_SOURCE=700",
+                "-D_FORNAX",
+                "-DSINGLE_THREADED",
+                "-Wno-bitwise-op-parentheses",
+                "-Wno-shift-op-parentheses",
+                "-Wno-ignored-attributes",
+                "-Wno-string-plus-int",
+                "-Wno-dangling-else",
+                "-Wno-parentheses",
+                "-Wno-logical-op-parentheses",
+                b.fmt("-I{s}", .{b.path("lib/posix/overlay").getPath(b)}),
+                b.fmt("-I{s}", .{musl_dep_rv.path("arch/riscv64").getPath(b)}),
+                b.fmt("-I{s}", .{musl_dep_rv.path("arch/generic").getPath(b)}),
+                b.fmt("-I{s}", .{musl_dep_rv.path("src/include").getPath(b)}),
+                b.fmt("-I{s}", .{musl_dep_rv.path("src/internal").getPath(b)}),
+                b.fmt("-I{s}", .{musl_dep_rv.path("include").getPath(b)}),
+            };
+
+            const rv_posix_programs: []const struct { name: []const u8, src: []const u8 } = &.{
+                .{ .name = "hello-posix", .src = "cmd/hello-posix/main.c" },
+                .{ .name = "cat-posix", .src = "cmd/cat-posix/main.c" },
+                .{ .name = "malloc-test", .src = "cmd/malloc-test/main.c" },
+                .{ .name = "fork-test", .src = "cmd/fork-test/main.c" },
+            };
+
+            for (rv_posix_programs) |prog| {
+                const rv_px = b.addExecutable(.{
+                    .name = prog.name,
+                    .root_module = b.createModule(.{
+                        .target = riscv64_freestanding,
+                        .optimize = user_optimize,
+                        .strip = if (user_strip) true else null,
+                    }),
+                });
+                rv_px.addAssemblyFile(b.path("lib/posix/crt0-riscv64.S"));
+                rv_px.addCSourceFile(.{ .file = b.path("lib/posix/shim.c"), .flags = rv_c_flags });
+                rv_px.addCSourceFile(.{ .file = b.path("lib/posix/process_stubs.c"), .flags = rv_c_flags });
+                rv_px.addCSourceFile(.{ .file = b.path(prog.src), .flags = rv_c_flags });
+                for (musl_sources) |src| {
+                    rv_px.addCSourceFile(.{ .file = musl_dep_rv.path(src), .flags = rv_c_flags });
+                }
+                rv_px.image_base = user_image_base;
+                const rv_px_install = b.addInstallArtifact(rv_px, .{
+                    .dest_dir = .{ .override = .{ .custom = "rootfs-riscv64/bin" } },
+                });
+                rv_initrd.step.dependOn(&rv_px_install.step);
+            }
+        }
+    }
+
+    // riscv64 container programs (gated behind -Dcontainers=true)
+    if (containers) {
+        const rv_bridge = b.addExecutable(.{
+            .name = "bridge",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("srv/bridge/main.zig"),
+                .target = riscv64_freestanding,
+                .optimize = user_optimize,
+                .strip = if (user_strip) true else null,
+                .imports = &.{
+                    .{ .name = "fornax", .module = rv_fornax_module },
+                },
+            }),
+        });
+        rv_bridge.image_base = user_image_base;
+        const rv_bridge_install = b.addInstallArtifact(rv_bridge, .{
+            .dest_dir = .{ .override = .{ .custom = "rootfs-riscv64/bin" } },
+        });
+        rv_initrd.step.dependOn(&rv_bridge_install.step);
+
+        const rv_fnx_options = b.addOptions();
+        rv_fnx_options.addOption(bool, "has_tls", false); // TLS not yet on riscv64
+
+        const rv_fnx = b.addExecutable(.{
+            .name = "fnx",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("cmd/fnx/main.zig"),
+                .target = riscv64_freestanding,
+                .optimize = user_optimize,
+                .strip = if (user_strip) true else null,
+                .imports = &.{
+                    .{ .name = "fornax", .module = rv_fornax_module },
+                    .{ .name = "fnx_options", .module = rv_fnx_options.createModule() },
+                },
+            }),
+        });
+        rv_fnx.image_base = user_image_base;
+        const rv_fnx_install = b.addInstallArtifact(rv_fnx, .{
+            .dest_dir = .{ .override = .{ .custom = "rootfs-riscv64/bin" } },
+        });
+        rv_initrd.step.dependOn(&rv_fnx_install.step);
     }
 
     // ── Named steps ─────────────────────────────────────────────────

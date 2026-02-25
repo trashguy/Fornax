@@ -372,6 +372,11 @@ pub fn getKernelRoot() *PageTable {
     return tablePtr(kernel_root_phys);
 }
 
+/// Get the SATP value for the kernel page tables (Sv48 mode).
+pub fn getKernelSatp() u64 {
+    return (@as(u64, 9) << 60) | (kernel_root_phys >> 12);
+}
+
 /// Walk page tables to translate a virtual address to physical.
 pub fn translateVaddr(root: *PageTable, virt: u64) ?u64 {
     const l3_idx: usize = @intCast((virt >> 39) & 0x1FF);

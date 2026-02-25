@@ -201,6 +201,8 @@ static int __cwd_len = 1;
 
 /* ── Raw Fornax syscall (inline asm) ──────────────────────────────── */
 
+#if defined(__x86_64__)
+
 static inline long __fx_raw1(long nr, long a0)
 {
     long ret;
@@ -243,6 +245,114 @@ static inline long __fx_raw5(long nr, long a0, long a1, long a2, long a3, long a
         : "rcx", "r11", "memory");
     return ret;
 }
+
+#elif defined(__riscv)
+
+static inline long __fx_raw1(long nr, long a0)
+{
+    register long _a7 __asm__("a7") = nr;
+    register long _a0 __asm__("a0") = a0;
+    __asm__ volatile ("ecall" : "+r"(_a0) : "r"(_a7) : "memory");
+    return _a0;
+}
+
+static inline long __fx_raw2(long nr, long a0, long a1)
+{
+    register long _a7 __asm__("a7") = nr;
+    register long _a0 __asm__("a0") = a0;
+    register long _a1 __asm__("a1") = a1;
+    __asm__ volatile ("ecall" : "+r"(_a0) : "r"(_a7), "r"(_a1) : "memory");
+    return _a0;
+}
+
+static inline long __fx_raw3(long nr, long a0, long a1, long a2)
+{
+    register long _a7 __asm__("a7") = nr;
+    register long _a0 __asm__("a0") = a0;
+    register long _a1 __asm__("a1") = a1;
+    register long _a2 __asm__("a2") = a2;
+    __asm__ volatile ("ecall" : "+r"(_a0) : "r"(_a7), "r"(_a1), "r"(_a2) : "memory");
+    return _a0;
+}
+
+static inline long __fx_raw4(long nr, long a0, long a1, long a2, long a3)
+{
+    register long _a7 __asm__("a7") = nr;
+    register long _a0 __asm__("a0") = a0;
+    register long _a1 __asm__("a1") = a1;
+    register long _a2 __asm__("a2") = a2;
+    register long _a3 __asm__("a3") = a3;
+    __asm__ volatile ("ecall" : "+r"(_a0) : "r"(_a7), "r"(_a1), "r"(_a2), "r"(_a3) : "memory");
+    return _a0;
+}
+
+static inline long __fx_raw5(long nr, long a0, long a1, long a2, long a3, long a4)
+{
+    register long _a7 __asm__("a7") = nr;
+    register long _a0 __asm__("a0") = a0;
+    register long _a1 __asm__("a1") = a1;
+    register long _a2 __asm__("a2") = a2;
+    register long _a3 __asm__("a3") = a3;
+    register long _a4 __asm__("a4") = a4;
+    __asm__ volatile ("ecall" : "+r"(_a0) : "r"(_a7), "r"(_a1), "r"(_a2), "r"(_a3), "r"(_a4) : "memory");
+    return _a0;
+}
+
+#elif defined(__aarch64__)
+
+static inline long __fx_raw1(long nr, long a0)
+{
+    register long _x8 __asm__("x8") = nr;
+    register long _x0 __asm__("x0") = a0;
+    __asm__ volatile ("svc #0" : "+r"(_x0) : "r"(_x8) : "memory");
+    return _x0;
+}
+
+static inline long __fx_raw2(long nr, long a0, long a1)
+{
+    register long _x8 __asm__("x8") = nr;
+    register long _x0 __asm__("x0") = a0;
+    register long _x1 __asm__("x1") = a1;
+    __asm__ volatile ("svc #0" : "+r"(_x0) : "r"(_x8), "r"(_x1) : "memory");
+    return _x0;
+}
+
+static inline long __fx_raw3(long nr, long a0, long a1, long a2)
+{
+    register long _x8 __asm__("x8") = nr;
+    register long _x0 __asm__("x0") = a0;
+    register long _x1 __asm__("x1") = a1;
+    register long _x2 __asm__("x2") = a2;
+    __asm__ volatile ("svc #0" : "+r"(_x0) : "r"(_x8), "r"(_x1), "r"(_x2) : "memory");
+    return _x0;
+}
+
+static inline long __fx_raw4(long nr, long a0, long a1, long a2, long a3)
+{
+    register long _x8 __asm__("x8") = nr;
+    register long _x0 __asm__("x0") = a0;
+    register long _x1 __asm__("x1") = a1;
+    register long _x2 __asm__("x2") = a2;
+    register long _x3 __asm__("x3") = a3;
+    __asm__ volatile ("svc #0" : "+r"(_x0) : "r"(_x8), "r"(_x1), "r"(_x2), "r"(_x3) : "memory");
+    return _x0;
+}
+
+static inline long __fx_raw5(long nr, long a0, long a1, long a2, long a3, long a4)
+{
+    register long _x8 __asm__("x8") = nr;
+    register long _x0 __asm__("x0") = a0;
+    register long _x1 __asm__("x1") = a1;
+    register long _x2 __asm__("x2") = a2;
+    register long _x3 __asm__("x3") = a3;
+    register long _x4 __asm__("x4") = a4;
+    __asm__ volatile ("svc #0" : "+r"(_x0) : "r"(_x8), "r"(_x1), "r"(_x2), "r"(_x3), "r"(_x4) : "memory");
+    return _x0;
+}
+
+#else
+#error "Unsupported architecture for Fornax syscalls"
+#endif
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
@@ -771,7 +881,15 @@ long __fornax_syscall(long n, long a, long b, long c, long d, long e, long f)
         __strcpy(u->nodename, "fornax");
         __strcpy(u->release, "0.1.0");
         __strcpy(u->version, "Phase 1000");
+#if defined(__x86_64__)
         __strcpy(u->machine, "x86_64");
+#elif defined(__riscv)
+        __strcpy(u->machine, "riscv64");
+#elif defined(__aarch64__)
+        __strcpy(u->machine, "aarch64");
+#else
+        __strcpy(u->machine, "unknown");
+#endif
         return 0;
     }
 
