@@ -11,6 +11,7 @@ const pci = switch (@import("builtin").cpu.arch) {
     else => @compileError("unsupported architecture"),
 };
 const pmm = @import("pmm.zig");
+const mem = @import("mem.zig");
 const virtio = @import("virtio.zig");
 
 /// Virtio PCI capability types (VIRTIO_PCI_CAP_*)
@@ -259,26 +260,36 @@ pub fn setupQueue(dev: *VirtioModernDevice, queue_index: u16) ?virtio.Virtqueue 
     const used_pages = (used_size + 4095) / 4096;
     const total_pages = desc_avail_pages + used_pages;
 
-    const first_page = pmm.allocPage() orelse return null;
-    var pages_got: usize = 1;
-    while (pages_got < total_pages) : (pages_got += 1) {
-        _ = pmm.allocPage() orelse return null;
-    }
+    // Allocate guaranteed-contiguous pages (device DMA requires contiguous physical memory)
+    const first_page = pmm.allocContiguousPages(total_pages) orelse return null;
+
+    // Use higher-half pointers for CPU access — immune to TTBR0 changes
+    // on aarch64 after context switches (see docs/aarch64-gotchas.md §1).
+    const base: u64 = first_page + mem.KERNEL_VIRT_BASE;
 
     // Zero all queue memory
-    const ptr: [*]u8 = @ptrFromInt(first_page);
+    const ptr: [*]u8 = @ptrFromInt(base);
     @memset(ptr[0 .. total_pages * 4096], 0);
 
-    // Set up pointers
+    // AArch64: flush TLB after memset so subsequent scalar stores get fresh translations
+    if (comptime @import("builtin").cpu.arch == .aarch64) {
+        asm volatile ("dsb sy" ::: .{ .memory = true });
+        asm volatile ("tlbi vmalle1" ::: .{ .memory = true });
+        asm volatile ("dsb sy" ::: .{ .memory = true });
+        asm volatile ("isb" ::: .{ .memory = true });
+    }
+
+    // Set up pointers (all higher-half)
     const desc_addr: u64 = first_page;
     const avail_addr: u64 = first_page + desc_size;
     const used_addr: u64 = (first_page + desc_size + avail_size + 4095) & ~@as(u64, 4095);
 
-    const desc_ptr: [*]virtio.VirtqDesc = @ptrFromInt(first_page);
-    const avail_ptr: *virtio.VirtqAvail = @ptrFromInt(@as(usize, @intCast(avail_addr)));
-    const avail_ring_ptr: [*]u16 = @ptrFromInt(@as(usize, @intCast(avail_addr)) + 4);
-    const used_ptr: *virtio.VirtqUsed = @ptrFromInt(@as(usize, @intCast(used_addr)));
-    const used_ring_ptr: [*]virtio.VirtqUsedElem = @ptrFromInt(@as(usize, @intCast(used_addr)) + 4);
+    const desc_ptr: [*]virtio.VirtqDesc = @ptrFromInt(base);
+    const avail_ptr: *virtio.VirtqAvail = @ptrFromInt(base + desc_size);
+    const avail_ring_ptr: [*]u16 = @ptrFromInt(base + desc_size + 4);
+    const used_virt = (base + desc_size + avail_size + 4095) & ~@as(usize, 4095);
+    const used_ptr: *virtio.VirtqUsed = @ptrFromInt(used_virt);
+    const used_ring_ptr: [*]virtio.VirtqUsedElem = @ptrFromInt(used_virt + 4);
 
     // Tell device the queue addresses (64-bit physical addresses)
     mmioWrite32(common + COMMON_QDESC_LO, @truncate(desc_addr));

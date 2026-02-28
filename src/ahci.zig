@@ -310,6 +310,14 @@ fn startPort(base: u64) void {
 
 /// Issue a command in slot 0 and wait for completion.
 fn issueCommand(base: u64) bool {
+    // Barrier: ensure command header + table writes are visible before CI
+    // (see docs/aarch64-gotchas.md §3)
+    if (comptime builtin.cpu.arch == .aarch64) {
+        asm volatile ("dsb sy" ::: .{ .memory = true });
+    } else if (comptime builtin.cpu.arch == .riscv64) {
+        asm volatile ("fence rw, rw" ::: .{ .memory = true });
+    }
+
     // Set CI bit 0
     mmioWrite32(base + PORT_CI, 1);
 

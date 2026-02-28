@@ -93,12 +93,15 @@ pub fn init() bool {
     // No special features needed for basic block I/O
     virtio.finishInit(&dev, 0);
 
-    // Set up the single request queue (queue 0)
+    // Set up the single request queue (queue 0) — before DRIVER_OK per virtio spec
     blk_dev.queue = virtio.setupQueue(&dev, 0);
     if (blk_dev.queue == null) {
         klog.err("virtio-blk: failed to setup queue\n");
         return false;
     }
+
+    // Set DRIVER_OK after queue is configured (per virtio spec)
+    virtio.setDriverOk(&dev);
 
     // Read capacity from device config at BAR + 0x14 (u64 LE, sector count)
     const cap_lo: u64 = blk: {

@@ -123,7 +123,7 @@ pub fn init() bool {
     // Don't request MRG_RXBUF to keep things simple
     virtio.finishInit(&dev, virtio.VIRTIO_NET_F_MAC | virtio.VIRTIO_NET_F_STATUS);
 
-    // Set up receive queue
+    // Set up receive queue (before DRIVER_OK per virtio spec)
     net_dev.rx_queue = virtio.setupQueue(&dev, RX_QUEUE);
     if (net_dev.rx_queue == null) {
         klog.err("virtio-net: failed to setup RX queue\n");
@@ -137,7 +137,17 @@ pub fn init() bool {
         return false;
     }
 
-    // Post receive buffers
+    // Guard ALL virtio-net DMA pages (RX + TX queues) against accidental free/realloc
+    if (comptime @import("builtin").cpu.arch == .aarch64) {
+        const rx_phys = net_dev.rx_queue.?.phys_addr;
+        // Guard from RX queue start through TX queue end (6 contiguous pages)
+        pmm.setDmaGuard(@intCast(rx_phys), 6);
+    }
+
+    // Set DRIVER_OK after all queues are configured (per virtio spec).
+    // MUST happen before any queue notifications (including postRxBuffers).
+    virtio.setDriverOk(&dev);
+
     postRxBuffers();
 
     net_dev.dev = dev;
@@ -145,6 +155,27 @@ pub fn init() bool {
 
     klog.info("virtio-net: initialized (RX/TX queues ready)\n");
     return true;
+}
+
+/// On aarch64, re-write all RX descriptor len/flags fields via volatile
+/// higher-half (TTBR1) writes + cache clean.  TTBR1 always maps to the
+/// correct physical page regardless of which process's TTBR0 is active.
+/// Must NOT use identity-mapped (TTBR0) addresses — after scheduleNext(),
+/// TTBR0 VA 0x40086000 maps to a user ELF page, not the descriptor page.
+fn rearmRxDescs() void {
+    if (comptime @import("builtin").cpu.arch != .aarch64) return;
+    const rx = &(net_dev.rx_queue.?);
+    const hh_base: u64 = rx.phys_addr + @import("mem.zig").KERNEL_VIRT_BASE;
+    for (0..RX_BUFFERS) |i| {
+        const desc_off = i * @sizeOf(virtio.VirtqDesc);
+        // Re-write len (offset 8 within descriptor)
+        @as(*volatile u32, @ptrFromInt(hh_base + desc_off + 8)).* = FRAME_SIZE;
+        // Re-write flags (offset 12) — WRITE flag for device-writable
+        @as(*volatile u16, @ptrFromInt(hh_base + desc_off + 12)).* = virtio.VRING_DESC_F_WRITE;
+        // Clean cache line
+        asm volatile ("dc cvac, %[addr]" : : [addr] "r" (hh_base + desc_off));
+    }
+    asm volatile ("dsb sy" ::: .{ .memory = true });
 }
 
 /// Allocate and post receive buffers to the RX queue.
@@ -162,7 +193,10 @@ fn postRxBuffers() void {
         _ = virtio.addBuffer(rx, buf_phys, FRAME_SIZE, true);
     }
 
-    // Notify device that buffers are available
+    // On aarch64, descriptor bytes 8-15 get silently zeroed (QEMU TCG bug).
+    // Re-arm all descriptors via volatile writes before notifying the device.
+    rearmRxDescs();
+
     virtio.notify(rx);
 
     klog.debug("virtio-net: posted ");
@@ -199,18 +233,35 @@ pub fn send(data: []const u8) bool {
         pmm.freePage(buf_phys);
         return false;
     };
+
+    // Re-arm RX descriptors before TX notify — the TX triggers SLIRP to
+    // respond (ARP reply, TCP SYN-ACK), and the device reads RX descriptors
+    // to deliver the response.  On aarch64, descriptors may be corrupted.
+    rearmRxDescs();
+
     virtio.notify(tx);
 
     // Poll for TX completion so we can free the buffer page.
-    // Synchronous send — waits until the device processes the descriptor.
     var spins: u32 = 0;
     while (virtio.pollUsed(tx) == null) : (spins += 1) {
         if (spins > 10_000_000) {
             klog.err("virtio-net: TX timeout\n");
+            tx.next_desc = 0;
             pmm.freePage(buf_phys);
             return false;
         }
-        cpu.spinHint();
+        if (spins % 4096 == 0) {
+            // On QEMU TCG, virtio TX is processed in a bottom-half that
+            // only runs when QEMU's main loop iterates.  Halting the vCPU
+            // (wfi/hlt) forces QEMU to exit the execution loop and process
+            // pending bottom-halves.  Brief enable/halt/disable keeps the
+            // re-entrancy window minimal.
+            cpu.enableInterrupts();
+            cpu.hltOnce();
+            cpu.disableInterrupts();
+        } else {
+            cpu.spinHint();
+        }
     }
 
     // Synchronous TX complete — recycle descriptor for next send
@@ -237,9 +288,15 @@ pub fn poll() ?[]u8 {
         // Re-post existing descriptor to the available ring (descriptor
         // already points to the correct buffer from initial setup)
         virtio.recycleDesc(rx, idx);
+        // Re-arm descriptors before notifying the device (aarch64 workaround)
+        rearmRxDescs();
         virtio.notify(rx);
         net_dev.pending_recycle = 0xFF;
     }
+
+    // Re-arm RX descriptors before checking the used ring (aarch64 workaround).
+    // This ensures the device sees valid len/flags in case they were corrupted.
+    rearmRxDescs();
 
     const used = virtio.pollUsed(rx) orelse return null;
 

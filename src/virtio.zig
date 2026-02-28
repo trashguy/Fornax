@@ -182,12 +182,15 @@ pub fn finishInit(dev: *VirtioDevice, wanted_features: u32) void {
     dev.negotiated_features = dev.device_features & wanted_features;
     write32(dev.io_base, REG_GUEST_FEATURES, dev.negotiated_features);
 
-    // Mark driver OK
-    write8(dev.io_base, REG_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK);
-
     klog.debug("virtio: negotiated features = ");
     klog.debugHex(dev.negotiated_features);
-    klog.debug(", status = DRIVER_OK\n");
+    klog.debug("\n");
+}
+
+/// Set DRIVER_OK status. Call this AFTER setting up all virtqueues.
+pub fn setDriverOk(dev: *VirtioDevice) void {
+    write8(dev.io_base, REG_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK);
+    klog.debug("virtio: status = DRIVER_OK\n");
 }
 
 /// Set up a virtqueue.
@@ -210,6 +213,12 @@ pub fn setupQueue(dev: *VirtioDevice, queue_index: u16) ?Virtqueue {
     klog.debugDec(queue_size);
     klog.debug("\n");
 
+    klog.debug("virtio: q");
+    klog.debugDec(queue_index);
+    klog.debug(" io=");
+    klog.debugHex(dev.io_base);
+    klog.debug("\n");
+
     // Calculate memory layout sizes
     // Descriptor table: 16 bytes per entry
     const desc_size: usize = @as(usize, queue_size) * @sizeOf(VirtqDesc);
@@ -228,6 +237,14 @@ pub fn setupQueue(dev: *VirtioDevice, queue_index: u16) ?Virtqueue {
 
     const phys_addr: u64 = first_page;
 
+    klog.debug("virtio: q");
+    klog.debugDec(queue_index);
+    klog.debug(" phys=");
+    klog.debugHex(@as(u32, @truncate(phys_addr)));
+    klog.debug(" pages=");
+    klog.debugDec(total_pages);
+    klog.debug("\n");
+
     // Use higher-half pointers for CPU access — immune to identity-map modifications
     // by user ELF mappings (huge page splits in per-process page tables).
     const base: u64 = first_page + @import("mem.zig").KERNEL_VIRT_BASE;
@@ -235,6 +252,16 @@ pub fn setupQueue(dev: *VirtioDevice, queue_index: u16) ?Virtqueue {
     // Zero all queue memory
     const ptr: [*]u8 = @ptrFromInt(base);
     @memset(ptr[0 .. total_pages * 4096], 0);
+
+    // On aarch64, the @memset may use SIMD stores that go through a different
+    // softmmu path in QEMU TCG than the scalar stores used in addBuffer().
+    // Flush the TLB so subsequent scalar stores get fresh translations.
+    if (@import("builtin").cpu.arch == .aarch64) {
+        asm volatile ("dsb sy" ::: .{ .memory = true });
+        asm volatile ("tlbi vmalle1" ::: .{ .memory = true });
+        asm volatile ("dsb sy" ::: .{ .memory = true });
+        asm volatile ("isb" ::: .{ .memory = true });
+    }
 
     // Set up pointers (all higher-half)
     const desc_ptr: [*]VirtqDesc = @ptrFromInt(base);
@@ -245,7 +272,20 @@ pub fn setupQueue(dev: *VirtioDevice, queue_index: u16) ?Virtqueue {
     const used_ring_ptr: [*]VirtqUsedElem = @ptrFromInt(used_virt + 4);
 
     // Tell device the queue address (in units of 4096 bytes)
-    write32(dev.io_base, REG_QUEUE_ADDRESS, @intCast(phys_addr / 4096));
+    const pfn: u32 = @intCast(phys_addr / 4096);
+    write32(dev.io_base, REG_QUEUE_ADDRESS, pfn);
+
+    // Verify PFN was accepted — read it back (legacy virtio PCI allows this)
+    const readback = read32(dev.io_base, REG_QUEUE_ADDRESS);
+    if (readback != pfn) {
+        klog.err("virtio: queue ");
+        klog.errDec(queue_index);
+        klog.err(" PFN mismatch: wrote ");
+        klog.errHex(pfn);
+        klog.err(" read ");
+        klog.errHex(readback);
+        klog.err("\n");
+    }
 
     return Virtqueue{
         .size = queue_size,
@@ -267,21 +307,34 @@ pub fn addBuffer(vq: *Virtqueue, phys_addr: u64, len: u32, device_writable: bool
     const idx = vq.next_desc;
     if (idx >= vq.size) return null;
 
-    vq.desc[idx] = .{
-        .addr = phys_addr,
-        .len = len,
-        .flags = if (device_writable) VRING_DESC_F_WRITE else 0,
-        .next = 0,
-    };
+    // Write descriptor fields via volatile to prevent reordering/elision.
+    const desc: *volatile VirtqDesc = @ptrCast(&vq.desc[idx]);
+    desc.addr = phys_addr;
+    desc.len = len;
+    desc.flags = if (device_writable) VRING_DESC_F_WRITE else 0;
+    desc.next = 0;
+
+    // AArch64: clean the descriptor cache line to PoC so QEMU TCG's DMA
+    // sees the writes even after a TTBR0 switch flushes the softmmu TLB.
+    if (comptime @import("builtin").cpu.arch == .aarch64) {
+        asm volatile ("dc cvac, %[addr]" : : [addr] "r" (@intFromPtr(desc)));
+        asm volatile ("dsb sy" ::: .{ .memory = true });
+    }
 
     // Add to available ring
-    const avail_idx = vq.avail.idx;
-    vq.avail_ring[avail_idx % vq.size] = idx;
+    const avail_idx = @as(*volatile u16, @ptrCast(&vq.avail.idx)).*;
+    @as(*volatile u16, @ptrFromInt(@intFromPtr(&vq.avail_ring[avail_idx % vq.size]))).* = idx;
 
-    // Memory barrier — ensure descriptor is written before updating index
     memoryBarrier();
 
-    vq.avail.idx = avail_idx +% 1;
+    @as(*volatile u16, @ptrCast(&vq.avail.idx)).* = avail_idx +% 1;
+
+    // Clean avail ring writes to PoC (aarch64 DMA coherency)
+    if (comptime @import("builtin").cpu.arch == .aarch64) {
+        asm volatile ("dc cvac, %[addr]" : : [addr] "r" (@intFromPtr(&vq.avail.idx)));
+        asm volatile ("dsb sy" ::: .{ .memory = true });
+    }
+
     vq.next_desc = idx + 1;
 
     return idx;
@@ -304,33 +357,46 @@ pub fn addBufferChain3(
     const head = vq.next_desc;
     if (head + 2 >= vq.size) return null;
 
-    // Descriptor 0 -> 1 -> 2
-    vq.desc[head] = .{
-        .addr = addr0,
-        .len = len0,
-        .flags = (if (writable0) VRING_DESC_F_WRITE else 0) | VRING_DESC_F_NEXT,
-        .next = head + 1,
-    };
-    vq.desc[head + 1] = .{
-        .addr = addr1,
-        .len = len1,
-        .flags = (if (writable1) VRING_DESC_F_WRITE else 0) | VRING_DESC_F_NEXT,
-        .next = head + 2,
-    };
-    vq.desc[head + 2] = .{
-        .addr = addr2,
-        .len = len2,
-        .flags = if (writable2) VRING_DESC_F_WRITE else 0,
-        .next = 0,
-    };
+    const d0: *volatile VirtqDesc = @ptrCast(&vq.desc[head]);
+    d0.addr = addr0;
+    d0.len = len0;
+    d0.flags = (if (writable0) VRING_DESC_F_WRITE else 0) | VRING_DESC_F_NEXT;
+    d0.next = head + 1;
+
+    const d1: *volatile VirtqDesc = @ptrCast(&vq.desc[head + 1]);
+    d1.addr = addr1;
+    d1.len = len1;
+    d1.flags = (if (writable1) VRING_DESC_F_WRITE else 0) | VRING_DESC_F_NEXT;
+    d1.next = head + 2;
+
+    const d2: *volatile VirtqDesc = @ptrCast(&vq.desc[head + 2]);
+    d2.addr = addr2;
+    d2.len = len2;
+    d2.flags = if (writable2) VRING_DESC_F_WRITE else 0;
+    d2.next = 0;
+
+    // AArch64: clean descriptor cache lines to PoC (see docs/aarch64-gotchas.md §2)
+    if (comptime @import("builtin").cpu.arch == .aarch64) {
+        asm volatile ("dc cvac, %[addr]" : : [addr] "r" (@intFromPtr(d0)));
+        asm volatile ("dc cvac, %[addr]" : : [addr] "r" (@intFromPtr(d1)));
+        asm volatile ("dc cvac, %[addr]" : : [addr] "r" (@intFromPtr(d2)));
+        asm volatile ("dsb sy" ::: .{ .memory = true });
+    }
 
     // Add head to available ring
-    const avail_idx = vq.avail.idx;
-    vq.avail_ring[avail_idx % vq.size] = head;
+    const avail_idx = @as(*volatile u16, @ptrCast(&vq.avail.idx)).*;
+    @as(*volatile u16, @ptrFromInt(@intFromPtr(&vq.avail_ring[avail_idx % vq.size]))).* = head;
 
     memoryBarrier();
 
-    vq.avail.idx = avail_idx +% 1;
+    @as(*volatile u16, @ptrCast(&vq.avail.idx)).* = avail_idx +% 1;
+
+    // Clean avail ring writes to PoC (aarch64 DMA coherency)
+    if (comptime @import("builtin").cpu.arch == .aarch64) {
+        asm volatile ("dc cvac, %[addr]" : : [addr] "r" (@intFromPtr(&vq.avail.idx)));
+        asm volatile ("dsb sy" ::: .{ .memory = true });
+    }
+
     vq.next_desc = head + 3;
 
     return head;
@@ -338,6 +404,8 @@ pub fn addBufferChain3(
 
 /// Notify the device that there are new available buffers.
 pub fn notify(vq: *Virtqueue) void {
+    // Ensure all descriptor/avail ring writes are visible before notifying device
+    memoryBarrier();
     write16(vq.io_base, REG_QUEUE_NOTIFY, vq.queue_index);
 }
 
@@ -350,7 +418,8 @@ pub fn pollUsed(vq: *Virtqueue) ?VirtqUsedElem {
     const used_idx = @as(*volatile u16, @ptrCast(&vq.used.idx)).*;
     if (vq.last_used_idx == used_idx) return null;
 
-    const elem = vq.used_ring[vq.last_used_idx % vq.size];
+    const elem_ptr: *volatile VirtqUsedElem = @ptrCast(&vq.used_ring[vq.last_used_idx % vq.size]);
+    const elem = elem_ptr.*;
     vq.last_used_idx +%= 1;
     return elem;
 }
@@ -358,10 +427,17 @@ pub fn pollUsed(vq: *Virtqueue) ?VirtqUsedElem {
 /// Re-post an existing descriptor to the available ring without allocating a new
 /// descriptor slot. Used for recycling RX buffers that have already been set up.
 pub fn recycleDesc(vq: *Virtqueue, desc_idx: u16) void {
-    const avail_idx = vq.avail.idx;
-    vq.avail_ring[avail_idx % vq.size] = desc_idx;
+    const avail_idx = @as(*volatile u16, @ptrCast(&vq.avail.idx)).*;
+    const ring_slot: *volatile u16 = @ptrCast(&vq.avail_ring[avail_idx % vq.size]);
+    ring_slot.* = desc_idx;
     memoryBarrier();
-    vq.avail.idx = avail_idx +% 1;
+    @as(*volatile u16, @ptrCast(&vq.avail.idx)).* = avail_idx +% 1;
+
+    // Clean avail ring writes to PoC (aarch64 DMA coherency)
+    if (comptime @import("builtin").cpu.arch == .aarch64) {
+        asm volatile ("dc cvac, %[addr]" : : [addr] "r" (@intFromPtr(&vq.avail.idx)));
+        asm volatile ("dsb sy" ::: .{ .memory = true });
+    }
 }
 
 /// Read the ISR status register (clears interrupt).
@@ -369,10 +445,23 @@ pub fn readIsr(dev: *VirtioDevice) u8 {
     return read8(dev.io_base, REG_ISR_STATUS);
 }
 
+/// Force an I/O access to the device.  In emulators (QEMU TCG), MMIO/PIO
+/// accesses exit the translation block, giving the event loop a chance to
+/// run pending bottom-halves (e.g. virtio-net TX completion).  Call this
+/// periodically in spin-wait loops that poll for used descriptors.
+pub fn ioKick(vq: *Virtqueue) void {
+    _ = read8(vq.io_base, REG_ISR_STATUS);
+}
+
 pub fn memoryBarrier() void {
     switch (@import("builtin").cpu.arch) {
         .x86_64 => asm volatile ("mfence" ::: .{ .memory = true }),
-        .aarch64 => asm volatile ("dmb sy" ::: .{ .memory = true }),
+        // dsb sy — Data Synchronization Barrier: ensures all memory writes
+        // (including DMA-visible stores to descriptor/avail rings) complete
+        // before subsequent MMIO writes (e.g. queue notify) reach the device.
+        // Linux virtio uses dsb sy here; dmb sy only orders accesses as seen
+        // by the CPU and is insufficient for device-visible ordering.
+        .aarch64 => asm volatile ("dsb sy" ::: .{ .memory = true }),
         .riscv64 => asm volatile ("fence rw, rw" ::: .{ .memory = true }),
         else => {},
     }

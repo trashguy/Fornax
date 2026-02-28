@@ -122,21 +122,31 @@ fn handleIrq() bool {
                 keyboard.handleEvdevKey(event.code, event.value);
             }
 
-            // Repost this buffer
+            // Repost this buffer — use volatile writes + cache clean
+            // to ensure device sees updates (see docs/aarch64-gotchas.md §2,§4).
             event.* = .{ .type = 0, .code = 0, .value = 0 };
             const phys_addr: u64 = @intFromPtr(event);
-            vq.desc[desc_idx] = .{
-                .addr = phys_addr,
-                .len = @sizeOf(VirtioInputEvent),
-                .flags = virtio.VRING_DESC_F_WRITE,
-                .next = 0,
-            };
+            const desc: *volatile virtio.VirtqDesc = @ptrCast(&vq.desc[desc_idx]);
+            desc.addr = phys_addr;
+            desc.len = @sizeOf(VirtioInputEvent);
+            desc.flags = virtio.VRING_DESC_F_WRITE;
+            desc.next = 0;
+
+            if (comptime @import("builtin").cpu.arch == .aarch64) {
+                asm volatile ("dc cvac, %[addr]" : : [addr] "r" (@intFromPtr(desc)));
+                asm volatile ("dsb sy" ::: .{ .memory = true });
+            }
 
             // Add to available ring
-            const avail_idx = vq.avail.idx;
-            vq.avail_ring[avail_idx % vq.size] = desc_idx;
+            const avail_idx = @as(*volatile u16, @ptrCast(&vq.avail.idx)).*;
+            @as(*volatile u16, @ptrFromInt(@intFromPtr(&vq.avail_ring[avail_idx % vq.size]))).* = desc_idx;
             virtio.memoryBarrier();
-            vq.avail.idx = avail_idx +% 1;
+            @as(*volatile u16, @ptrCast(&vq.avail.idx)).* = avail_idx +% 1;
+
+            if (comptime @import("builtin").cpu.arch == .aarch64) {
+                asm volatile ("dc cvac, %[addr]" : : [addr] "r" (@intFromPtr(&vq.avail.idx)));
+                asm volatile ("dsb sy" ::: .{ .memory = true });
+            }
         }
 
         vq.last_used_idx +%= 1;

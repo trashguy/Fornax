@@ -112,5 +112,5 @@ exec qemu-system-aarch64 \
     -drive file="$DISK_IMG",format=raw,if=none,id=disk0 \
     -device virtio-blk-pci,drive=disk0 \
     -netdev user,id=net0 \
-    -device virtio-net-pci,netdev=net0 \
+    -device virtio-net-pci,disable-legacy=off,disable-modern=on,netdev=net0 \
     "$@"

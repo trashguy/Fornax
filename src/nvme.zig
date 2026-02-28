@@ -213,9 +213,19 @@ fn cqDoorbellAddr(qid: u16) u64 {
 fn submitCommand(qp: *QueuePair, cmd: *const SubmissionEntry) void {
     const sq_ptr: [*]u8 = paging.physPtr(qp.sq_phys);
     const offset = @as(usize, qp.sq_tail) * @sizeOf(SubmissionEntry);
-    const dest: *SubmissionEntry = @ptrCast(@alignCast(sq_ptr + offset));
+    const dest: *volatile SubmissionEntry = @ptrCast(@alignCast(sq_ptr + offset));
     dest.* = cmd.*;
     qp.sq_tail = (qp.sq_tail + 1) % qp.size;
+
+    // Barrier: ensure SQ entry writes are visible before doorbell
+    // (see docs/aarch64-gotchas.md §3)
+    if (comptime builtin.cpu.arch == .aarch64) {
+        asm volatile ("dc cvac, %[addr]" : : [addr] "r" (@intFromPtr(dest)));
+        asm volatile ("dsb sy" ::: .{ .memory = true });
+    } else if (comptime builtin.cpu.arch == .riscv64) {
+        asm volatile ("fence rw, rw" ::: .{ .memory = true });
+    }
+
     // Ring doorbell
     mmioWrite32(qp.sq_doorbell, qp.sq_tail);
 }

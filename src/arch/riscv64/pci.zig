@@ -121,9 +121,54 @@ pub fn enableBusMastering(dev: *const PciDevice) void {
 var devices: [MAX_DEVICES]PciDevice = undefined;
 var device_count: u8 = 0;
 
+/// Next available I/O port address for BAR assignment.
+/// On RISC-V/AArch64, no firmware configures PCI BARs, so we do it ourselves.
+var next_io_port: u32 = 0;
+
+/// Probe the size of an I/O BAR by writing all-ones and reading back the mask.
+/// Must be called while I/O Space is disabled in the PCI command register.
+fn probeBarSize(bus: u8, slot: u8, func: u8, bar_offset: u8) u32 {
+    const saved = configRead(bus, slot, func, bar_offset);
+    configWrite(bus, slot, func, bar_offset, 0xFFFFFFFF);
+    const mask = configRead(bus, slot, func, bar_offset);
+    configWrite(bus, slot, func, bar_offset, saved);
+    // I/O BAR: mask out type bit, invert, add 1 → size
+    const size_mask = mask & 0xFFFC;
+    if (size_mask == 0) return 0;
+    return (~size_mask + 1) & 0xFFFF;
+}
+
+/// Assign I/O port addresses to unconfigured I/O BARs.
+/// On x86, the BIOS handles this. On RISC-V, we must do it ourselves.
+/// Probes actual BAR sizes to avoid overlapping assignments.
+fn assignBars(bus: u8, slot: u8, func: u8) void {
+    // Disable I/O space during BAR probing to prevent spurious accesses
+    const cmd = configRead16(bus, slot, func, 0x04);
+    configWrite(bus, slot, func, 0x04, @as(u32, cmd) & ~@as(u32, 0x01));
+
+    for (0..6) |i| {
+        const bar_offset: u8 = @intCast(0x10 + i * 4);
+        const bar_val = configRead(bus, slot, func, bar_offset);
+        // Only handle I/O BARs (bit 0 = 1) that are unconfigured (address = 0)
+        if (bar_val & 1 != 1) continue;
+        if (bar_val & 0xFFFC != 0) continue; // already configured
+        // Probe the actual BAR size
+        var bar_size = probeBarSize(bus, slot, func, bar_offset);
+        if (bar_size == 0) bar_size = 0x100; // fallback: 256 bytes
+        // Align next_io_port to the BAR's natural alignment (size)
+        next_io_port = (next_io_port + bar_size - 1) & ~(bar_size - 1);
+        configWrite(bus, slot, func, bar_offset, next_io_port | 1);
+        next_io_port += bar_size;
+    }
+
+    // Restore command register
+    configWrite(bus, slot, func, 0x04, @as(u32, cmd));
+}
+
 /// Enumerate PCI bus 0 and discover all devices.
 pub fn enumerate() void {
     device_count = 0;
+    next_io_port = 0;
     klog.debug("PCI ECAM: scanning bus 0...\n");
 
     for (0..32) |slot_usize| {
@@ -138,6 +183,11 @@ pub fn enumerate() void {
         const class_rev = configRead(0, slot, 0, 0x08);
         const header_type = configRead8(0, slot, 0, 0x0E);
         const interrupt = configRead(0, slot, 0, 0x3C);
+
+        // Assign I/O BAR addresses before reading them (RISC-V has no BIOS to do this)
+        if ((header_type & 0x7F) == 0) {
+            assignBars(0, slot, 0);
+        }
 
         var dev = &devices[device_count];
         dev.bus = 0;
@@ -178,6 +228,8 @@ pub fn enumerate() void {
         } else if (dev.isVirtio()) {
             klog.debug(" (virtio)");
         }
+        klog.debug(" BAR0=");
+        klog.debugHex(dev.bar[0]);
         klog.debug("\n");
 
         device_count += 1;
