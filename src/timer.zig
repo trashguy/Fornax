@@ -65,22 +65,50 @@ pub fn getTicks() u32 {
     return ticks;
 }
 
-fn handleIrq() bool {
-    ticks +%= 1;
-    @import("trace.zig").trace(.timer_tick, @truncate(ticks));
+pub fn getMillis() u64 {
+    switch (builtin.cpu.arch) {
+        .riscv64 => {
+            const cpu = @import("arch/riscv64/cpu.zig");
+            return cpu.rdtime() / 10_000; // 10 MHz timebase
+        },
+        .aarch64 => {
+            const cpu = @import("arch/aarch64/cpu.zig");
+            const cnt = cpu.readCntvct();
+            const freq = cpu.readCntfrq();
+            if (freq == 0) return ticks * 1000 / TICKS_PER_SEC;
+            return cnt * 1000 / freq;
+        },
+        else => {
+            // x86_64: fallback to tick counter (~55ms granularity)
+            return @as(u64, ticks) * 1000 / TICKS_PER_SEC;
+        },
+    }
+}
 
-    // Re-arm timer on riscv64
+fn handleIrq() bool {
+    const percpu = @import("percpu.zig");
+
+    // Re-arm timer on riscv64 (per-core — each core's timer is private)
     if (builtin.cpu.arch == .riscv64) {
         const cpu = @import("arch/riscv64/cpu.zig");
         const now = cpu.rdtime();
         cpu.sbiSetTimer(now + CLINT_INTERVAL);
     }
 
-    // Re-arm timer on aarch64
+    // Re-arm timer on aarch64 (per-core — PPI is private to each core)
     if (builtin.cpu.arch == .aarch64) {
         const cpu = @import("arch/aarch64/cpu.zig");
         cpu.writeCntpTval(arm_timer_interval);
     }
+
+    // Only BSP manages the global tick counter, sleep wakeups, and
+    // supervisor checks.  On SMP, each core's timer PPI fires
+    // independently — without this guard, ticks advances N× too fast
+    // and sleep durations are wrong.
+    if (percpu.getCoreId() != 0) return true;
+
+    ticks +%= 1;
+    @import("trace.zig").trace(.timer_tick, @truncate(ticks));
 
     // Wake processes whose sleep timer has expired
     const process = @import("process.zig");

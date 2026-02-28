@@ -52,6 +52,14 @@ pub fn enableInterrupts() void {
     asm volatile ("csrsi sstatus, 0x2"); // set SSTATUS.SIE (bit 1)
 }
 
+/// Return true if supervisor interrupts are enabled (SSTATUS.SIE == 1).
+pub fn interruptsEnabled() bool {
+    const sstatus = asm volatile ("csrr %[ret], sstatus"
+        : [ret] "=r" (-> u64),
+    );
+    return (sstatus & 0x2) != 0; // bit 1 = SIE
+}
+
 // ── CSR operations ───────────────────────────────────────────────────
 pub inline fn csrRead(comptime csr: u12) u64 {
     return asm volatile ("csrr %[ret], " ++ csrName(csr)

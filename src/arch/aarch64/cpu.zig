@@ -20,6 +20,14 @@ pub fn enableInterrupts() void {
     asm volatile ("msr daifclr, #0xF");
 }
 
+/// Return true if IRQs are unmasked (DAIF.I == 0).
+pub fn interruptsEnabled() bool {
+    const daif = asm volatile ("mrs %[ret], daif"
+        : [ret] "=r" (-> u64),
+    );
+    return (daif & (1 << 7)) == 0; // bit 7 = IRQ mask
+}
+
 pub inline fn spinHint() void {
     asm volatile ("yield");
 }

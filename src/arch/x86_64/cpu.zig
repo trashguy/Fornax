@@ -13,6 +13,15 @@ pub fn enableInterrupts() void {
     asm volatile ("sti");
 }
 
+/// Return true if interrupts are enabled (RFLAGS.IF == 1).
+pub fn interruptsEnabled() bool {
+    var flags: u64 = undefined;
+    asm volatile ("pushfq; pop %[flags]"
+        : [flags] "=r" (flags),
+    );
+    return (flags & (1 << 9)) != 0; // bit 9 = IF
+}
+
 pub fn outb(port: u16, val: u8) void {
     asm volatile ("outb %[val], %[port]"
         :
