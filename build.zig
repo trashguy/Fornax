@@ -1805,6 +1805,11 @@ const touch_bin = b.addExecutable(.{
         .{ "partfs", "srv/partfs/main.zig" },
         .{ "ktrace", "cmd/ktrace/main.zig" },
         .{ "smp-test", "cmd/smp-test/main.zig" },
+        .{ "netd", "srv/netd/main.zig" },
+        .{ "crond", "srv/crond/main.zig" },
+        .{ "crontab", "cmd/crontab/main.zig" },
+        .{ "date", "cmd/date/main.zig" },
+        .{ "uptime", "cmd/uptime/main.zig" },
     };
 
     var aa64_initrd_bins: [3]*std.Build.Step.Compile = undefined;
@@ -2058,6 +2063,11 @@ const touch_bin = b.addExecutable(.{
         .{ "partfs", "srv/partfs/main.zig" },
         .{ "ktrace", "cmd/ktrace/main.zig" },
         .{ "smp-test", "cmd/smp-test/main.zig" },
+        .{ "netd", "srv/netd/main.zig" },
+        .{ "crond", "srv/crond/main.zig" },
+        .{ "crontab", "cmd/crontab/main.zig" },
+        .{ "date", "cmd/date/main.zig" },
+        .{ "uptime", "cmd/uptime/main.zig" },
     };
 
     // Build riscv64 initrd programs (init, partfs, fxfs)
@@ -2261,6 +2271,7 @@ const touch_bin = b.addExecutable(.{
     const mod_sha256 = b.createModule(.{ .root_source_file = b.path("lib/sha256.zig"), .target = host, .optimize = test_opt });
     const mod_json = b.createModule(.{ .root_source_file = b.path("lib/json.zig"), .target = host, .optimize = test_opt });
     const mod_time = b.createModule(.{ .root_source_file = b.path("lib/time.zig"), .target = host, .optimize = test_opt });
+    const mod_ipc = b.createModule(.{ .root_source_file = b.path("lib/ipc.zig"), .target = host, .optimize = test_opt });
     const mod_ethernet = b.createModule(.{ .root_source_file = b.path("lib/net/ethernet.zig"), .target = host, .optimize = test_opt });
     const mod_ipv4 = b.createModule(.{ .root_source_file = b.path("lib/net/ipv4.zig"), .target = host, .optimize = test_opt });
     // arp/tcp/dns/icmp use relative @import("ethernet.zig") and @import("ipv4.zig")
@@ -2319,6 +2330,7 @@ const touch_bin = b.addExecutable(.{
                 .{ .name = "dns", .module = mod_dns },
                 .{ .name = "icmp", .module = mod_icmp },
                 .{ .name = "time", .module = mod_time },
+                .{ .name = "ipc", .module = mod_ipc },
             },
         }),
     });

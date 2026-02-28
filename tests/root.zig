@@ -14,4 +14,5 @@ comptime {
     _ = @import("dns_test.zig");
     _ = @import("icmp_test.zig");
     _ = @import("time_test.zig");
+    _ = @import("ipc_test.zig");
 }

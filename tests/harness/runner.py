@@ -466,7 +466,7 @@ def main():
                         aa64_tests,
                         tmpdir,
                         pre_disk_hook=make_stage_linux_elf("aarch64"),
-                        smp=1, memory="4G",
+                        smp=smp, memory="4G",  # single-threaded TCG for SMP
                         arch="aarch64",
                     )
                     total_passed += p
@@ -488,7 +488,7 @@ def main():
                         rv64_tests,
                         tmpdir,
                         pre_disk_hook=make_stage_linux_elf("riscv64"),
-                        smp=1, memory="4G",
+                        smp=min(smp, 1), memory="4G",  # RISC-V SMP untested with QEMU TCG
                         arch="riscv64",
                     )
                     total_passed += p

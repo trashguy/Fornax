@@ -41,6 +41,7 @@ class QemuDriver:
                 "qemu-system-aarch64",
                 "-machine", "virt",
                 "-cpu", "cortex-a72",
+                "-smp", str(self.smp),
                 "-drive", f"if=pflash,format=raw,readonly=on,file={self.ovmf}",
                 "-drive", f"format=raw,file=fat:rw:{self.esp_dir}",
                 "-device", "ramfb",
@@ -49,7 +50,7 @@ class QemuDriver:
                 "-display", "none",
                 "-no-reboot",
                 "-no-shutdown",
-                "-device", "virtio-net-pci,netdev=net0",
+                "-device", "virtio-net-pci,disable-legacy=off,disable-modern=on,netdev=net0",
                 "-netdev", "user,id=net0",
                 "-drive", f"file={self.disk_img},format=raw,if=none,id=blk0,cache=writeback",
                 "-device", "virtio-blk-pci,drive=blk0",
@@ -59,6 +60,7 @@ class QemuDriver:
                 "qemu-system-riscv64",
                 "-machine", "virt",
                 "-cpu", "rv64",
+                "-smp", str(self.smp),
                 "-m", self.memory,
                 "-bios", "default",
                 "-kernel", self.kernel,
@@ -98,7 +100,7 @@ class QemuDriver:
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=open("/tmp/qemu-aarch64-stderr.log", "w") if self.arch == "aarch64" else subprocess.DEVNULL,
         )
         # Set stdout to non-blocking
         fd = self.proc.stdout.fileno()

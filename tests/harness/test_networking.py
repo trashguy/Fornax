@@ -19,6 +19,11 @@ def test_host_networking(qemu):
         qemu.send_line("cat /net/arp; echo __ARP__")
         qemu.expect(r"__ARP__", timeout=10)
 
+        # 4. Ping gateway — verify ICMP echo works
+        qemu.send_line("ping -c 2 10.0.2.2; echo __PING__")
+        qemu.expect(r"2 packets transmitted, 2 received", timeout=15)
+        qemu.expect(r"__PING__", timeout=5)
+
         log_pass("test_host_networking")
         return True
     except (TimeoutError, RuntimeError) as e:
