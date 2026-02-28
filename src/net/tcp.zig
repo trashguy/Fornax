@@ -522,6 +522,7 @@ pub fn handlePacket(payload: []const u8, ip_hdr: ipv4.Header) void {
 
     // No matching connection — send RST if it's not already a RST
     if (flags & RST == 0) {
+        klog.err("tcp: RST for unmatched segment\n");
         sendRstReply(ip_hdr.src, src_port, dst_port, seq_num, ack_num, flags, @intCast(data.len));
     }
 }

@@ -93,7 +93,7 @@ var mac_table: [MAX_MAC]MacEntry linksection(".bss") = undefined;
 var handles: [MAX_HANDLES]Handle linksection(".bss") = undefined;
 
 var host_ip: u32 = 0x0F02000A; // 10.0.2.15 in network byte order
-var host_mac: [6]u8 = .{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 }; // QEMU default
+var host_mac: [6]u8 = .{ 0, 0, 0, 0, 0, 0 };
 var subnet_mask: u32 = 0x00FFFFFF; // 255.255.255.0
 var next_nat_port: u16 = NAT_PORT_BASE;
 var bridge_lock: fx.thread.Mutex = .{};
@@ -1072,6 +1072,17 @@ fn writeDirEntry(buf: []u8, name: []const u8, file_type: u32, size: u32) usize {
 export fn _start() noreturn {
     out.puts("[bridge] starting\n");
     initState();
+
+    // Auto-detect MAC from kernel via sysinfo
+    if (fx.sysinfo()) |info| {
+        const m = info.ether_mac;
+        host_mac[0] = @truncate(m);
+        host_mac[1] = @truncate(m >> 8);
+        host_mac[2] = @truncate(m >> 16);
+        host_mac[3] = @truncate(m >> 24);
+        host_mac[4] = @truncate(m >> 32);
+        host_mac[5] = @truncate(m >> 40);
+    }
 
     // Set ether to exclusive mode — bridge owns all frames
     _ = fx.write(ETHER_FD, "exclusive");

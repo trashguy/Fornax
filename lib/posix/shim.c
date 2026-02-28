@@ -193,6 +193,7 @@ struct fx_sysinfo {
     unsigned long long free_pages;
     unsigned long long page_size;
     unsigned long long uptime_secs;
+    unsigned long long ether_mac;
 };
 
 /* Current working directory buffer */

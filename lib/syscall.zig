@@ -46,6 +46,7 @@ pub const SYS = enum(u64) {
     futex = 38,
     ipc_pair = 39,
     cntr_op = 40,
+    thread_exit = 41,
 };
 
 const ipc = @import("ipc.zig");
@@ -259,13 +260,15 @@ pub const SysInfo = extern struct {
     free_pages: u64,
     page_size: u64,
     uptime_secs: u64,
+    ether_mac: u64,
+    net_ip: u64,
 };
 
 pub fn sysinfo() ?SysInfo {
-    var buf: [4]u64 = undefined;
+    var buf: [6]u64 = undefined;
     const result = syscall1(.sysinfo, @intFromPtr(&buf));
     if (result != 0) return null;
-    return .{ .total_pages = buf[0], .free_pages = buf[1], .page_size = buf[2], .uptime_secs = buf[3] };
+    return .{ .total_pages = buf[0], .free_pages = buf[1], .page_size = buf[2], .uptime_secs = buf[3], .ether_mac = buf[4], .net_ip = buf[5] };
 }
 
 pub fn sleep(ms: u64) void {

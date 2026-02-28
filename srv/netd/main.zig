@@ -26,7 +26,7 @@ const MAX_POLL_ITERS: u32 = 3000; // ~30 seconds max block
 const NUM_WORKERS = 3; // + main thread = 4
 
 // Network config (QEMU defaults)
-var our_mac: [6]u8 = .{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
+var our_mac: [6]u8 = .{ 0, 0, 0, 0, 0, 0 };
 var our_ip: [4]u8 = .{ 10, 0, 2, 15 };
 var gateway_ip: [4]u8 = .{ 10, 0, 2, 2 };
 var subnet_mask: [4]u8 = .{ 255, 255, 255, 0 };
@@ -101,33 +101,38 @@ var packet_id_counter: u16 = 1;
 // ── Callbacks for the network stack ───────────────────────────────
 
 fn sendTcpIpPacket(dst_ip: [4]u8, tcp_segment: []const u8) void {
-    // Build IP header around TCP segment
-    var ip_buf: [1600]u8 = undefined;
-    const ip_len = net.ipv4.build(&ip_buf, our_ip, dst_ip, net.ipv4.PROTO_TCP, 64, blk: {
+    // Build IP header around TCP segment (BSS — see docs/aarch64-gotchas.md §5)
+    const ip_len = net.ipv4.build(&net_tcp_ip_buf, our_ip, dst_ip, net.ipv4.PROTO_TCP, 64, blk: {
         const id = packet_id_counter;
         packet_id_counter +%= 1;
         break :blk id;
     }, tcp_segment) orelse return;
 
-    sendIpPacket(dst_ip, ip_buf[0..ip_len]);
+    sendIpPacket(dst_ip, net_tcp_ip_buf[0..ip_len]);
 }
+
+// BSS buffers for packet building — avoids LLVM aarch64 stack-slot reuse
+// bug with multiple large `= undefined` arrays (see docs/aarch64-gotchas.md §5).
+var net_arp_buf: [64]u8 = undefined;
+var net_frame_buf: [1600]u8 = undefined;
+var net_udp_buf: [600]u8 = undefined;
+var net_dns_ip_buf: [1600]u8 = undefined;
+var net_tcp_ip_buf: [1600]u8 = undefined;
 
 fn sendIpPacket(dst_ip: [4]u8, ip_packet: []const u8) void {
     // Determine MAC: gateway or direct
     const target_ip = if (sameSubnet(dst_ip)) dst_ip else gateway_ip;
     const mac = arp_table.lookup(target_ip) orelse {
         // Send ARP request and drop this packet (caller will retry)
-        var arp_buf: [64]u8 = undefined;
-        if (net.arp.ArpTable.buildRequest(&arp_buf, our_mac, our_ip, target_ip)) |arp_len| {
-            _ = fx.write(ETHER_FD, arp_buf[0..arp_len]);
+        if (net.arp.ArpTable.buildRequest(&net_arp_buf, our_mac, our_ip, target_ip)) |arp_len| {
+            _ = fx.write(ETHER_FD, net_arp_buf[0..arp_len]);
         }
         return;
     };
 
     // Wrap in Ethernet frame
-    var frame_buf: [1600]u8 = undefined;
-    const frame_len = net.ethernet.build(&frame_buf, mac, our_mac, net.ethernet.ETHER_IPV4, ip_packet) orelse return;
-    _ = fx.write(ETHER_FD, frame_buf[0..frame_len]);
+    const frame_len = net.ethernet.build(&net_frame_buf, mac, our_mac, net.ethernet.ETHER_IPV4, ip_packet) orelse return;
+    _ = fx.write(ETHER_FD, net_frame_buf[0..frame_len]);
 }
 
 fn sendIcmpIpPacket(ctx: *anyopaque, dst_ip: [4]u8, ip_packet: []const u8) void {
@@ -138,20 +143,26 @@ fn sendIcmpIpPacket(ctx: *anyopaque, dst_ip: [4]u8, ip_packet: []const u8) void 
 fn sendDnsUdp(ctx: *anyopaque, dst_ip: [4]u8, src_port: u16, dst_port: u16, data: []const u8) void {
     _ = ctx;
     // Build UDP packet
-    var udp_buf: [600]u8 = undefined;
-    const udp_len = buildUdp(&udp_buf, src_port, dst_port, data) orelse return;
+    const udp_len = buildUdp(&net_udp_buf, src_port, dst_port, data) orelse return;
 
     // Wrap in IP
-    var ip_buf: [1600]u8 = undefined;
     const id = packet_id_counter;
     packet_id_counter +%= 1;
-    const ip_len = net.ipv4.build(&ip_buf, our_ip, dst_ip, net.ipv4.PROTO_UDP, 64, id, udp_buf[0..udp_len]) orelse return;
+    const ip_len = net.ipv4.build(&net_dns_ip_buf, our_ip, dst_ip, net.ipv4.PROTO_UDP, 64, id, net_udp_buf[0..udp_len]) orelse return;
 
-    sendIpPacket(dst_ip, ip_buf[0..ip_len]);
+    sendIpPacket(dst_ip, net_dns_ip_buf[0..ip_len]);
 }
 
 fn getOurIp() [4]u8 {
     return our_ip;
+}
+
+/// Send a gratuitous ARP to keep the gateway's ARP cache fresh.
+fn sendGratuitousArp() void {
+    var buf: [64]u8 = undefined;
+    if (net.arp.ArpTable.buildRequest(&buf, our_mac, our_ip, gateway_ip)) |len| {
+        _ = fx.write(ETHER_FD, buf[0..len]);
+    }
 }
 
 fn getTicks() u32 {
@@ -946,6 +957,10 @@ fn handleCtlWrite(conn: u8, data: []const u8) ?u16 {
     if (startsWith(trimmed, "connect ")) {
         const args = trimmed[8..];
         const parsed = parseAddr(args) orelse return 0;
+        // Send gratuitous ARP before TCP connect to ensure the gateway
+        // (QEMU SLIRP) has a fresh ARP entry for our IP. Without this,
+        // SLIRP may drop SYN-ACKs while waiting for ARP resolution.
+        sendGratuitousArp();
         if (!tcp_stack.connect(conn, parsed.ip, parsed.port)) return 0;
         // Return null to indicate blocking connect
         return null;
@@ -1027,26 +1042,29 @@ fn rxThreadEntry(_: *anyopaque) callconv(.c) void {
     rxLoop();
 }
 
-fn rxLoop() noreturn {
-    var frame_buf: [1600]u8 = undefined;
+// BSS buffers for rxLoop — avoids LLVM aarch64 stack-slot reuse bug
+// (frame_buf + icmp reply_buf are both 1600 bytes; see docs/aarch64-gotchas.md §5).
+var rx_frame_buf: [1600]u8 = undefined;
+var rx_arp_reply_buf: [64]u8 = undefined;
+var rx_icmp_reply_buf: [1600]u8 = undefined;
 
+fn rxLoop() noreturn {
     while (true) {
-        const n = fx.read(ETHER_FD, &frame_buf);
+        const n = fx.read(ETHER_FD, &rx_frame_buf);
         if (n <= 0) {
             fx.sleep(1);
             continue;
         }
 
-        const frame = frame_buf[0..@intCast(n)];
+        const frame = rx_frame_buf[0..@intCast(n)];
         const eth = net.ethernet.parse(frame) orelse continue;
 
         net_lock.lock();
 
         if (eth.header.ethertype == net.ethernet.ETHER_ARP) {
-            var reply_buf: [64]u8 = undefined;
-            if (arp_table.handlePacket(eth.payload, our_mac, our_ip, &reply_buf)) |reply_len| {
+            if (arp_table.handlePacket(eth.payload, our_mac, our_ip, &rx_arp_reply_buf)) |reply_len| {
                 net_lock.unlock();
-                _ = fx.write(ETHER_FD, reply_buf[0..reply_len]);
+                _ = fx.write(ETHER_FD, rx_arp_reply_buf[0..reply_len]);
                 continue;
             }
         } else if (eth.header.ethertype == net.ethernet.ETHER_IPV4) {
@@ -1054,13 +1072,31 @@ fn rxLoop() noreturn {
                 const ip_hdr = ip_result.header;
                 const ip_payload = ip_result.payload;
 
+                // Ignore packets not addressed to us (avoids container netd
+                // sending RSTs for the host's TCP traffic).
+                if (!net.ipv4.ipEqual(ip_hdr.dst, our_ip) and
+                    ip_hdr.dst[0] != 255) // allow broadcast
+                {
+                    net_lock.unlock();
+                    continue;
+                }
+
                 if (ip_hdr.protocol == net.ipv4.PROTO_TCP) {
+                    // Ignore TCP for bridge NAT ports (40000-49151) to avoid
+                    // sending RSTs for container traffic that the bridge NAT
+                    // rewrote to our IP.
+                    if (ip_payload.len >= 4) {
+                        const dst_port = @as(u16, ip_payload[2]) << 8 | ip_payload[3];
+                        if (dst_port >= 40000 and dst_port < 49152) {
+                            net_lock.unlock();
+                            continue;
+                        }
+                    }
                     tcp_stack.handlePacket(ip_payload, ip_hdr);
                 } else if (ip_hdr.protocol == net.ipv4.PROTO_ICMP) {
-                    var reply_buf: [1600]u8 = undefined;
-                    if (icmp_handler.handlePacket(ip_payload, ip_hdr, our_ip, &reply_buf)) |reply_len| {
+                    if (icmp_handler.handlePacket(ip_payload, ip_hdr, our_ip, &rx_icmp_reply_buf)) |reply_len| {
                         net_lock.unlock();
-                        sendIpPacket(ip_hdr.src, reply_buf[0..reply_len]);
+                        sendIpPacket(ip_hdr.src, rx_icmp_reply_buf[0..reply_len]);
                         continue;
                     }
                 } else if (ip_hdr.protocol == net.ipv4.PROTO_UDP) {
@@ -1085,6 +1121,8 @@ fn timerThreadEntry(_: *anyopaque) callconv(.c) void {
     timerLoop();
 }
 
+var arp_refresh_counter: u16 = 0;
+
 fn timerLoop() noreturn {
     while (true) {
         fx.sleep(TICK_MS);
@@ -1103,6 +1141,16 @@ fn timerLoop() noreturn {
         // ICMP timeouts
         var timeout_buf: [4]u8 = undefined;
         _ = icmp_handler.checkTimeouts(&timeout_buf);
+
+        // Periodic gratuitous ARP (~30s) to keep gateway ARP cache warm.
+        // QEMU SLIRP expires ARP entries; without refresh, TCP connections
+        // initiated after a long idle period fail because SLIRP can't
+        // immediately route the SYN-ACK back to us.
+        arp_refresh_counter += 1;
+        if (arp_refresh_counter >= 30000 / TICK_MS) {
+            arp_refresh_counter = 0;
+            sendGratuitousArp();
+        }
 
         net_lock.unlock();
     }
@@ -1142,8 +1190,25 @@ fn workerLoop() noreturn {
 export fn _start() noreturn {
     _ = fx.write(1, "netd: started\n");
 
-    // Read MAC from ether device (first read before exclusive mode)
-    // For now, use QEMU default MAC. TODO: read from ctl.
+    // Auto-detect MAC and container IP from kernel via sysinfo
+    if (fx.sysinfo()) |info| {
+        const m = info.ether_mac;
+        our_mac[0] = @truncate(m);
+        our_mac[1] = @truncate(m >> 8);
+        our_mac[2] = @truncate(m >> 16);
+        our_mac[3] = @truncate(m >> 24);
+        our_mac[4] = @truncate(m >> 32);
+        our_mac[5] = @truncate(m >> 40);
+
+        // Container netd: use assigned IP instead of host default
+        if (info.net_ip != 0) {
+            const ip: u32 = @truncate(info.net_ip);
+            our_ip[0] = @truncate(ip);
+            our_ip[1] = @truncate(ip >> 8);
+            our_ip[2] = @truncate(ip >> 16);
+            our_ip[3] = @truncate(ip >> 24);
+        }
+    }
 
     // Initialize network stack
     tcp_stack.initInPlace(&sendTcpIpPacket, &getOurIp, &getTicks);
@@ -1165,6 +1230,10 @@ export fn _start() noreturn {
         &getTimeMs,
         @ptrCast(&dummy_ctx),
     );
+
+    // Claim exclusive access so the kernel stack doesn't process (and RST)
+    // TCP segments that belong to our userspace TCP stack.
+    _ = fx.write(ETHER_FD, "exclusive\n");
 
     // Send gratuitous ARP to populate gateway's ARP cache
     var arp_buf: [64]u8 = undefined;

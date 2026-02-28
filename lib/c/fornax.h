@@ -88,6 +88,8 @@ struct fx_sysinfo {
     uint64_t free_pages;
     uint64_t page_size;
     uint64_t uptime_secs;
+    uint64_t ether_mac;
+    uint64_t net_ip;
 };
 
 /* ── Inline syscall wrappers ─────────────────────────────────────── */

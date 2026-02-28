@@ -66,11 +66,29 @@ pub fn sysSysinfo(info_ptr: u64) u64 {
     if (info_ptr >= 0x0000_8000_0000_0000) return EFAULT;
     if (info_ptr % 8 != 0) return EFAULT;
 
-    const ptr: *[4]u64 = @ptrFromInt(info_ptr);
+    const ptr: *[6]u64 = @ptrFromInt(info_ptr);
     ptr[0] = pmm.getTotalPages();
     ptr[1] = pmm.getFreePages();
     ptr[2] = 4096;
     ptr[3] = timer.getTicks() / timer.TICKS_PER_SEC;
+
+    // Pack ether MAC (6 bytes) into u64
+    const virtio_net = @import("../virtio_net.zig");
+    const mac = virtio_net.getMac();
+    ptr[4] = @as(u64, mac[0]) | (@as(u64, mac[1]) << 8) |
+        (@as(u64, mac[2]) << 16) | (@as(u64, mac[3]) << 24) |
+        (@as(u64, mac[4]) << 32) | (@as(u64, mac[5]) << 40);
+
+    // Container IP: if caller is in a container with a net_ip, return it
+    const container_mod = @import("../container.zig");
+    ptr[5] = 0;
+    if (process.getCurrent()) |proc| {
+        if (proc.container_id != container_mod.HOST_CONTAINER) {
+            if (container_mod.getById(proc.container_id)) |ct| {
+                ptr[5] = ct.net_ip;
+            }
+        }
+    }
     return 0;
 }
 
