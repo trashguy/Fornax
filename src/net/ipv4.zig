@@ -77,6 +77,10 @@ var packet_id: u16 = 0;
 /// Build an IPv4 packet into the provided buffer.
 /// Returns total IP packet length, or null if buffer too small.
 pub fn build(buf: []u8, src: [4]u8, dst: [4]u8, protocol: u8, payload: []const u8) ?usize {
+    return buildWithTtl(buf, src, dst, protocol, 64, payload);
+}
+
+pub fn buildWithTtl(buf: []u8, src: [4]u8, dst: [4]u8, protocol: u8, ttl: u8, payload: []const u8) ?usize {
     const total_len = HEADER_SIZE + payload.len;
     if (total_len > buf.len or total_len > 65535) return null;
 
@@ -88,7 +92,7 @@ pub fn build(buf: []u8, src: [4]u8, dst: [4]u8, protocol: u8, payload: []const u
     writeBe16(buf, 2, total);
     writeBe16(buf, 4, packet_id);
     writeBe16(buf, 6, 0x4000); // Don't Fragment
-    buf[8] = 64; // TTL
+    buf[8] = ttl;
     buf[9] = protocol;
     writeBe16(buf, 10, 0); // checksum placeholder
     @memcpy(buf[12..16], &src);

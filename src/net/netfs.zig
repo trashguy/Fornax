@@ -370,6 +370,26 @@ fn handleIcmpCtlWrite(conn: u8, data: []const u8) ?u16 {
         return @intCast(data.len);
     }
 
+    if (startsWith(trimmed, "size ")) {
+        const val = parseDec(trimmed[5..]) orelse {
+            klog.debug("netfs: bad icmp size value\n");
+            return 0;
+        };
+        const size: u16 = if (val > 1472) 1472 else @intCast(val);
+        icmp.setPayloadSize(conn, size);
+        return @intCast(data.len);
+    }
+
+    if (startsWith(trimmed, "ttl ")) {
+        const val = parseDec(trimmed[4..]) orelse {
+            klog.debug("netfs: bad icmp ttl value\n");
+            return 0;
+        };
+        const ttl_val: u8 = if (val > 255) 255 else if (val == 0) 1 else @intCast(val);
+        icmp.setTtl(conn, ttl_val);
+        return @intCast(data.len);
+    }
+
     klog.debug("netfs: unknown icmp ctl command\n");
     return 0;
 }

@@ -36,6 +36,10 @@ const IcmpConn = struct {
     reply_seq: u16,
     waiter_pid: u16,
     send_tick: u32,
+    send_millis: u64,
+    reply_rtt_ms: u32,
+    payload_size: u16,
+    ttl: u8,
 };
 
 const empty_conn = IcmpConn{
@@ -50,6 +54,10 @@ const empty_conn = IcmpConn{
     .reply_seq = 0,
     .waiter_pid = 0,
     .send_tick = 0,
+    .send_millis = 0,
+    .reply_rtt_ms = 0,
+    .payload_size = 56,
+    .ttl = 64,
 };
 
 var connections: [MAX_CONNECTIONS]IcmpConn = .{empty_conn} ** MAX_CONNECTIONS;
@@ -73,14 +81,27 @@ pub fn setDst(idx: u8, ip: [4]u8) void {
     connections[idx].dst_ip = ip;
 }
 
+pub fn setPayloadSize(idx: u8, size: u16) void {
+    if (idx >= MAX_CONNECTIONS) return;
+    connections[idx].payload_size = if (size > 1472) 1472 else size;
+}
+
+pub fn setTtl(idx: u8, ttl_val: u8) void {
+    if (idx >= MAX_CONNECTIONS) return;
+    connections[idx].ttl = if (ttl_val == 0) 1 else ttl_val;
+}
+
 /// Build and send an ICMP echo request. Returns true on success.
 pub fn sendEchoRequest(idx: u8, our_ip: [4]u8) bool {
     if (idx >= MAX_CONNECTIONS) return false;
     const c = &connections[idx];
     if (!c.in_use) return false;
 
+    const pkt_len: usize = HEADER_SIZE + c.payload_size;
+
     // Build ICMP echo request: type=8, code=0, checksum, id, seq
-    var icmp_buf: [64]u8 = undefined;
+    var icmp_buf: [1480]u8 = undefined;
+    if (pkt_len > icmp_buf.len) return false;
     icmp_buf[0] = TYPE_ECHO_REQUEST;
     icmp_buf[1] = 0; // code
     icmp_buf[2] = 0; // checksum placeholder
@@ -92,12 +113,10 @@ pub fn sendEchoRequest(idx: u8, our_ip: [4]u8) bool {
     icmp_buf[6] = @truncate(c.next_seq >> 8);
     icmp_buf[7] = @truncate(c.next_seq);
 
-    // 56 bytes of payload data (standard ping size)
-    for (icmp_buf[HEADER_SIZE..]) |*b| {
+    // Fill payload data
+    for (icmp_buf[HEADER_SIZE..pkt_len]) |*b| {
         b.* = 0x42;
     }
-
-    const pkt_len: usize = 64;
 
     // Compute ICMP checksum
     const cksum = ipv4.computeChecksum(icmp_buf[0..pkt_len]);
@@ -106,7 +125,7 @@ pub fn sendEchoRequest(idx: u8, our_ip: [4]u8) bool {
 
     // Wrap in IP packet
     var ip_buf: [1600]u8 = undefined;
-    const ip_len = ipv4.build(&ip_buf, our_ip, c.dst_ip, ipv4.PROTO_ICMP, icmp_buf[0..pkt_len]) orelse return false;
+    const ip_len = ipv4.buildWithTtl(&ip_buf, our_ip, c.dst_ip, ipv4.PROTO_ICMP, c.ttl, icmp_buf[0..pkt_len]) orelse return false;
 
     // Send via net module
     const net = @import("../net.zig");
@@ -115,6 +134,7 @@ pub fn sendEchoRequest(idx: u8, our_ip: [4]u8) bool {
     c.got_reply = false;
     c.timed_out = false;
     c.send_tick = timer.getTicks();
+    c.send_millis = timer.getMillis();
     stats.echo_requests_tx += 1;
     c.next_seq +%= 1;
 
@@ -161,11 +181,14 @@ pub fn getReplyText(idx: u8, buf: []u8) u16 {
 
     var pos: u16 = 0;
 
-    // "64 bytes from "
-    const size_str = "64 bytes from ";
-    if (pos + size_str.len > buf.len) return 0;
-    @memcpy(buf[pos..][0..size_str.len], size_str);
-    pos += size_str.len;
+    // "<N> bytes from " — compute actual byte count (header + payload)
+    const byte_count: u32 = HEADER_SIZE + c.payload_size;
+    pos += formatDec(buf[pos..], byte_count);
+
+    const from_str = " bytes from ";
+    if (pos + from_str.len > buf.len) return 0;
+    @memcpy(buf[pos..][0..from_str.len], from_str);
+    pos += from_str.len;
 
     // IP address
     pos += formatIp(buf[pos..], c.reply_src);
@@ -187,6 +210,21 @@ pub fn getReplyText(idx: u8, buf: []u8) u16 {
 
     // TTL
     pos += formatDec(buf[pos..], c.reply_ttl);
+
+    // " time="
+    const time_str = " time=";
+    if (pos + time_str.len > buf.len) return 0;
+    @memcpy(buf[pos..][0..time_str.len], time_str);
+    pos += time_str.len;
+
+    // RTT value
+    pos += formatDec(buf[pos..], c.reply_rtt_ms);
+
+    // " ms"
+    const ms_str = " ms";
+    if (pos + ms_str.len > buf.len) return 0;
+    @memcpy(buf[pos..][0..ms_str.len], ms_str);
+    pos += ms_str.len;
 
     // newline
     if (pos < buf.len) {
@@ -226,6 +264,7 @@ fn matchEchoReply(payload: []const u8, ip_hdr: ipv4.Header) void {
             c.reply_ttl = ip_hdr.ttl;
             c.reply_src = ip_hdr.src;
             c.reply_seq = reply_seq;
+            c.reply_rtt_ms = @intCast(timer.getMillis() -| c.send_millis);
             klog.debug("icmp: matched echo reply to conn, seq=");
             klog.debugDec(reply_seq);
             klog.debug("\n");
