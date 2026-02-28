@@ -59,6 +59,15 @@ pub const Header = struct {
 };
 
 pub fn parseOctal(buf: []const u8) u64 {
+    // GNU tar binary encoding: high bit set means big-endian binary
+    if (buf.len > 0 and buf[0] & 0x80 != 0) {
+        var val: u64 = 0;
+        // Skip the marker byte, parse remaining as big-endian
+        for (buf[1..]) |b| {
+            val = (val << 8) | b;
+        }
+        return val;
+    }
     var val: u64 = 0;
     for (buf) |c| {
         if (c == 0 or c == ' ') continue;

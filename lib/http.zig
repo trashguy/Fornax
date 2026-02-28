@@ -862,6 +862,12 @@ pub fn buildRequest(
     return req_pos;
 }
 
+// BSS buffers for redirect handling — avoids LLVM aarch64 stack-slot reuse
+// bug with multiple `= undefined` arrays (see docs/aarch64-gotchas.md §5).
+var redir_ip_buf: [64]u8 = undefined;
+var redir_loc_buf: [512]u8 = undefined;
+var redir_path_buf: [512]u8 = undefined;
+
 fn requestWithRedirects(
     host: []const u8,
     port: u16,
@@ -872,8 +878,7 @@ fn requestWithRedirects(
     redirect_count: u8,
 ) ?RequestResult {
     // Resolve hostname if needed
-    var ip_buf: [64]u8 = undefined;
-    const host_ip = if (isIpAddress(host)) host else (resolve(host, &ip_buf) orelse {
+    const host_ip = if (isIpAddress(host)) host else (resolve(host, &redir_ip_buf) orelse {
         _ = fx.write(2, "http: DNS resolution failed for ");
         _ = fx.write(2, host);
         _ = fx.write(2, "\n");
@@ -919,10 +924,9 @@ fn requestWithRedirects(
     {
         if (resp.getHeader("Location")) |location| {
             // Copy location before closing (it points into header_buf)
-            var loc_buf: [512]u8 = undefined;
-            if (location.len <= loc_buf.len) {
-                @memcpy(loc_buf[0..location.len], location);
-                const loc = loc_buf[0..location.len];
+            if (location.len <= redir_loc_buf.len) {
+                @memcpy(redir_loc_buf[0..location.len], location);
+                const loc = redir_loc_buf[0..location.len];
                 conn.close();
 
                 // 301/302 change method to GET and drop body
@@ -935,7 +939,6 @@ fn requestWithRedirects(
                 }
 
                 // Strip Authorization on cross-domain redirects
-                var redir_path_buf: [512]u8 = undefined;
                 if (parseUrl(loc, &redir_path_buf)) |parts| {
                     // Cross-domain: strip auth headers
                     if (!caseInsensitiveEql(parts.host, host)) {

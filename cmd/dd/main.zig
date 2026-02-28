@@ -5,6 +5,10 @@ const err = fx.io.Writer.stderr;
 
 var buf: [4096]u8 linksection(".bss") = undefined;
 
+/// Result of last parseNum call — avoids returning u64 across function boundary
+/// (riscv64 codegen corrupts function return values).
+var parsed_result: u64 = 0;
+
 export fn _start() noreturn {
     const args = fx.getArgs();
 
@@ -24,15 +28,19 @@ export fn _start() noreturn {
         } else if (startsWith(s, "of=")) {
             of_path = s[3..];
         } else if (startsWith(s, "bs=")) {
-            bs = @min(parseNum(s[3..]), 4096);
+            parseNum(s[3..]);
+            bs = @min(parsed_result, 4096);
             if (bs == 0) bs = 4096;
         } else if (startsWith(s, "count=")) {
-            count = parseNum(s[6..]);
+            parseNum(s[6..]);
+            count = parsed_result;
             count_set = true;
         } else if (startsWith(s, "skip=")) {
-            skip_blocks = parseNum(s[5..]);
+            parseNum(s[5..]);
+            skip_blocks = parsed_result;
         } else if (startsWith(s, "seek=")) {
-            seek_blocks = parseNum(s[5..]);
+            parseNum(s[5..]);
+            seek_blocks = parsed_result;
         } else {
             err.print("dd: unknown arg: {s}\n", .{s});
             fx.exit(1);
@@ -125,11 +133,10 @@ fn startsWith(s: []const u8, prefix: []const u8) bool {
     return true;
 }
 
-fn parseNum(s: []const u8) u64 {
-    var n: u64 = 0;
+fn parseNum(s: []const u8) void {
+    parsed_result = 0;
     for (s) |c| {
         if (c < '0' or c > '9') break;
-        n = n * 10 + (c - '0');
+        parsed_result = parsed_result * 10 + (c - '0');
     }
-    return n;
 }

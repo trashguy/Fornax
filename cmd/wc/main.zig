@@ -12,7 +12,11 @@ const err = fx.io.Writer.stderr;
 
 const Counts = struct { lines: u64, words: u64, chars: u64 };
 
-fn countFd(fd: i32) Counts {
+/// Result of last countFd call — avoids returning struct across function boundary
+/// (riscv64 codegen corrupts multi-register return values).
+var last_counts: Counts = .{ .lines = 0, .words = 0, .chars = 0 };
+
+fn countFd(fd: i32) void {
     var lines: u64 = 0;
     var words: u64 = 0;
     var chars: u64 = 0;
@@ -35,28 +39,79 @@ fn countFd(fd: i32) Counts {
         }
     }
 
-    return .{ .lines = lines, .words = words, .chars = chars };
+    last_counts = .{ .lines = lines, .words = words, .chars = chars };
 }
 
-fn printCounts(c: Counts, show_lines: bool, show_words: bool, show_chars: bool, name: ?[]const u8) void {
+/// Name for printCounts — avoids passing optional slice across function boundary
+/// (riscv64 codegen corrupts slice pointer in function args).
+var print_name: ?[]const u8 = null;
+
+/// Output buffer for printCounts — built with direct byte manipulation to avoid
+/// formatDec slice return and putDec function call codegen bugs on riscv64.
+var out_buf: [256]u8 = undefined;
+
+/// Current write position in out_buf — module-level to avoid return value codegen bug on riscv64.
+var out_pos: usize = 0;
+
+/// Write a u64 as decimal digits into out_buf at out_pos.
+/// Inline to avoid riscv64 function call boundary codegen bugs.
+inline fn writeDec(val: u64) void {
+    if (val == 0) {
+        out_buf[out_pos] = '0';
+        out_pos += 1;
+        return;
+    }
+    // Format into temp buffer in reverse
+    var tmp: [20]u8 = undefined;
+    var v = val;
+    var i: usize = 20;
+    while (v > 0 and i > 0) {
+        i -= 1;
+        tmp[i] = '0' + @as(u8, @truncate(v % 10));
+        v /= 10;
+    }
+    // Copy digits to out_buf
+    while (i < 20) {
+        out_buf[out_pos] = tmp[i];
+        out_pos += 1;
+        i += 1;
+    }
+}
+
+/// Inline to avoid riscv64 function call boundary codegen bugs.
+inline fn printCounts(show_lines: bool, show_words: bool, show_chars: bool) void {
+    out_pos = 0;
     var first = true;
     if (show_lines) {
-        out.print("{d}", .{c.lines});
+        writeDec(last_counts.lines);
         first = false;
     }
     if (show_words) {
-        if (!first) out.puts(" ");
-        out.print("{d}", .{c.words});
+        if (!first) {
+            out_buf[out_pos] = ' ';
+            out_pos += 1;
+        }
+        writeDec(last_counts.words);
         first = false;
     }
     if (show_chars) {
-        if (!first) out.puts(" ");
-        out.print("{d}", .{c.chars});
+        if (!first) {
+            out_buf[out_pos] = ' ';
+            out_pos += 1;
+        }
+        writeDec(last_counts.chars);
     }
-    if (name) |n| {
-        out.print(" {s}", .{n});
+    if (print_name) |n| {
+        out_buf[out_pos] = ' ';
+        out_pos += 1;
+        for (n) |c| {
+            out_buf[out_pos] = c;
+            out_pos += 1;
+        }
     }
-    out.puts("\n");
+    out_buf[out_pos] = '\n';
+    out_pos += 1;
+    _ = fx.write(1, out_buf[0..out_pos]);
 }
 
 export fn _start() noreturn {
@@ -97,8 +152,9 @@ export fn _start() noreturn {
 
     if (file_start >= args.len) {
         // No file args — read stdin
-        const c = countFd(0);
-        printCounts(c, show_lines, show_words, show_chars, null);
+        countFd(0);
+        print_name = null;
+        printCounts(show_lines, show_words, show_chars);
     } else {
         for (args[file_start..]) |arg| {
             var len: usize = 0;
@@ -107,12 +163,15 @@ export fn _start() noreturn {
 
             const fd = fx.open(name);
             if (fd < 0) {
-                err.print("wc: {s}: not found\n", .{name});
+                err.puts("wc: ");
+                err.puts(name);
+                err.puts(": not found\n");
                 continue;
             }
-            const c = countFd(fd);
+            countFd(fd);
             _ = fx.close(fd);
-            printCounts(c, show_lines, show_words, show_chars, name);
+            print_name = name;
+            printCounts(show_lines, show_words, show_chars);
         }
     }
 

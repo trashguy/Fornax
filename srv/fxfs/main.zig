@@ -1438,6 +1438,14 @@ fn cowPathWithSplit(path: []const PathEntry, path_len: usize, new_left: u64, sep
     return carry_left;
 }
 
+// BSS buffers for btreeInsert/leafInsert — avoids LLVM aarch64 stack-slot
+// reuse bug with multiple large `= undefined` arrays (see docs/aarch64-gotchas.md §5).
+var insert_old_leaf: [BLOCK_SIZE]u8 = undefined;
+var insert_new_buf: [BLOCK_SIZE]u8 = undefined;
+var insert_left_buf: [BLOCK_SIZE]u8 = undefined;
+var insert_right_buf: [BLOCK_SIZE]u8 = undefined;
+var insert_root_buf: [BLOCK_SIZE]u8 = undefined;
+
 fn btreeInsert(key: Key, data: []const u8) bool {
     const root = readBlockCached(sb_tree_root) orelse return false;
     const level = parseNodeLevel(root);
@@ -1453,19 +1461,18 @@ fn btreeInsert(key: Key, data: []const u8) bool {
     const leaf_block = findLeafPath(key, &path, &path_len) orelse return false;
 
     // Copy old leaf locally to survive cache invalidation during splits
-    var old_leaf: [BLOCK_SIZE]u8 = undefined;
     {
         const cached = readBlockCached(leaf_block) orelse return false;
-        @memcpy(&old_leaf, cached);
+        @memcpy(&insert_old_leaf, cached);
     }
-    const num_items = parseNodeNumItems(&old_leaf);
+    const num_items = parseNodeNumItems(&insert_old_leaf);
 
     // Check if items fit in a single leaf
     var total_data: usize = data.len;
     {
         var i: u16 = 0;
         while (i < num_items) : (i += 1) {
-            total_data += parseLeafItemDataSize(&old_leaf, i);
+            total_data += parseLeafItemDataSize(&insert_old_leaf, i);
         }
     }
     const total_items: u16 = num_items + 1;
@@ -1473,42 +1480,42 @@ fn btreeInsert(key: Key, data: []const u8) bool {
 
     if (header_end + total_data <= BLOCK_SIZE) {
         // Fits in single leaf — build directly
-        var new_buf: [BLOCK_SIZE]u8 = [_]u8{0} ** BLOCK_SIZE;
+        @memset(&insert_new_buf, 0);
         var data_cursor: usize = BLOCK_SIZE;
         var new_count: u16 = 0;
         var inserted = false;
 
         var i: u16 = 0;
         while (i < num_items) : (i += 1) {
-            const k = parseLeafItemKey(&old_leaf, i);
+            const k = parseLeafItemKey(&insert_old_leaf, i);
             if (!inserted and key.lessThan(k)) {
                 data_cursor -= data.len;
-                @memcpy(new_buf[data_cursor..][0..data.len], data);
-                writeLeafItem(&new_buf, new_count, key, @intCast(data_cursor), @intCast(data.len));
+                @memcpy(insert_new_buf[data_cursor..][0..data.len], data);
+                writeLeafItem(&insert_new_buf, new_count, key, @intCast(data_cursor), @intCast(data.len));
                 new_count += 1;
                 inserted = true;
             }
-            const old_data = parseLeafItemData(&old_leaf, i);
+            const old_data = parseLeafItemData(&insert_old_leaf, i);
             data_cursor -= old_data.len;
-            @memcpy(new_buf[data_cursor..][0..old_data.len], old_data);
-            writeLeafItem(&new_buf, new_count, k, @intCast(data_cursor), @intCast(old_data.len));
+            @memcpy(insert_new_buf[data_cursor..][0..old_data.len], old_data);
+            writeLeafItem(&insert_new_buf, new_count, k, @intCast(data_cursor), @intCast(old_data.len));
             new_count += 1;
         }
         if (!inserted) {
             data_cursor -= data.len;
-            @memcpy(new_buf[data_cursor..][0..data.len], data);
-            writeLeafItem(&new_buf, new_count, key, @intCast(data_cursor), @intCast(data.len));
+            @memcpy(insert_new_buf[data_cursor..][0..data.len], data);
+            writeLeafItem(&insert_new_buf, new_count, key, @intCast(data_cursor), @intCast(data.len));
             new_count += 1;
         }
 
-        writeNodeHeader(&new_buf, 0, new_count, sb_generation + 1);
+        writeNodeHeader(&insert_new_buf, 0, new_count, sb_generation + 1);
 
         const new_block = allocBlock() orelse return false;
-        if (!writeTreeNode(new_block, &new_buf)) {
+        if (!writeTreeNode(new_block, &insert_new_buf)) {
             freeBlock(new_block);
             return false;
         }
-        _ = cacheInsert(new_block, &new_buf);
+        _ = cacheInsert(new_block, &insert_new_buf);
         freeBlock(leaf_block);
 
         // CoW the path back to root
@@ -1518,28 +1525,26 @@ fn btreeInsert(key: Key, data: []const u8) bool {
     }
 
     // Leaf overflow — split by data size for balance
-    const split_at = findLeafSplitPoint(&old_leaf, num_items, key, data.len, total_data);
+    const split_at = findLeafSplitPoint(&insert_old_leaf, num_items, key, data.len, total_data);
 
-    var left_buf: [BLOCK_SIZE]u8 = undefined;
-    _ = buildLeafRange(&old_leaf, num_items, key, data, 0, split_at, &left_buf);
+    _ = buildLeafRange(&insert_old_leaf, num_items, key, data, 0, split_at, &insert_left_buf);
 
-    var right_buf: [BLOCK_SIZE]u8 = undefined;
-    const separator = buildLeafRange(&old_leaf, num_items, key, data, split_at, total_items, &right_buf);
+    const separator = buildLeafRange(&insert_old_leaf, num_items, key, data, split_at, total_items, &insert_right_buf);
 
     const left_block = allocBlock() orelse return false;
-    if (!writeTreeNode(left_block, &left_buf)) {
+    if (!writeTreeNode(left_block, &insert_left_buf)) {
         freeBlock(left_block);
         return false;
     }
-    _ = cacheInsert(left_block, &left_buf);
+    _ = cacheInsert(left_block, &insert_left_buf);
 
     const right_block = allocBlock() orelse return false;
-    if (!writeTreeNode(right_block, &right_buf)) {
+    if (!writeTreeNode(right_block, &insert_right_buf)) {
         freeBlock(right_block);
         freeBlock(left_block);
         return false;
     }
-    _ = cacheInsert(right_block, &right_buf);
+    _ = cacheInsert(right_block, &insert_right_buf);
 
     freeBlock(leaf_block);
 
@@ -1551,19 +1556,18 @@ fn btreeInsert(key: Key, data: []const u8) bool {
 
 fn leafInsert(leaf_block: u64, key: Key, data: []const u8) bool {
     // Copy old leaf locally to survive cache invalidation during splits
-    var old_leaf: [BLOCK_SIZE]u8 = undefined;
     {
         const cached = readBlockCached(leaf_block) orelse return false;
-        @memcpy(&old_leaf, cached);
+        @memcpy(&insert_old_leaf, cached);
     }
-    const num_items = parseNodeNumItems(&old_leaf);
+    const num_items = parseNodeNumItems(&insert_old_leaf);
 
     // Check if items fit in a single leaf
     var total_data: usize = data.len;
     {
         var i: u16 = 0;
         while (i < num_items) : (i += 1) {
-            total_data += parseLeafItemDataSize(&old_leaf, i);
+            total_data += parseLeafItemDataSize(&insert_old_leaf, i);
         }
     }
     const total_items: u16 = num_items + 1;
@@ -1571,86 +1575,84 @@ fn leafInsert(leaf_block: u64, key: Key, data: []const u8) bool {
 
     if (header_end + total_data <= BLOCK_SIZE) {
         // Fits in single leaf — build directly
-        var new_buf: [BLOCK_SIZE]u8 = [_]u8{0} ** BLOCK_SIZE;
+        @memset(&insert_new_buf, 0);
         var data_cursor: usize = BLOCK_SIZE;
         var new_count: u16 = 0;
         var inserted = false;
 
         var i: u16 = 0;
         while (i < num_items) : (i += 1) {
-            const k = parseLeafItemKey(&old_leaf, i);
+            const k = parseLeafItemKey(&insert_old_leaf, i);
             if (!inserted and key.lessThan(k)) {
                 data_cursor -= data.len;
-                @memcpy(new_buf[data_cursor..][0..data.len], data);
-                writeLeafItem(&new_buf, new_count, key, @intCast(data_cursor), @intCast(data.len));
+                @memcpy(insert_new_buf[data_cursor..][0..data.len], data);
+                writeLeafItem(&insert_new_buf, new_count, key, @intCast(data_cursor), @intCast(data.len));
                 new_count += 1;
                 inserted = true;
             }
-            const old_data = parseLeafItemData(&old_leaf, i);
+            const old_data = parseLeafItemData(&insert_old_leaf, i);
             data_cursor -= old_data.len;
-            @memcpy(new_buf[data_cursor..][0..old_data.len], old_data);
-            writeLeafItem(&new_buf, new_count, k, @intCast(data_cursor), @intCast(old_data.len));
+            @memcpy(insert_new_buf[data_cursor..][0..old_data.len], old_data);
+            writeLeafItem(&insert_new_buf, new_count, k, @intCast(data_cursor), @intCast(old_data.len));
             new_count += 1;
         }
         if (!inserted) {
             data_cursor -= data.len;
-            @memcpy(new_buf[data_cursor..][0..data.len], data);
-            writeLeafItem(&new_buf, new_count, key, @intCast(data_cursor), @intCast(data.len));
+            @memcpy(insert_new_buf[data_cursor..][0..data.len], data);
+            writeLeafItem(&insert_new_buf, new_count, key, @intCast(data_cursor), @intCast(data.len));
             new_count += 1;
         }
 
-        writeNodeHeader(&new_buf, 0, new_count, sb_generation + 1);
+        writeNodeHeader(&insert_new_buf, 0, new_count, sb_generation + 1);
 
         const new_block = allocBlock() orelse return false;
-        if (!writeTreeNode(new_block, &new_buf)) {
+        if (!writeTreeNode(new_block, &insert_new_buf)) {
             freeBlock(new_block);
             return false;
         }
-        _ = cacheInsert(new_block, &new_buf);
+        _ = cacheInsert(new_block, &insert_new_buf);
         freeBlock(leaf_block);
         sb_tree_root = new_block;
         return true;
     }
 
     // Leaf overflow — split by data size for balance
-    const split_at = findLeafSplitPoint(&old_leaf, num_items, key, data.len, total_data);
+    const split_at = findLeafSplitPoint(&insert_old_leaf, num_items, key, data.len, total_data);
 
-    var left_buf: [BLOCK_SIZE]u8 = undefined;
-    _ = buildLeafRange(&old_leaf, num_items, key, data, 0, split_at, &left_buf);
+    _ = buildLeafRange(&insert_old_leaf, num_items, key, data, 0, split_at, &insert_left_buf);
 
-    var right_buf: [BLOCK_SIZE]u8 = undefined;
-    const separator = buildLeafRange(&old_leaf, num_items, key, data, split_at, total_items, &right_buf);
+    const separator = buildLeafRange(&insert_old_leaf, num_items, key, data, split_at, total_items, &insert_right_buf);
 
     const left_block = allocBlock() orelse return false;
-    if (!writeTreeNode(left_block, &left_buf)) {
+    if (!writeTreeNode(left_block, &insert_left_buf)) {
         freeBlock(left_block);
         return false;
     }
-    _ = cacheInsert(left_block, &left_buf);
+    _ = cacheInsert(left_block, &insert_left_buf);
 
     const right_block = allocBlock() orelse return false;
-    if (!writeTreeNode(right_block, &right_buf)) {
+    if (!writeTreeNode(right_block, &insert_right_buf)) {
         freeBlock(right_block);
         freeBlock(left_block);
         return false;
     }
-    _ = cacheInsert(right_block, &right_buf);
+    _ = cacheInsert(right_block, &insert_right_buf);
 
     freeBlock(leaf_block);
 
     // Create new internal root (level 1)
-    var root_buf: [BLOCK_SIZE]u8 = [_]u8{0} ** BLOCK_SIZE;
-    writeNodeHeader(&root_buf, 1, 1, sb_generation + 1);
-    writeInternalKey(&root_buf, 0, separator);
-    writeInternalChild(&root_buf, 1, 0, left_block);
-    writeInternalChild(&root_buf, 1, 1, right_block);
+    @memset(&insert_root_buf, 0);
+    writeNodeHeader(&insert_root_buf, 1, 1, sb_generation + 1);
+    writeInternalKey(&insert_root_buf, 0, separator);
+    writeInternalChild(&insert_root_buf, 1, 0, left_block);
+    writeInternalChild(&insert_root_buf, 1, 1, right_block);
 
     const new_root = allocBlock() orelse return false;
-    if (!writeTreeNode(new_root, &root_buf)) {
+    if (!writeTreeNode(new_root, &insert_root_buf)) {
         freeBlock(new_root);
         return false;
     }
-    _ = cacheInsert(new_root, &root_buf);
+    _ = cacheInsert(new_root, &insert_root_buf);
 
     sb_tree_root = new_root;
     return true;

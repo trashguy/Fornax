@@ -19,19 +19,24 @@ var vt_pids: [MAX_VTS]i32 = .{ -1, -1, -1, -1 };
 var vt_fail_count: [MAX_VTS]u8 = .{ 0, 0, 0, 0 };
 var vt_last_spawn: [MAX_VTS]u64 = .{ 0, 0, 0, 0 };
 
+/// Active VT count — written by readVtCount(), avoids return-value codegen bug on riscv64.
+var active_vts: usize = MAX_VTS;
+
+/// Bytes loaded by last loadBin call — avoids passing slice across function boundary (riscv64 codegen bug).
+var last_load_total: usize = 0;
+
 /// Read /etc/vts to determine active VT count (1..MAX_VTS, default MAX_VTS).
-fn readVtCount() usize {
+fn readVtCount() void {
     const fd = fx.open("/etc/vts");
-    if (fd < 0) return MAX_VTS;
+    if (fd < 0) return;
     var buf: [8]u8 = undefined;
     const n = fx.read(fd, &buf);
     _ = fx.close(fd);
-    if (n <= 0) return MAX_VTS;
+    if (n <= 0) return;
     const c = buf[0];
     if (c >= '1' and c <= '0' + MAX_VTS) {
-        return c - '0';
+        active_vts = c - '0';
     }
-    return MAX_VTS;
 }
 
 /// Load an ELF from /bin/<name> into elf_buf. Returns the slice, or null on failure.
@@ -56,23 +61,29 @@ fn loadBin(name: []const u8) ?[]const u8 {
 
     out.print("init: read {d} bytes\n", .{@as(u64, total)});
 
+    last_load_total = total;
     if (total == 0) return null;
     return elf_buf[0..total];
 }
 
 /// Spawn login on a given VT, return pid or -1.
-fn spawnLogin(elf_data: []const u8, vt: usize) i32 {
+fn spawnLogin(vt: usize) void {
     // Set init's VT so the child inherits it
     var vt_cmd = [_]u8{ 'v', 't', ' ', '0' + @as(u8, @intCast(vt)) };
     _ = fx.write(0, &vt_cmd);
 
-    const pid = fx.spawn(elf_data, &.{}, null);
+    const pid = fx.spawn(elf_buf[0..last_load_total], &.{}, null);
     if (pid >= 0) {
-        out.print("init: login on VT {d}, pid={d}\n", .{ vt, @as(u64, @bitCast(@as(i64, pid))) });
+        out.puts("init: login on VT ");
+        out.putDec(vt);
+        out.puts("\n");
+        vt_pids[vt] = pid;
     } else {
-        out.print("init: failed to spawn login on VT {d}\n", .{vt});
+        out.puts("init: failed to spawn login on VT ");
+        out.putDec(vt);
+        out.puts("\n");
+        vt_pids[vt] = -1;
     }
-    return pid;
 }
 
 /// Check if a process is still alive via /proc/<pid>/status.
@@ -258,13 +269,14 @@ export fn _start() noreturn {
     spawnCrond();
 
     // Determine how many VTs to use (/etc/vts overrides default)
-    const active_vts = readVtCount();
+    readVtCount();
     out.print("init: {d} virtual terminals\n", .{@as(u64, active_vts)});
 
-    // Load login once
-    const elf_data = loadBin("login") orelse {
+    // Load login once (use elf_buf + last_load_total to avoid passing slice across
+    // function boundary — riscv64 codegen corrupts slice pointer in function args)
+    _ = loadBin("login") orelse {
         // Fall back to fsh if login doesn't exist
-        const fsh_data = loadBin("fsh") orelse {
+        _ = loadBin("fsh") orelse {
             out.puts("init: failed to load /bin/login and /bin/fsh\n");
             fx.exit(1);
         };
@@ -272,7 +284,7 @@ export fn _start() noreturn {
         for (0..active_vts) |i| {
             var vt_cmd = [_]u8{ 'v', 't', ' ', '0' + @as(u8, @intCast(i)) };
             _ = fx.write(0, &vt_cmd);
-            const pid = fx.spawn(fsh_data, &.{}, null);
+            const pid = fx.spawn(elf_buf[0..last_load_total], &.{}, null);
             if (pid >= 0) vt_pids[i] = pid;
         }
         // Wait loop for fallback
@@ -284,7 +296,7 @@ export fn _start() noreturn {
     // Spawn login on each active VT
     const now = fx.getUptime();
     for (0..active_vts) |i| {
-        vt_pids[i] = spawnLogin(elf_data, i);
+        spawnLogin(i);
         vt_last_spawn[i] = now;
     }
 
@@ -308,9 +320,9 @@ export fn _start() noreturn {
                 }
 
                 out.print("init: respawning login on VT {d}\n", .{i});
-                // Need to reload ELF since elf_buf may have been reused
-                const new_elf = loadBin("login") orelse continue;
-                vt_pids[i] = spawnLogin(new_elf, i);
+                // Reload ELF since elf_buf may have been reused
+                _ = loadBin("login") orelse continue;
+                spawnLogin(i);
                 vt_last_spawn[i] = spawn_now;
             }
         }

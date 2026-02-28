@@ -46,6 +46,19 @@ var header_buf: [8192]u8 linksection(".bss") = undefined;
 var pull_io_buf: [4096]u8 linksection(".bss") = undefined;
 var path_scratch: [512]u8 linksection(".bss") = undefined;
 
+// cmdPull large arrays — stored in BSS instead of stack to avoid aarch64
+// Zig/LLVM stack-slot reuse bug where large `= undefined` arrays
+// clobber other live local variables in the same function.
+const MAX_LAYERS = 32;
+var pull_layer_digests: [MAX_LAYERS][]const u8 linksection(".bss") = undefined;
+var pull_layer_sizes: [MAX_LAYERS]u64 linksection(".bss") = undefined;
+var pull_progress: [MAX_LAYERS]LayerProgress linksection(".bss") = undefined;
+var pull_contexts: [MAX_LAYERS]DownloadCtx linksection(".bss") = undefined;
+var pull_tmp_paths: [MAX_LAYERS][64]u8 linksection(".bss") = undefined;
+var pull_tmp_path_lens: [MAX_LAYERS]usize linksection(".bss") = undefined;
+var pull_handles: [MAX_LAYERS]fx.thread.ThreadHandle linksection(".bss") = undefined;
+var pull_spawned: [MAX_LAYERS]bool linksection(".bss") = undefined;
+
 // --- Auth token BSS buffers ---
 var auth_token_buf: [4096]u8 linksection(".bss") = undefined;
 var auth_token_len: usize = 0;
@@ -1224,8 +1237,6 @@ fn cmdBuild(argc: u64, argv: []const [*:0]const u8) void {
 
 // --- OCI Registry Pull ---
 
-const MAX_LAYERS = 32;
-
 const ImageRef = struct {
     registry_host: []const u8, // "10.0.2.2" or "myregistry.local"
     registry_port: u16, // 5000
@@ -2053,10 +2064,7 @@ fn getOrConnect(host: []const u8, port: u16, use_tls_flag: bool) ?*http.Connecti
         return null;
     });
 
-    persistent_conn = http.Connection.connect(host_ip, port, &header_buf) orelse {
-        stderr.puts("http: TCP connect failed\n");
-        return null;
-    };
+    persistent_conn = http.Connection.connect(host_ip, port, &header_buf) orelse return null;
 
     // TLS handshake if needed
     if (has_tls and use_tls_flag) {
@@ -2345,8 +2353,14 @@ fn downloadThreadFn(arg: *anyopaque) callconv(.c) void {
         const n = result.resp.readBody(&thr_io_buf);
         if (n <= 0) break;
         const nbytes: usize = @intCast(n);
-        _ = fx.syscall.write(tmp_fd, thr_io_buf[0..nbytes]);
-        total_written += nbytes;
+        // Write with short-write retry
+        var written: usize = 0;
+        while (written < nbytes) {
+            const w = fx.syscall.write(tmp_fd, thr_io_buf[written..nbytes]);
+            if (w <= 0) break;
+            written += @intCast(w);
+        }
+        total_written += written;
         @atomicStore(u64, &progress.bytes_done, total_written, .release);
     }
 
@@ -2403,8 +2417,14 @@ fn downloadSequential(ctx: *DownloadCtx) void {
         const n = result.resp.readBody(&pull_io_buf);
         if (n <= 0) break;
         const nbytes: usize = @intCast(n);
-        _ = fx.syscall.write(tmp_fd, pull_io_buf[0..nbytes]);
-        total_written += nbytes;
+        // Write with short-write retry
+        var written: usize = 0;
+        while (written < nbytes) {
+            const w = fx.syscall.write(tmp_fd, pull_io_buf[written..nbytes]);
+            if (w <= 0) break;
+            written += @intCast(w);
+        }
+        total_written += written;
         @atomicStore(u64, &progress.bytes_done, total_written, .release);
     }
 
@@ -2626,6 +2646,7 @@ fn extractEntryBuffered(header_raw: *[tar.HEADER_SIZE]u8, gz: *FileGzipReader, r
             _ = fx.syscall.write(out_fd, write_buf[0..wb_pos]);
         }
 
+
         _ = fx.wstat(out_fd, @intCast(mode_val & 0o7777), @intCast(uid_val), @intCast(gid_val), fx.WSTAT_MODE | fx.WSTAT_UID | fx.WSTAT_GID);
         _ = fx.close(out_fd);
     } else {
@@ -2713,8 +2734,8 @@ fn cmdPull(image_str: []const u8) void {
 
     // Step 3: Parse manifest — extract config digest + layer digests + sizes
     var config_digest: []const u8 = "";
-    var layer_digests: [MAX_LAYERS][]const u8 = undefined;
-    var layer_sizes: [MAX_LAYERS]u64 = undefined;
+    const layer_digests = &pull_layer_digests;
+    const layer_sizes = &pull_layer_sizes;
     var layer_count: usize = 0;
     {
         var parser = json.Parser.init(manifest_data);
@@ -2899,10 +2920,14 @@ fn cmdPull(image_str: []const u8) void {
     _ = fx.mkdir("/tmp");
 
     // Step 7: Download and extract layers (parallel for non-TLS, sequential for TLS)
-    var progress: [MAX_LAYERS]LayerProgress = undefined;
-    var contexts: [MAX_LAYERS]DownloadCtx = undefined;
-    var tmp_paths: [MAX_LAYERS][64]u8 = undefined;
-    var tmp_path_lens: [MAX_LAYERS]usize = undefined;
+    // All large arrays live in BSS to avoid aarch64 Zig/LLVM stack-slot
+    // reuse bug where `= undefined` initialization clobbers live locals.
+    const progress = &pull_progress;
+    const contexts = &pull_contexts;
+    const tmp_paths = &pull_tmp_paths;
+    const tmp_path_lens = &pull_tmp_path_lens;
+    const handles = &pull_handles;
+    const spawned = &pull_spawned;
 
     // Initialize progress and contexts for each layer
     for (0..layer_count) |li| {
@@ -2963,8 +2988,6 @@ fn cmdPull(image_str: []const u8) void {
 
     if (!ref.use_tls) {
         // PARALLEL: Spawn download threads for non-TLS
-        var handles: [MAX_LAYERS]fx.thread.ThreadHandle = undefined;
-        var spawned: [MAX_LAYERS]bool = undefined;
         for (0..layer_count) |i| {
             if (fx.thread.spawnThread(downloadThreadFn, @ptrCast(&contexts[i]))) |h| {
                 handles[i] = h;

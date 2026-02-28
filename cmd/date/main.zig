@@ -64,20 +64,54 @@ fn printDefault() void {
     }
     const dt = fx.time_lib.fromEpoch(epoch);
 
-    // "Sat Feb 22 14:30:05 UTC 2026"
-    out.puts(fx.time_lib.dowName(dt.dow));
-    out.puts(" ");
-    out.puts(fx.time_lib.monthName(dt.month));
-    out.puts(" ");
-    var day_buf: [4]u8 = undefined;
-    out.puts(fmtPad2(dt.day, &day_buf));
-    out.puts(" ");
-    var time_buf: [8]u8 = undefined;
-    out.puts(fx.time_lib.fmtTime(dt, &time_buf));
-    out.puts(" UTC ");
-    var year_buf: [8]u8 = undefined;
-    out.puts(fx.fmt.formatDec(&year_buf, dt.year));
-    out.puts("\n");
+    // Build entire output in one buffer, single write — avoids riscv64 codegen
+    // issues with repeated slice-returning function calls + syscalls.
+    const dow_tbl = [7][3]u8{
+        .{ 'S', 'u', 'n' }, .{ 'M', 'o', 'n' }, .{ 'T', 'u', 'e' },
+        .{ 'W', 'e', 'd' }, .{ 'T', 'h', 'u' }, .{ 'F', 'r', 'i' },
+        .{ 'S', 'a', 't' },
+    };
+    const mon_tbl = [12][3]u8{
+        .{ 'J', 'a', 'n' }, .{ 'F', 'e', 'b' }, .{ 'M', 'a', 'r' },
+        .{ 'A', 'p', 'r' }, .{ 'M', 'a', 'y' }, .{ 'J', 'u', 'n' },
+        .{ 'J', 'u', 'l' }, .{ 'A', 'u', 'g' }, .{ 'S', 'e', 'p' },
+        .{ 'O', 'c', 't' }, .{ 'N', 'o', 'v' }, .{ 'D', 'e', 'c' },
+    };
+
+    var buf: [30]u8 = undefined;
+    const di = dt.dow % 7;
+    buf[0] = dow_tbl[di][0];
+    buf[1] = dow_tbl[di][1];
+    buf[2] = dow_tbl[di][2];
+    buf[3] = ' ';
+    const mi = if (dt.month >= 1 and dt.month <= 12) dt.month - 1 else 0;
+    buf[4] = mon_tbl[mi][0];
+    buf[5] = mon_tbl[mi][1];
+    buf[6] = mon_tbl[mi][2];
+    buf[7] = ' ';
+    buf[8] = if (dt.day < 10) ' ' else '0' + dt.day / 10;
+    buf[9] = '0' + dt.day % 10;
+    buf[10] = ' ';
+    buf[11] = '0' + dt.hour / 10;
+    buf[12] = '0' + dt.hour % 10;
+    buf[13] = ':';
+    buf[14] = '0' + dt.minute / 10;
+    buf[15] = '0' + dt.minute % 10;
+    buf[16] = ':';
+    buf[17] = '0' + dt.second / 10;
+    buf[18] = '0' + dt.second % 10;
+    buf[19] = ' ';
+    buf[20] = 'U';
+    buf[21] = 'T';
+    buf[22] = 'C';
+    buf[23] = ' ';
+    const y = dt.year;
+    buf[24] = '0' + @as(u8, @intCast(y / 1000));
+    buf[25] = '0' + @as(u8, @intCast((y / 100) % 10));
+    buf[26] = '0' + @as(u8, @intCast((y / 10) % 10));
+    buf[27] = '0' + @as(u8, @intCast(y % 10));
+    buf[28] = '\n';
+    _ = fx.write(1, buf[0..29]);
 }
 
 fn printRfc2822() void {

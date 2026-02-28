@@ -93,23 +93,26 @@ fn splitFields(line: []const u8, fields: [][]const u8) usize {
     return count;
 }
 
+// BSS buffers — avoids LLVM aarch64 stack-slot reuse bug with multiple
+// large `= undefined` arrays (see docs/aarch64-gotchas.md §5).
+var awk_line_buf: [LINE_BUF_SIZE]u8 = undefined;
+var awk_read_buf: [4096]u8 = undefined;
+
 fn awkFd(fd: i32) void {
-    var line_buf: [LINE_BUF_SIZE]u8 = undefined;
     var line_len: usize = 0;
-    var buf: [4096]u8 = undefined;
 
     while (true) {
-        const n = fx.read(fd, &buf);
+        const n = fx.read(fd, &awk_read_buf);
         if (n <= 0) break;
         const len: usize = @intCast(n);
 
-        for (buf[0..len]) |c| {
+        for (awk_read_buf[0..len]) |c| {
             if (c == '\n') {
-                processLine(line_buf[0..line_len]);
+                processLine(awk_line_buf[0..line_len]);
                 line_len = 0;
             } else {
                 if (line_len < LINE_BUF_SIZE) {
-                    line_buf[line_len] = c;
+                    awk_line_buf[line_len] = c;
                     line_len += 1;
                 }
             }
@@ -117,7 +120,7 @@ fn awkFd(fd: i32) void {
     }
 
     if (line_len > 0) {
-        processLine(line_buf[0..line_len]);
+        processLine(awk_line_buf[0..line_len]);
     }
 }
 
