@@ -90,7 +90,6 @@ pub fn init() void {
 
         // Start CPU — PSCI CPU_ON with physical address of ap_entry_asm.
         // On aarch64 UEFI, PE symbols are at UEFI-loaded physical addresses
-        // (within identity-mapped first 4GB).
         const entry_phys = @intFromPtr(&ap_entry_asm);
         const err = cpu.psciCpuOn(@as(u64, mpidr), entry_phys, @as(u64, next_core));
         if (err != 0) {

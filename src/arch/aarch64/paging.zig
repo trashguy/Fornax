@@ -155,21 +155,23 @@ pub fn init() void {
     const user_root: *PageTable = @ptrFromInt(user_page);
     user_root.zero();
 
-    // Identity map first 4 GB using 2MB blocks in TTBR0 (lower half).
-    // 0x00000000-0x3FFFFFFF = first 1 GB (includes MMIO devices below 0x40000000)
-    // 0x40000000-0xFFFFFFFF = RAM on QEMU virt
-    mapHugeRegion(user_root, 0, 0, 4 * 1024 / 2) orelse {
+    // Identity map using 2MB blocks in TTBR0 (lower half).
+    // QEMU virt aarch64: RAM starts at 0x4000_0000. With 4G RAM, highest
+    // address is 0x1_4000_0000. UEFI may load the kernel EFI binary anywhere
+    // in RAM, including above 4 GB. Map KERNEL_MAP_SIZE to cover all of it.
+    const map_blocks = comptime mem.KERNEL_MAP_SIZE / (2 * 1024 * 1024);
+    mapHugeRegion(user_root, 0, 0, map_blocks) orelse {
         klog.err("Paging: failed to map identity region!\n");
         return;
     };
 
-    // Higher-half map: virtual KERNEL_VIRT_BASE → physical 0, 4 GB
+    // Higher-half map: virtual KERNEL_VIRT_BASE → physical 0, KERNEL_MAP_SIZE
     // This goes into TTBR1 (upper half addresses).
     // TTBR1 maps addresses 0xFFFF_0000_0000_0000 and above.
     // KERNEL_VIRT_BASE = 0xFFFF_8000_0000_0000.
     // With T1SZ=16, TTBR1 covers 0xFFFF_0000_0000_0000 - 0xFFFF_FFFF_FFFF_FFFF.
     // Index into TTBR1 root: bits [47:39] of (VA without top bits).
-    mapHugeRegion(kern_root, mem.KERNEL_VIRT_BASE, 0, 4 * 1024 / 2) orelse {
+    mapHugeRegion(kern_root, mem.KERNEL_VIRT_BASE, 0, map_blocks) orelse {
         klog.err("Paging: failed to map higher-half region!\n");
         return;
     };
@@ -185,8 +187,10 @@ pub fn init() void {
         klog.err("Paging: failed to map PCI ECAM (higher-half)!\n");
     };
 
-    // Step 2: Switch MMU configuration atomically — MAIR, TCR, TTBRs, then TLB flush.
-    // This replaces UEFI's attribute/translation config with ours in one shot.
+    // Step 2: Switch MMU configuration.
+    // Write MAIR, TCR, and TTBRs without ISBs between them so the changes
+    // all take effect at the single ISB below.  This avoids a window where
+    // UEFI's PTEs are interpreted with our (incompatible) MAIR indices.
 
     // Configure MAIR_EL1:
     //   Attr0 = 0xFF (Normal, Write-Back, Read-Write-Allocate, Inner+Outer)
@@ -219,7 +223,8 @@ pub fn init() void {
     cpu.writeTtbr0(user_root_phys);
     cpu.writeTtbr1(kernel_root_phys);
 
-    // Synchronize and flush TLB so new MAIR/TCR/TTBRs take effect
+    // Single context synchronization point — all four MSR writes above
+    // take effect here simultaneously.  Then flush stale TLB entries.
     cpu.isb();
     cpu.tlbiAll();
     cpu.dsb();
@@ -236,7 +241,9 @@ pub fn init() void {
 
     initialized = true;
 
-    klog.info("Paging: AArch64 4KB granule, 4GB identity + higher-half mapped\n");
+    klog.info("Paging: AArch64 4KB granule, ");
+    klog.infoDec(mem.KERNEL_MAP_SIZE / (1024 * 1024 * 1024));
+    klog.info("GB identity + higher-half mapped\n");
 }
 
 /// Map `count` 2MB blocks starting at `virt_base` → `phys_base`.

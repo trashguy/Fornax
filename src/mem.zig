@@ -32,8 +32,14 @@ pub const ARGV_BASE: u64 = USER_STACK_TOP - PAGE_SIZE;
 /// Used by POSIX programs for AT_PHDR, AT_PHNUM, etc.
 pub const AUXV_BASE: u64 = ARGV_BASE - PAGE_SIZE;
 
-/// How much physical memory to map in the kernel half (4 GB).
-pub const KERNEL_MAP_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+/// How much physical memory to map in the kernel half.
+/// AArch64 QEMU virt: RAM starts at 0x4000_0000, so 4 GB of RAM occupies
+/// physical addresses up to 0x1_4000_0000 — requiring an 8 GB map.
+/// x86_64 and riscv64 RAM starts near 0, so 4 GB suffices.
+pub const KERNEL_MAP_SIZE: u64 = if (@import("builtin").cpu.arch == .aarch64)
+    8 * 1024 * 1024 * 1024
+else
+    4 * 1024 * 1024 * 1024;
 
 /// Convert a physical address to its kernel virtual address.
 pub fn physToVirt(phys: u64) u64 {

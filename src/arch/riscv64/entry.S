@@ -189,6 +189,8 @@ trap_entry:
     csrw sscratch, zero        # Re-mark S-mode
     # SP is already kernel stack — save original SP before allocating frame
     addi sp, sp, -FRAME_SIZE
+    # Save t0 FIRST before using it as scratch (fixes clobber bug)
+    sd x5, 4*8(sp)
     # Save ORIGINAL SP (before frame alloc) so trap_return restores correctly.
     # Without this, every S-mode interrupt permanently leaks 272 bytes of stack.
     addi t0, sp, FRAME_SIZE
@@ -204,6 +206,8 @@ trap_entry:
     sd sp, ASM_SAVED_USER_RSP(tp)    # save user SP
     ld sp, ASM_KERNEL_STACK_TOP(tp)  # load kernel SP
     addi sp, sp, -FRAME_SIZE
+    # Save t0 FIRST before using it as scratch (fixes clobber bug)
+    sd x5, 4*8(sp)
 
     # Save user SP from percpu to frame
     ld t0, ASM_SAVED_USER_RSP(tp)
@@ -214,10 +218,10 @@ trap_entry:
     sd t0, 3*8(sp)
 
 .save_regs:
-    # Save all GPRs (except SP@slot1 and TP@slot3, already saved)
+    # Save all GPRs (except SP@slot1, TP@slot3, t0@slot4 — already saved)
     sd x1,   0*8(sp)           # ra
     sd x3,   2*8(sp)           # gp
-    sd x5,   4*8(sp)           # t0
+    # x5 (t0) already saved before scratch use
     sd x6,   5*8(sp)           # t1
     sd x7,   6*8(sp)           # t2
     sd x8,   7*8(sp)           # s0/fp

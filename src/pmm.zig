@@ -18,6 +18,15 @@ var initialized: bool = false;
 /// Spinlock guarding PMM bitmap, free_pages, and search_hint.
 pub var pmm_lock: SpinLock = .{};
 
+/// DMA guard: physical range that must never be freed/re-allocated (debug trap).
+var dma_guard_start: usize = 0;
+var dma_guard_pages: usize = 0;
+
+pub fn setDmaGuard(phys: usize, pages: usize) void {
+    dma_guard_start = phys;
+    dma_guard_pages = pages;
+}
+
 pub const PmmError = error{
     NoConventionalMemory,
 };
@@ -159,6 +168,20 @@ pub fn initDirect(ram_base: u64, ram_size: u64, reserved_end: u64) void {
     klog.info(" MB)\n");
 }
 
+/// Upgrade the bitmap pointer from a physical (TTBR0) address to a higher-half
+/// (TTBR1) virtual address. Must be called after paging is initialized.
+///
+/// Without this, bitmap accesses go through TTBR0 (the per-process page table).
+/// On aarch64, the bitmap's physical address overlaps the user ELF image base
+/// (both near 0x4000_0000), so user-space ELF mappings overwrite the identity-map
+/// entries and corrupt the kernel's bitmap reads during syscalls.
+pub fn upgradeBitmapToHigherHalf() void {
+    if (initialized) {
+        const phys = @intFromPtr(bitmap);
+        bitmap = @ptrFromInt(phys + mem.KERNEL_VIRT_BASE);
+    }
+}
+
 pub fn allocPage() ?usize {
     if (!initialized) return null;
     pmm_lock.lock();
@@ -168,6 +191,15 @@ pub fn allocPage() ?usize {
     while (checked < total_pages) : (checked += 1) {
         const page = (search_hint + checked) % total_pages;
         if (isFree(page)) {
+            // Trap: catch re-allocation of DMA-guarded pages
+            if (comptime @import("builtin").cpu.arch == .aarch64) {
+                const addr = page * page_size;
+                if (dma_guard_start != 0 and addr >= dma_guard_start and addr < dma_guard_start + dma_guard_pages * page_size) {
+                    klog.err("PMM TRAP: allocPage DMA page 0x");
+                    klog.errHex(@as(u32, @truncate(addr)));
+                    klog.err("\n");
+                }
+            }
             markUsed(page);
             free_pages -= 1;
             search_hint = page + 1;
@@ -221,6 +253,14 @@ pub fn allocContiguousPages(count: usize) ?usize {
 
 pub fn freePage(phys_addr: usize) void {
     if (!initialized) return;
+    // Trap: catch unexpected frees of DMA pages (aarch64 virtqueue debug)
+    if (comptime @import("builtin").cpu.arch == .aarch64) {
+        if (dma_guard_start != 0 and phys_addr >= dma_guard_start and phys_addr < dma_guard_start + dma_guard_pages * page_size) {
+            klog.err("PMM TRAP: freePage DMA page 0x");
+            klog.errHex(@as(u32, @truncate(phys_addr)));
+            klog.err("\n");
+        }
+    }
     pmm_lock.lock();
     defer pmm_lock.unlock();
     const page = phys_addr / page_size;

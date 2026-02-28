@@ -379,6 +379,13 @@ ap_entry_asm:
     // Save core_id in x19 (callee-saved, survives function calls)
     mov     x19, x0
 
+    // Enable FP/SIMD — PSCI CPU_ON resets CPACR_EL1 to 0 (trapping).
+    // Zig-generated code uses NEON for struct copies, so this must be
+    // set before calling any Zig function.
+    mov     x1, #(3 << 20)         // CPACR_EL1.FPEN = 0b11
+    msr     cpacr_el1, x1
+    isb
+
     // Load physical stack top
     adrp    x1, ap_stack_top
     add     x1, x1, :lo12:ap_stack_top

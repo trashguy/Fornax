@@ -107,6 +107,13 @@ pub fn main() noreturn {
 pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize, rsdp: ?[*]const u8) noreturn {
     // Phase 4/5: Architecture-specific init (GDT/IDT/paging)
     arch.init();
+
+    // Upgrade PMM bitmap pointer to higher-half (TTBR1/kernel page table).
+    // Before this, bitmap accesses go through TTBR0 which user ELF mappings
+    // can overwrite — on aarch64 the bitmap physical address overlaps the
+    // user image base (both near 0x4000_0000).
+    pmm.upgradeBitmapToHigherHalf();
+
     klog.info("Architecture init complete.\n");
 
     // SMP: Per-CPU data structures (BSP core 0)
@@ -227,8 +234,11 @@ pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize, rsdp: ?[*]const
         const rtc = @import("arch/riscv64/rtc.zig");
         rtc.init();
         time.init(rtc.boot_epoch);
+    } else if (builtin.cpu.arch == .aarch64) {
+        const rtc = @import("arch/aarch64/rtc.zig");
+        rtc.init();
+        time.init(rtc.boot_epoch);
     } else {
-        // aarch64: no RTC driver yet, start with epoch 0
         time.init(0);
     }
 

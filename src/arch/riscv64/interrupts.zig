@@ -91,6 +91,22 @@ export fn handleExceptionRv(frame_ptr: u64, scause: u64, stval: u64) callconv(.c
             proc.exit_status = 128;
             proc.state = .dead;
 
+            // Container cleanup: update container state if init faulted
+            if (proc.container_id != 0xFF) {
+                const container = @import("../../container.zig");
+                if (container.getById(proc.container_id)) |ct| {
+                    container.removeProcess(ct);
+                    if (ct.init_pid != null and ct.init_pid.? == proc.pid) {
+                        container.killAllProcessesExcept(ct, proc.pid);
+                        ct.state = .failed;
+                        ct.init_pid = null;
+                    }
+                }
+            }
+
+            // Kill orphaned children (Fornax orphan policy)
+            process.killChildren(proc.pid);
+
             // Wake parent if it's blocked in wait() for this child
             if (proc.parent_pid) |ppid| {
                 if (process.getByPid(ppid)) |parent| {
