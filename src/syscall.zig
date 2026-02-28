@@ -35,6 +35,7 @@ pub const sysPipe = root.sysPipe;
 pub const sysPread = root.sysPread;
 pub const sysPwrite = root.sysPwrite;
 pub const sysExit = root.sysExit;
+pub const sysThreadExit = root.sysThreadExit;
 pub const sysWait = root.sysWait;
 pub const sysGetpid = root.sysGetpid;
 pub const sysSpawn = root.sysSpawn;

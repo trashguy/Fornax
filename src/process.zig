@@ -1153,7 +1153,10 @@ fn scheduleNextImpl() noreturn {
         }
 
         if (any_alive) {
-            // BSP: poll network
+            // BSP: poll network before and after halt.
+            // Pre-halt poll handles frames delivered by previous main-loop
+            // iterations.  Post-halt poll handles frames delivered while
+            // the vCPU was halted (QEMU processes SLIRP during WFI/HLT).
             if (my_core == 0) {
                 const net = @import("net.zig");
                 net.poll();
@@ -1178,6 +1181,12 @@ fn scheduleNextImpl() noreturn {
                     asm volatile ("hlt");
                     asm volatile ("cli");
                 },
+            }
+
+            // Post-halt poll — process frames QEMU delivered during WFI/HLT
+            if (my_core == 0) {
+                const net = @import("net.zig");
+                net.poll();
             }
             continue;
         } else {

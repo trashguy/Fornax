@@ -219,9 +219,10 @@ pub fn sysCntrOp(op: u64, cntr_id: u64, a0: u64, a1: u64, a2: u64) u64 {
             child.compat = @intFromEnum(ct.compat);
             child.uid = 0; // Container exec runs as root inside container
             child.gid = 0;
-            // Re-parent: exec'd process belongs to the container init, not the
-            // management tool (fnx exec), so it survives detached mode.
-            child.parent_pid = ct.init_pid;
+            // Parent to the calling process (fnx exec) so it can wait() for
+            // the exec'd process to finish.  The container still tracks the
+            // process via addProcess; if fnx is killed, killChildren cleans up.
+            child.parent_pid = caller.pid;
             container.addProcess(ct);
 
             klog.info("[cntr_exec] container=");

@@ -57,7 +57,7 @@ pub fn spawnThread(comptime func: fn (*anyopaque) callconv(.c) void, arg: ?*anyo
             \\ popq %%r12
             \\ popq %%rdi
             \\ callq *%%r12
-            \\ movl $14, %%eax
+            \\ movl $41, %%eax
             \\ xorl %%edi, %%edi
             \\ syscall
             \\ 1:
@@ -77,7 +77,7 @@ pub fn spawnThread(comptime func: fn (*anyopaque) callconv(.c) void, arg: ?*anyo
             \\ ld a0, 8(sp)
             \\ addi sp, sp, 16
             \\ jalr t0
-            \\ li a7, 14
+            \\ li a7, 41
             \\ li a0, 0
             \\ ecall
             \\ 1:
@@ -97,7 +97,7 @@ pub fn spawnThread(comptime func: fn (*anyopaque) callconv(.c) void, arg: ?*anyo
             \\ ldr x0, [sp, #8]
             \\ add sp, sp, #16
             \\ blr x9
-            \\ mov x8, #14
+            \\ mov x8, #41
             \\ mov x0, #0
             \\ svc #0
             \\ 1:

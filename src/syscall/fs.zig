@@ -38,7 +38,7 @@ pub fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
         if (fd == 0 and proc.getFdEntry(0) == null) {
             // Default: keyboard control (Plan 9 style: write to fd 0)
             const keyboard = @import("../keyboard.zig");
-            if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+            if (buf_ptr == 0 or buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
             if (count == 0) return 0;
             const buf: [*]const u8 = @ptrFromInt(buf_ptr);
             const len: usize = @intCast(@min(count, 64));
@@ -47,7 +47,7 @@ pub fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
         }
         if ((fd == 1 or fd == 2) and proc.getFdEntry(@intCast(fd)) == null) {
             // Default: direct framebuffer console + serial (routed to process's VT)
-            if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+            if (buf_ptr == 0 or buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
             if (count == 0) return 0;
             const buf: [*]const u8 = @ptrFromInt(buf_ptr);
             const len: usize = @intCast(@min(count, 4096));
@@ -60,7 +60,7 @@ pub fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
     const proc = process.getCurrent() orelse return EBADF;
     const entry = proc.getFdEntry(@intCast(fd)) orelse return EBADF;
 
-    if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+    if (buf_ptr == 0 or buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
     if (count == 0) return 0;
 
     // Pipe fd: write to pipe buffer
@@ -618,7 +618,7 @@ pub fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
         if (proc0.getFdEntry(0) == null) {
             // Default: console read (stdin from keyboard)
             const keyboard = @import("../keyboard.zig");
-            if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+            if (buf_ptr == 0 or buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
             if (count == 0) return 0;
 
             // Check if data is already available
@@ -642,7 +642,7 @@ pub fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
     const proc = process.getCurrent() orelse return EBADF;
     const entry_ptr = proc.getFdEntryPtr(@intCast(fd)) orelse return EBADF;
 
-    if (buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+    if (buf_ptr == 0 or buf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
     if (count == 0) return 0;
 
     // Pipe fd: read from pipe buffer

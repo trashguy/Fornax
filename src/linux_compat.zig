@@ -171,7 +171,10 @@ pub fn linuxDispatch(nr: u64, a: u64, b: u64, c: u64, d: u64, e: u64) u64 {
         LNX_FCHMOD => 0, // no-op for now
 
         // ── Process ───────────────────────────────────────────────
-        LNX_EXIT, LNX_EXIT_GROUP => {
+        LNX_EXIT => {
+            syscall.sysThreadExit(a);
+        },
+        LNX_EXIT_GROUP => {
             syscall.sysExit(a);
         },
         LNX_GETPID, LNX_GETTID => syscall.sysGetpid(0),

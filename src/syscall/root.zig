@@ -58,6 +58,7 @@ pub const SYS = enum(u64) {
     futex = 38,
     ipc_pair = 39,
     cntr_op = 40,
+    thread_exit = 41,
 };
 
 /// Error return values.
@@ -216,6 +217,7 @@ pub const sysPread = fs.sysPread;
 pub const sysPwrite = fs.sysPwrite;
 
 pub const sysExit = proc.sysExit;
+pub const sysThreadExit = proc.sysThreadExit;
 pub const sysWait = proc.sysWait;
 pub const sysGetpid = proc.sysGetpid;
 pub const sysSpawn = proc.sysSpawn;
@@ -320,6 +322,7 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         .unmount => sysUnmount(arg0, arg1),
         .ipc_pair => sysIpcPair(arg0),
         .cntr_op => sysCntrOp(arg0, arg1, arg2, arg3, arg4),
+        .thread_exit => sysThreadExit(arg0),
     };
 
     @import("../trace.zig").trace(.syscall_exit, @truncate(nr));

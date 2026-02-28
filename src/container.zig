@@ -242,32 +242,63 @@ pub fn killAllProcessesExcept(ct: *Container, except_pid: ?u32) void {
     const tg_mod = @import("thread_group.zig");
     const table = process.getProcessTable();
     for (table) |*p| {
-        if (p.state != .free and p.state != .dead and p.container_id == ct.id) {
-            if (except_pid) |ep| {
-                if (p.pid == ep) continue;
-            }
-            // Clean up ether and pipe fds before killing.
-            // Thread groups share the fd table, so getFdSlice returns
-            // the shared table — setting entries to null prevents
-            // double-free when we process sibling threads.
-            const fds = tg_mod.getFdSlice(p);
-            for (0..process.MAX_FDS) |i| {
-                if (fds[i]) |entry| {
-                    if (entry.fd_type == .dev_ether) {
-                        ether_mod.freeClient(entry.ether_client);
-                        fds[i] = null;
-                    }
-                    if (entry.fd_type == .pipe) {
-                        if (entry.pipe_is_read) {
-                            pipe_mod.closeReadEnd(entry.pipe_id);
-                        } else {
-                            pipe_mod.closeWriteEnd(entry.pipe_id);
+        if (p.container_id != ct.id) continue;
+        if (except_pid) |ep| {
+            if (p.pid == ep) continue;
+        }
+        // Use atomic state transition for SMP safety (mirrors killChildren).
+        // On SMP, a process may be .running on another core mid-syscall;
+        // we must not touch its FDs or free resources while it executes.
+        const state = @atomicLoad(process.ProcessState, &p.state, .acquire);
+        switch (state) {
+            .blocked, .ready => {
+                // Safe to clean up — process is not executing on any core.
+                // CAS ensures another core doesn't start it between check and kill.
+                if (@cmpxchgStrong(process.ProcessState, &p.state, state, .dead, .seq_cst, .seq_cst) == null) {
+                    // Clean up ether, pipe, and IPC fds before killing.
+                    // Thread groups share the fd table, so getFdSlice returns
+                    // the shared table — setting entries to null prevents
+                    // double-free when we process sibling threads.
+                    const fds = tg_mod.getFdSlice(p);
+                    for (0..process.MAX_FDS) |i| {
+                        if (fds[i]) |entry| {
+                            if (entry.fd_type == .dev_ether) {
+                                ether_mod.freeClient(entry.ether_client);
+                                fds[i] = null;
+                            } else if (entry.fd_type == .pipe) {
+                                if (entry.pipe_is_read) {
+                                    pipe_mod.closeReadEnd(entry.pipe_id);
+                                } else {
+                                    pipe_mod.closeWriteEnd(entry.pipe_id);
+                                }
+                                fds[i] = null;
+                            } else if (entry.fd_type == .ipc) {
+                                // IPC fds: null to prevent stale channel refs.
+                                // Don't send T_CLOSE — the server may also be
+                                // dying in this same container teardown.
+                                fds[i] = null;
+                            }
                         }
-                        fds[i] = null;
                     }
+                } else {
+                    // State changed between load and CAS — process transitioned
+                    // on another core. Mark as zombie orphan for safe reclamation.
+                    p.parent_pid = null;
                 }
-            }
-            p.state = .dead;
+            },
+            .running => {
+                // Process is executing on another core — cannot safely
+                // access its FDs or free memory. Mark as zombie orphan;
+                // process.create() will reclaim the slot once the core
+                // finishes with it.
+                @atomicStore(process.ProcessState, &p.state, .zombie, .release);
+                p.parent_pid = null;
+            },
+            .zombie, .dead => {
+                // Already dying — just orphan for reclamation
+                p.parent_pid = null;
+            },
+            .free => {},
         }
     }
 }

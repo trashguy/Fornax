@@ -1,7 +1,6 @@
 /// IPC and futex syscall handlers.
 const process = @import("../process.zig");
 const ipc = @import("../ipc.zig");
-const klog = @import("../klog.zig");
 const root = @import("root.zig");
 
 const ENOSYS = root.ENOSYS;

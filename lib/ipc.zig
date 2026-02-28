@@ -11,7 +11,7 @@ pub const IpcMessage = extern struct {
     data: [4096]u8,
 
     pub fn init(tag: u32) IpcMessage {
-        return .{ .tag = tag, .data_len = 0, .data = undefined };
+        return .{ .tag = tag, .data_len = 0, .data = .{0} ** 4096 };
     }
 
     pub fn initWithData(tag: u32, payload: []const u8) IpcMessage {

@@ -332,6 +332,93 @@ pub fn sysExit(status: u64) noreturn {
     process.scheduleNext();
 }
 
+/// Thread-only exit (syscall 41). Exits only the calling thread without
+/// killing siblings in the thread group. This is the `exit()` counterpart
+/// to the `exit_group()` semantics of sysExit.
+pub fn sysThreadExit(status: u64) noreturn {
+    const proc = process.getCurrent() orelse process.scheduleNext();
+
+    klog.debug("[Thread ");
+    klog.debugDec(proc.pid);
+    klog.debug(" exited with status ");
+    klog.debugDec(status);
+    klog.debug("]\n");
+
+    proc.exit_status = @truncate(status);
+
+    // CLONE_CHILD_CLEARTID: clear tid at user address and futex-wake joiners.
+    // Must happen before freeUserMemory (user address space still active).
+    if (proc.ctid_ptr != 0 and proc.ctid_ptr < 0x0000_8000_0000_0000) {
+        const futex_mod = @import("../futex.zig");
+        const ptr: *volatile u32 = @ptrFromInt(proc.ctid_ptr);
+        ptr.* = 0;
+        const pml4_phys: u64 = if (proc.thread_group) |tg|
+            (if (tg.pml4) |p| @intFromPtr(p) else 0)
+        else
+            (if (proc.pml4) |p| @intFromPtr(p) else 0);
+        futex_mod.wakeOne(pml4_phys, proc.ctid_ptr);
+        proc.ctid_ptr = 0;
+    }
+
+    // Close pipe/ether fds only if this is the last thread in the group
+    // (otherwise sibling threads may still need the shared fds).
+    const is_last_thread = if (proc.thread_group) |tg| blk: {
+        tg.lock.lock();
+        const last = tg.ref_count <= 1;
+        tg.lock.unlock();
+        break :blk last;
+    } else true;
+
+    if (is_last_thread) {
+        const pipe_mod = @import("../pipe.zig");
+        const ether_mod = @import("../ether.zig");
+        const fds = process.thread_group.getFdSlice(proc);
+        for (0..process.MAX_FDS) |i| {
+            if (fds[i]) |entry| {
+                if (entry.fd_type == .pipe) {
+                    if (entry.pipe_is_read) {
+                        pipe_mod.closeReadEnd(entry.pipe_id);
+                    } else {
+                        pipe_mod.closeWriteEnd(entry.pipe_id);
+                    }
+                    fds[i] = null;
+                }
+                if (entry.fd_type == .dev_ether) {
+                    ether_mod.freeClient(entry.ether_client);
+                    fds[i] = null;
+                }
+                if (entry.server_handle > 0) {
+                    if (ipc.getChannel(entry.channel_id)) |chan| {
+                        chan.lock.lock();
+                        const has_waiter = chan.client.server_waiter_count > 0 or
+                            (chan.client.recv_waiting and chan.client.blocked_pid != 0);
+                        const queue_empty = chan.client.pending_count == 0;
+                        chan.lock.unlock();
+                        if (has_waiter and queue_empty) {
+                            proc.ipc_msg = ipc.Message.init(.t_close);
+                            writeU32LE(proc.ipc_msg.data_buf[0..4], entry.server_handle);
+                            proc.ipc_msg.data_len = 4;
+                            sendToServer(chan, proc);
+                        }
+                    }
+                    fds[i] = null;
+                }
+            }
+        }
+    }
+
+    // Free user address space (releases thread group ref; last thread frees address space)
+    process.freeUserMemory(proc);
+
+    // Kernel stack: deferred free — we're still running on it.
+    proc.needs_stack_free = true;
+
+    // Orphan zombie — no parent waking, no sibling killing.
+    proc.state = .zombie;
+    proc.parent_pid = null;
+    process.scheduleNext();
+}
+
 /// brk(new_brk) — adjust program break (heap top).
 /// If new_brk == 0, return current brk. Otherwise, expand heap by allocating
 /// and mapping pages for the new region, checking quotas.
