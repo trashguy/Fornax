@@ -191,16 +191,11 @@ pub fn handleException(frame: *idt.ExceptionFrame) void {
             proc.exit_status = @truncate(128 + frame.vector);
             proc.state = .dead;
 
-            // Container cleanup: update container state if init faulted
-            if (proc.container_id != 0xFF) {
-                const container = @import("../../container.zig");
-                if (container.getById(proc.container_id)) |ct| {
-                    container.removeProcess(ct);
-                    if (ct.init_pid != null and ct.init_pid.? == proc.pid) {
-                        container.killAllProcessesExcept(ct, proc.pid);
-                        ct.state = .failed;
-                        ct.init_pid = null;
-                    }
+            // Process group cleanup: decrement count on fault
+            if (proc.group_id != 0xFF) {
+                const pg = @import("../../process_group.zig");
+                if (pg.getById(proc.group_id)) |g| {
+                    pg.removeProcess(g);
                 }
             }
 

@@ -68,6 +68,12 @@ pub const STATUS_FAILED: u8 = 128;
 pub const VIRTIO_NET_F_MAC: u32 = 1 << 5;
 pub const VIRTIO_NET_F_STATUS: u32 = 1 << 16;
 pub const VIRTIO_NET_F_MRG_RXBUF: u32 = 1 << 15;
+pub const VIRTIO_NET_F_CSUM: u32 = 1 << 0;
+pub const VIRTIO_NET_F_GUEST_CSUM: u32 = 1 << 1;
+pub const VIRTIO_NET_F_HOST_TSO4: u32 = 1 << 11;
+pub const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
+pub const VIRTIO_NET_HDR_GSO_NONE: u8 = 0;
+pub const VIRTIO_NET_HDR_GSO_TCPV4: u8 = 1;
 
 /// A virtqueue descriptor.
 pub const VirtqDesc = extern struct {
@@ -338,6 +344,37 @@ pub fn addBuffer(vq: *Virtqueue, phys_addr: u64, len: u32, device_writable: bool
     vq.next_desc = idx + 1;
 
     return idx;
+}
+
+/// Add a buffer at a specific descriptor index (for pre-allocated TX pools).
+/// Unlike `addBuffer`, does NOT increment `next_desc` — caller manages descriptor ownership.
+pub fn addBufferAt(vq: *Virtqueue, idx: u16, phys_addr: u64, len: u32, device_writable: bool) bool {
+    if (idx >= vq.size) return false;
+
+    const desc: *volatile VirtqDesc = @ptrCast(&vq.desc[idx]);
+    desc.addr = phys_addr;
+    desc.len = len;
+    desc.flags = if (device_writable) VRING_DESC_F_WRITE else 0;
+    desc.next = 0;
+
+    if (comptime @import("builtin").cpu.arch == .aarch64) {
+        asm volatile ("dc cvac, %[addr]" : : [addr] "r" (@intFromPtr(desc)));
+        asm volatile ("dsb sy" ::: .{ .memory = true });
+    }
+
+    const avail_idx = @as(*volatile u16, @ptrCast(&vq.avail.idx)).*;
+    @as(*volatile u16, @ptrFromInt(@intFromPtr(&vq.avail_ring[avail_idx % vq.size]))).* = idx;
+
+    memoryBarrier();
+
+    @as(*volatile u16, @ptrCast(&vq.avail.idx)).* = avail_idx +% 1;
+
+    if (comptime @import("builtin").cpu.arch == .aarch64) {
+        asm volatile ("dc cvac, %[addr]" : : [addr] "r" (@intFromPtr(&vq.avail.idx)));
+        asm volatile ("dsb sy" ::: .{ .memory = true });
+    }
+
+    return true;
 }
 
 /// Add a 3-descriptor chain to the virtqueue (for virtio-blk requests).

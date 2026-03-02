@@ -45,6 +45,9 @@
 | 1001a-d,l | Foundation libraries (crc32, sha256, deflate, tar, json, http) |
 | 1001i | TCC cross-compiled as POSIX program |
 | 1002 | Container system (fnx CLI, Containerfile, Linux compat, bridge + NAT) |
+| 1010 | Socket shim — linux_socket.zig rewritten to use Plan 9 /net/ file ops via IPC to netd |
+| 1011 | Kernel network stack deleted — src/net/ gutted to frame delivery only, ~4000 lines removed |
+| 1012 | Container orchestration to userspace (process groups, SYS 46 proc_setup, cntrd server, spawn_blocked) |
 | 3A-3D | Userspace networking (netd, per-realm stacks, /dev/ether0, bridge server) |
 | — | Kernel trace buffer (`/dev/trace`, per-CPU ring buffers, ktrace command) |
 | — | Time subsystem + cron (RTC, wallclock, `/dev/time`, date/uptime, crond) |
@@ -74,6 +77,9 @@
 | 12 | Multi-core boot with SMP scheduling | A-G |
 | 13 | CoW filesystem with B-tree persistent storage | 300-313 |
 | 14 | Container runs with Linux binary compat | 1002 |
+| 29 | Container iperf3 uses container IP (10.0.1.x) via netd IPC | 1010 |
+| 30 | Kernel has no TCP/IP stack — all networking via netd | 1011 |
+| 31 | Container lifecycle managed entirely from userspace | 1012 |
 | 15 | C program compiled and run on Fornax | 1000 |
 | 16 | Userspace TCP/IP stack serves per-realm networking | 3A-3D |
 | 17 | Crashed server transparently restarts with dependency ordering | 130 |

@@ -5,16 +5,16 @@
 ```
 User Programs / Containers (native or OCI-imported)
 ────────────────────────────────────────────────────
-Userspace File Servers (netd, fxfs, partfs, crond, bridge...)
+Userspace File Servers (netd, fxfs, partfs, crond, cntrd, bridge...)
 ────────────────────────────────────────────────────
 Microkernel
 ├── Memory: PMM + heap + paging + address spaces
 ├── Scheduling: SMP with per-core run queues + work stealing
 ├── IPC: synchronous message passing (channels)
 ├── Namespaces: per-process mount tables
-├── Syscalls: Plan 9-inspired (~41 calls)
+├── Syscalls: Plan 9-inspired (~46 calls)
 ├── Fault supervisor: VMS-style monitor + restart + backoff
-├── Containers: namespace + quotas + rootfs + Linux compat
+├── Process groups: resource quotas + group kill (container support)
 ├── Threads: clone + futex + thread groups
 └── Drivers: virtio-blk, NVMe, AHCI, xHCI USB, virtio-net
 ```
@@ -43,7 +43,7 @@ POSIX programs run in two modes, using different levels of isolation:
 
 **POSIX realms** are for interactive/CLI programs (tcc, etc.). The crt0 calls `rfork(RFNAMEG)` to create a new namespace, mounts musl/libposix and POSIX /dev, then loads the real binary. The realm is ephemeral — lives and dies with the process.
 
-**Containers** are for managed, long-running services (nginx, postgres). They have their own rootfs image, resource quotas, lifecycle management (create/start/stop/destroy), and potentially their own init process. Created explicitly via `fnx` CLI or `/cntr/` virtual filesystem.
+**Containers** are for managed, long-running services (nginx, postgres). They have their own rootfs image, resource quotas, lifecycle management (create/start/stop/destroy), and potentially their own init process. Created explicitly via `fnx` CLI or `/cntr/` file interface (served by `srv/cntrd`).
 
 ```
 ┌───────────────────────────────────────────────────────────┐
@@ -79,7 +79,7 @@ POSIX programs run in two modes, using different levels of isolation:
 
 ### Processes & Scheduling
 
-- **Process model** (`src/process.zig`): Per-process address space, kernel stack, FD table (32 entries), namespace, uid/gid, thread group, container id, core affinity. MAX_PROCESSES=128.
+- **Process model** (`src/process.zig`): Per-process address space, kernel stack, FD table (32 entries), namespace, uid/gid, thread group, group_id, core affinity. MAX_PROCESSES=128.
 - **SMP scheduling** (`src/percpu.zig`): Per-core run queues with CAS-based state transitions. Work stealing (`stealHalf`). Least-loaded core assignment for new processes. TLB shootdown via IPI.
 - **Kernel threads** (`src/thread_group.zig`): SYS 37 clone, SYS 38 futex. Shared page tables, fd table, namespace within a thread group. 128 futex waiters.
 - **ELF64 loader** (`src/elf.zig`): Parses PT_LOAD segments, allocates pages, maps with correct flags. Returns entry point and program break.
@@ -126,18 +126,18 @@ Runtime control via `/proc/supervisor` (read status table) and `/proc/supervisor
 
 ### Containers
 
-Container system (`src/container.zig`, `-Dcontainers=true`):
+Container management is fully in userspace. The kernel provides composable primitives; policy lives in `srv/cntrd` and `cmd/fnx`.
 
-```
-/cntr/clone                       allocate container slot
-write(/cntr/N/ctl, "rootfs ...")  set isolated rootfs
-write(/cntr/N/ctl, "compat ...")  set compat mode (fornax/linux)
-SYS 40 cntr_start(N, elf, argv)  load ELF + start init process
-```
+**Kernel primitives** (`src/process_group.zig`, `src/syscall/proc_setup.zig`):
+- Process groups: lightweight resource tracking (quotas, process count, page count, group kill)
+- `sysSpawn` blocked mode: create a process in `.blocked` state for configuration
+- `sysProcSetup` (SYS 46): composable ops (mount, setfd, setcompat, setquota, setargv, clearnm, mountpfx, clonenm, ready)
 
-Resource quotas enforce container-wide limits on memory pages and process count. Per-container networking via bridge server. Linux syscall compatibility (`src/linux_compat.zig`) enables running Alpine/musl binaries.
+**Userspace servers**:
+- `srv/cntrd`: IPC server at `/cntr/` — container metadata, clone/status/ctl/procs file interface
+- `cmd/fnx`: podman-familiar CLI (`fnx run`, `fnx ps`, `fnx build`, `fnx pull`). Uses `spawn_blocked` + `proc_setup` for lifecycle
 
-The `fnx` CLI provides a podman-familiar interface (`fnx run`, `fnx ps`, `fnx build`, `fnx pull`). OCI registry pull with Docker Hub support (bearer auth, manifest list, streaming extraction). See `docs/containers.md`.
+Resource quotas enforce group-wide limits on memory pages and process count. Per-container networking via bridge server. Linux syscall compatibility (`src/linux_compat.zig`) enables running Alpine/musl binaries. OCI registry pull with Docker Hub support (bearer auth, manifest list, streaming extraction). See `docs/containers.md`.
 
 ### Virtual Filesystems
 
@@ -160,7 +160,7 @@ Kernel-intercepted virtual paths (no userspace server needed):
 | `/dev/sysstat` | Per-core counters (ctx_switches, syscalls, interrupts) |
 | `/dev/pid`, `/dev/user` | Current process info |
 | `/dev/consctl` | Console raw/echo mode |
-| `/cntr/` | Container management |
+| `/cntr/` | Container management (via cntrd server) |
 | `/net/*` | Network stack (when netd not mounted) |
 
 ### Kernel Pipes
@@ -213,7 +213,13 @@ Plan 9-inspired. NOT Linux-compatible. No `ioctl` — device control via text wr
 | 37 | `clone` | Create kernel thread |
 | 38 | `futex` | Fast userspace mutex (wait/wake) |
 | 39 | `ipc_pair` | Create IPC channel pair |
-| 40 | `cntr_op` | Container operations (start/stop/destroy/exec) |
+| 40 | — | *(reserved)* |
+| 41 | `shmem_create` | Create shared memory region |
+| 42 | `shmem_map` | Map shared memory into address space |
+| 43 | `shmem_destroy` | Destroy shared memory region |
+| 44 | `time` | Get wall clock / uptime / millis / micros |
+| 45 | `thread_exit` | Exit current thread |
+| 46 | `proc_setup` | Configure a blocked process (mount/setfd/compat/quota/ready/...) |
 
 ## Hardware Support
 
@@ -262,7 +268,7 @@ main.zig: Entry point
   ├── Process manager init
   ├── SYSCALL MSR setup / per-CPU state init
   ├── Fault supervisor init
-  ├── Container init
+  ├── Process group init
   ├── PCI enumeration
   ├── Block device init (NVMe > AHCI > virtio-blk)
   ├── Network init (virtio-net)
@@ -272,6 +278,7 @@ main.zig: Entry point
   ├── Spawn boot services:
   │   ├── partfs (GPT partition server at /dev/)
   │   ├── fxfs (filesystem server at /)
+  │   ├── cntrd (container management server at /cntr/)
   │   └── init (PID 1, spawns netd, crond, login on VTs)
   └── scheduleNext() — picks first ready process (never returns)
 ```
@@ -283,6 +290,5 @@ Compile-time feature flags:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-Dposix=true` | `false` | Enable POSIX/C programs (musl libc + shim + TCC) |
-| `-Dcontainers=true` | `false` | Enable container system (fnx CLI, Linux compat, bridge, TLS) |
 | `-Dcluster=true` | `false` | Enable clustering (gossip discovery, 9P remote namespaces) |
 | `-Dviceroy=true` | `false` | Enable deployment tooling (implies `-Dcluster=true`) |

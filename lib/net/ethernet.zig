@@ -49,6 +49,21 @@ pub fn build(buf: []u8, dst: [6]u8, src: [6]u8, ethertype: u16, payload: []const
     return total;
 }
 
+/// Build Ethernet header in-place. Payload is already at buf[HEADER_SIZE..].
+/// Returns total length (header + payload) or null on error.
+pub fn buildHeaderOnly(buf: []u8, dst: [6]u8, src: [6]u8, ethertype: u16, payload_len: usize) ?usize {
+    const total = HEADER_SIZE + payload_len;
+    if (total > buf.len) return null;
+    if (payload_len > MAX_PAYLOAD) return null;
+
+    @memcpy(buf[0..6], &dst);
+    @memcpy(buf[6..12], &src);
+    buf[12] = @truncate(ethertype >> 8);
+    buf[13] = @truncate(ethertype);
+
+    return total;
+}
+
 pub const BROADCAST: [6]u8 = .{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
 pub fn macEqual(a: [6]u8, b: [6]u8) bool {

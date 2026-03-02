@@ -89,7 +89,7 @@ pub fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
     const reply_data_ptr: [*]const u8 = @ptrFromInt(reply_msg_ptr + 8);
 
     const reply_tag = reply_tag_ptr.*;
-    const reply_data_len = @min(reply_len_ptr.*, ipc.MAX_MSG_DATA);
+    const reply_data_len = @min(reply_len_ptr.*, ipc.effective_max_data);
 
     // Find the client being served by this server thread
     const serving_pid = proc.ipc_serving_client;
@@ -117,7 +117,7 @@ pub fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
         .read => {
             if (is_ok) {
                 if (reply_data_len > 0 and client_proc.ipc_recv_buf_ptr != 0) {
-                    client_proc.ipc_msg = ipc.Message.init(.r_ok);
+                    client_proc.ipc_msg.reset(.r_ok);
                     client_proc.ipc_msg.data_len = reply_data_len;
                     @memcpy(client_proc.ipc_msg.data_buf[0..reply_data_len], reply_data_ptr[0..reply_data_len]);
                     client_proc.ipc_pending_msg = &client_proc.ipc_msg;
@@ -149,7 +149,7 @@ pub fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
         },
         .stat => {
             if (is_ok and reply_data_len > 0 and client_proc.ipc_recv_buf_ptr != 0) {
-                client_proc.ipc_msg = ipc.Message.init(.r_ok);
+                client_proc.ipc_msg.reset(.r_ok);
                 const copy_len = @min(reply_data_len, 64);
                 client_proc.ipc_msg.data_len = copy_len;
                 @memcpy(client_proc.ipc_msg.data_buf[0..copy_len], reply_data_ptr[0..copy_len]);
@@ -174,7 +174,7 @@ pub fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
                     fd_entry.server_handle = handle;
                 }
                 // Phase 1 done. Send T_STAT to same server.
-                client_proc.ipc_msg = ipc.Message.init(.t_stat);
+                client_proc.ipc_msg.reset(.t_stat);
                 writeU32LE(client_proc.ipc_msg.data_buf[0..4], handle);
                 client_proc.ipc_msg.data_len = 4;
                 client_proc.pending_op = .linux_stat_done;
@@ -202,7 +202,7 @@ pub fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
         .linux_stat_done => {
             // Linux compat multi-step stat: stat phase completed. Translate + close.
             if (is_ok and reply_data_len > 0 and client_proc.ipc_recv_buf_ptr != 0) {
-                client_proc.ipc_msg = ipc.Message.init(.r_ok);
+                client_proc.ipc_msg.reset(.r_ok);
                 const copy_len = @min(reply_data_len, 64);
                 client_proc.ipc_msg.data_len = copy_len;
                 @memcpy(client_proc.ipc_msg.data_buf[0..copy_len], reply_data_ptr[0..copy_len]);
@@ -221,11 +221,20 @@ pub fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
             client_proc.linux_stat_fd = 0;
             client_proc.linux_stat_buf = 0;
         },
-        .console_read, .net_read, .net_connect, .net_listen, .dns_query, .icmp_read, .pipe_read, .pipe_write, .sleep, .ether_read => {},
+        .linux_sock_step => {
+            const linux_socket = @import("../linux_socket.zig");
+            const still_blocked = linux_socket.handleResume(client_proc, is_ok, reply_data_ptr, reply_data_len);
+            if (still_blocked) {
+                proc.ipc_serving_client = 0;
+                return 0; // Don't markReady — still blocked
+            }
+            // Fall through to markReady
+        },
+        .console_read, .pipe_read, .pipe_write, .sleep, .ether_read, .poll_wait => {},
         .none => {
             if (is_ok) {
                 if (client_proc.ipc_recv_buf_ptr != 0 and reply_data_len > 0) {
-                    client_proc.ipc_msg = ipc.Message.init(.r_ok);
+                    client_proc.ipc_msg.reset(.r_ok);
                     client_proc.ipc_msg.data_len = reply_data_len;
                     @memcpy(client_proc.ipc_msg.data_buf[0..reply_data_len], reply_data_ptr[0..reply_data_len]);
                     client_proc.ipc_pending_msg = &client_proc.ipc_msg;

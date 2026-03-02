@@ -132,8 +132,8 @@ test "extern struct layout: tag at offset 0, data_len at offset 4" {
     try expectEqual(@as(u8, 0x00), base[7]);
 }
 
-test "extern struct size: 4104 bytes" {
-    try expectEqual(@as(usize, 4104), @sizeOf(ipc.IpcMessage));
+test "extern struct size: 65544 bytes" {
+    try expectEqual(@as(usize, 65544), @sizeOf(ipc.IpcMessage));
 }
 
 test "extern struct field offsets" {

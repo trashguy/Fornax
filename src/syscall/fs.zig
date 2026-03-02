@@ -22,7 +22,6 @@ const writeU64LE = root.writeU64LE;
 const readU32LE = root.readU32LE;
 const sendToServer = root.sendToServer;
 const strEql = root.strEql;
-const hasNetMount = root.hasNetMount;
 
 /// write(fd, buf, count) → bytes_written
 /// fd 1/2 → direct framebuffer console + serial (bootstrap path).
@@ -80,51 +79,9 @@ pub fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
         process.scheduleNext();
     }
 
-    // Net fd: dispatch to netfs
-    if (entry.fd_type == .net) {
-        const net = @import("../net.zig");
-        const netfs = net.netfs;
-        const tcp = net.tcp;
-        const dns = net.dns;
-
-        const buf: [*]const u8 = @ptrFromInt(buf_ptr);
-        const data_len: u16 = @intCast(@min(count, 4096));
-
-        const result = netfs.netWrite(entry.net_kind, entry.net_conn, buf[0..data_len]);
-        if (result) |n| {
-            return n;
-        }
-
-        // null means block — depends on the kind
-        if (entry.net_kind == .tcp_ctl) {
-            // Block until connect completes
-            tcp.setConnectWaiter(entry.net_conn, @intCast(proc.pid));
-            proc.pending_op = .net_connect;
-            proc.pending_fd = @intCast(fd);
-            proc.syscall_ret = data_len;
-            proc.state = .blocked;
-            process.scheduleNext();
-        } else if (entry.net_kind == .dns_query) {
-            // Block until DNS response arrives
-            dns.setWaiter(@intCast(proc.pid));
-            proc.pending_op = .dns_query;
-            proc.pending_fd = @intCast(fd);
-            proc.syscall_ret = data_len;
-            proc.state = .blocked;
-            process.scheduleNext();
-        }
-
-        return 0;
-    }
-
     // Proc fd: write "kill" to /proc/N/ctl
     if (entry.fd_type == .proc) {
         return devfiles.procWrite(entry, buf_ptr, count);
-    }
-
-    // Container fd: write to /cntr/N/ctl
-    if (entry.fd_type == .cntr) {
-        return devfiles.cntrWrite(entry, buf_ptr, count);
     }
 
     // Virtual device fds: discard writes, return count
@@ -168,6 +125,11 @@ pub fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
         return len;
     }
 
+    // /dev/ipcctl: write sets effective_max_data (root only)
+    if (entry.fd_type == .dev_ipcctl) {
+        return devfiles.ipcctlWrite(buf_ptr, count);
+    }
+
     // /dev/time: write epoch seconds to adjust clock (root only)
     if (entry.fd_type == .dev_time) {
         const caller = process.getCurrent() orelse return EBADF;
@@ -201,8 +163,10 @@ pub fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
     // Raw Ethernet write: ctl commands or send frame via virtio-net
     if (entry.fd_type == .dev_ether) {
         const ether_mod = @import("../ether.zig");
+        const virtio_net = @import("../virtio_net.zig");
         const src: [*]const u8 = @ptrFromInt(buf_ptr);
-        const len: usize = @intCast(@min(count, 1518));
+        const max_frame: usize = if (virtio_net.hasTsoOffload()) virtio_net.TSO_MAX_FRAME else 1518;
+        const len: usize = @intCast(@min(count, max_frame));
         // Check for ctl commands (short text strings)
         if (len <= 12) {
             var cmd_len = len;
@@ -213,8 +177,21 @@ pub fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
                 return len;
             }
         }
-        // Not a ctl command — send as raw Ethernet frame
-        const virtio_net = @import("../virtio_net.zig");
+        // TSO: large TCP frames (> 1514) are offloaded to virtio device
+        if (len > 1514 and virtio_net.hasTsoOffload()) {
+            _ = virtio_net.sendTso(src[0..len], 1460);
+            return len;
+        }
+        // TCP checksum offload: if device supports CSUM and frame is IPv4+TCP,
+        // set NEEDS_CSUM so the device computes the checksum.
+        if (virtio_net.hasCsumOffload() and len >= 34) {
+            const ethertype = @as(u16, src[12]) << 8 | src[13];
+            if (ethertype == 0x0800 and src[23] == 6) { // IPv4 + TCP
+                const ip_hdr_len: u16 = @as(u16, src[14] & 0x0F) * 4;
+                _ = virtio_net.sendWithCsum(src[0..len], 14 + ip_hdr_len, 16);
+                return len;
+            }
+        }
         _ = virtio_net.send(src[0..len]);
         return len;
     }
@@ -224,10 +201,10 @@ pub fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
 
     // Server-backed fd: T_WRITE with [handle: u32][data...]
     if (entry.server_handle > 0) {
-        const max_data = ipc.MAX_MSG_DATA - 4;
+        const max_data = ipc.effective_max_data - 4;
         const data_len: u32 = @intCast(@min(count, max_data));
 
-        proc.ipc_msg = ipc.Message.init(.t_write);
+        proc.ipc_msg.reset(.t_write);
         writeU32LE(proc.ipc_msg.data_buf[0..4], entry.server_handle);
         @memcpy(proc.ipc_msg.data_buf[4..][0..data_len], buf[0..data_len]);
         proc.ipc_msg.data_len = 4 + data_len;
@@ -241,9 +218,9 @@ pub fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
     }
 
     // Raw IPC write (existing behavior for non-server-backed channels)
-    const len: u32 = @intCast(@min(count, ipc.MAX_MSG_DATA));
+    const len: u32 = @intCast(@min(count, ipc.effective_max_data));
 
-    proc.ipc_msg = ipc.Message.init(.t_write);
+    proc.ipc_msg.reset(.t_write);
     @memcpy(proc.ipc_msg.data_buf[0..len], buf[0..len]);
     proc.ipc_msg.data_len = len;
 
@@ -286,7 +263,7 @@ pub fn sysOpen(path_ptr: u64, path_len: u64) u64 {
         if (strEql(path_slice, "/dev/zero")) {
             return proc.allocDevFd(.dev_zero) orelse return EMFILE;
         }
-        if (strEql(path_slice, "/dev/random")) {
+        if (strEql(path_slice, "/dev/random") or strEql(path_slice, "/dev/urandom")) {
             return proc.allocDevFd(.dev_random) orelse return EMFILE;
         }
         if (strEql(path_slice, "/dev/pci")) {
@@ -327,7 +304,7 @@ pub fn sysOpen(path_ptr: u64, path_len: u64) u64 {
         }
         if (strEql(path_slice, "/dev/reboot")) {
             // Container processes cannot reboot the host
-            if (proc.container_id != 0xFF) return @bitCast(@as(i64, -1));
+            if (proc.group_id != 0xFF) return @bitCast(@as(i64, -1));
             return proc.allocDevFd(.dev_reboot) orelse return EMFILE;
         }
         if (strEql(path_slice, "/dev/drivers")) {
@@ -348,95 +325,13 @@ pub fn sysOpen(path_ptr: u64, path_len: u64) u64 {
         if (strEql(path_slice, "/dev/trace")) {
             return proc.allocDevFd(.dev_trace) orelse return EMFILE;
         }
+        if (strEql(path_slice, "/dev/ipcctl")) {
+            return proc.allocDevFd(.dev_ipcctl) orelse return EMFILE;
+        }
     }
 
-    // Intercept /net/* paths for kernel TCP/DNS — only when no userspace netd is mounted.
-    // When netd is mounted at /net/, namespace resolution (below) handles it instead.
-    if (path_len > 5 and path_slice[0] == '/' and path_slice[1] == 'n' and
-        path_slice[2] == 'e' and path_slice[3] == 't' and path_slice[4] == '/' and
-        !hasNetMount(proc.getNs()))
-    {
-        const net = @import("../net.zig");
-        const netfs = net.netfs;
-
-        const result = netfs.netOpen(path_slice[5..]) orelse return ENOENT;
-        const fd_val = proc.allocNetFd(result.kind, result.conn) orelse return EMFILE;
-
-        // For tcp/N/listen, block until a connection arrives
-        if (result.kind == .tcp_listen) {
-            const tcp = net.tcp;
-            tcp.setListenWaiter(result.conn, @intCast(proc.pid));
-            proc.pending_op = .net_listen;
-            proc.pending_fd = fd_val;
-            proc.syscall_ret = fd_val;
-            proc.state = .blocked;
-            process.scheduleNext();
-        }
-
-        return fd_val;
-    }
-
-    // Intercept /cntr/* paths for container management
-    if (path_len >= 5 and path_slice[0] == '/' and path_slice[1] == 'c' and
-        path_slice[2] == 'n' and path_slice[3] == 't' and path_slice[4] == 'r')
-    {
-        const container = @import("../container.zig");
-
-        // "/cntr" or "/cntr/" — directory listing
-        if (path_len == 5 or (path_len == 6 and path_slice[5] == '/')) {
-            return proc.allocCntrFd(.dir, 0) orelse return EMFILE;
-        }
-
-        if (path_slice[5] != '/') return ENOENT;
-        const cntr_suffix = path_slice[6..];
-
-        // "/cntr/clone" — allocate new container
-        if (cntr_suffix.len == 5 and cntr_suffix[0] == 'c' and cntr_suffix[1] == 'l' and
-            cntr_suffix[2] == 'o' and cntr_suffix[3] == 'n' and cntr_suffix[4] == 'e')
-        {
-            return proc.allocCntrFd(.clone, 0) orelse return EMFILE;
-        }
-
-        // Parse container ID: digits until '/' or end
-        var cntr_id: u32 = 0;
-        var ci: usize = 0;
-        while (ci < cntr_suffix.len and cntr_suffix[ci] >= '0' and cntr_suffix[ci] <= '9') : (ci += 1) {
-            cntr_id = cntr_id * 10 + (cntr_suffix[ci] - '0');
-        }
-        if (ci == 0 or cntr_id >= container.MAX_CONTAINERS) return ENOENT;
-
-        // Verify container exists
-        if (container.getById(@intCast(cntr_id)) == null) return ENOENT;
-
-        // "/cntr/N" — per-container directory
-        if (ci == cntr_suffix.len) {
-            return proc.allocCntrFd(.status, @intCast(cntr_id)) orelse return EMFILE;
-        }
-
-        if (cntr_suffix[ci] != '/') return ENOENT;
-        const file = cntr_suffix[ci + 1 ..];
-
-        // "/cntr/N/status"
-        if (file.len == 6 and file[0] == 's' and file[1] == 't' and
-            file[2] == 'a' and file[3] == 't' and file[4] == 'u' and file[5] == 's')
-        {
-            return proc.allocCntrFd(.status, @intCast(cntr_id)) orelse return EMFILE;
-        }
-
-        // "/cntr/N/ctl"
-        if (file.len == 3 and file[0] == 'c' and file[1] == 't' and file[2] == 'l') {
-            return proc.allocCntrFd(.ctl, @intCast(cntr_id)) orelse return EMFILE;
-        }
-
-        // "/cntr/N/procs"
-        if (file.len == 5 and file[0] == 'p' and file[1] == 'r' and
-            file[2] == 'o' and file[3] == 'c' and file[4] == 's')
-        {
-            return proc.allocCntrFd(.procs, @intCast(cntr_id)) orelse return EMFILE;
-        }
-
-        return ENOENT;
-    }
+    // /cntr/* is now served by cntrd (userspace IPC server).
+    // Requests go through the namespace mount, not kernel interception.
 
     // Intercept /proc/* paths for kernel process info
     if (path_len >= 5 and path_slice[0] == '/' and path_slice[1] == 'p' and
@@ -531,7 +426,7 @@ pub fn sysOpen(path_ptr: u64, path_len: u64) u64 {
     proc.pending_fd = fd_val;
 
     // Build T_OPEN: data = [prefix][suffix]
-    proc.ipc_msg = ipc.Message.init(.t_open);
+    proc.ipc_msg.reset(.t_open);
     const prefix = resolved.prefix;
     const suffix = resolved.suffix;
     const prefix_len: u32 = @intCast(prefix.len);
@@ -585,7 +480,7 @@ pub fn sysCreate(path_ptr: u64, path_len: u64, flags: u64) u64 {
     proc.pending_fd = fd_val;
 
     // Build T_CREATE: [flags: u32][prefix][suffix]
-    proc.ipc_msg = ipc.Message.init(.t_create);
+    proc.ipc_msg.reset(.t_create);
     writeU32LE(proc.ipc_msg.data_buf[0..4], @truncate(flags));
     const c_prefix = resolved.prefix;
     const suffix = resolved.suffix;
@@ -662,44 +557,9 @@ pub fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
         process.scheduleNext();
     }
 
-    // Net fd: dispatch to netfs
-    if (entry_ptr.fd_type == .net) {
-        const net = @import("../net.zig");
-        const netfs = net.netfs;
-        const tcp = net.tcp;
-
-        const dest: [*]u8 = @ptrFromInt(buf_ptr);
-        const buf_size: u16 = @intCast(@min(count, 4096));
-
-        const result = netfs.netRead(entry_ptr.net_kind, entry_ptr.net_conn, dest[0..buf_size], &entry_ptr.net_read_done);
-        if (result) |n| {
-            return n;
-        }
-
-        // null means block — register waiter and block
-        if (entry_ptr.net_kind == .icmp_data) {
-            const icmp_mod = net.icmp;
-            icmp_mod.setReadWaiter(entry_ptr.net_conn, @intCast(proc.pid));
-            proc.pending_op = .icmp_read;
-        } else {
-            tcp.setReadWaiter(entry_ptr.net_conn, @intCast(proc.pid));
-            proc.pending_op = .net_read;
-        }
-        proc.pending_fd = @intCast(fd);
-        proc.ipc_recv_buf_ptr = buf_ptr;
-        proc.syscall_ret = count;
-        proc.state = .blocked;
-        process.scheduleNext();
-    }
-
     // Proc fd: kernel-generated process info
     if (entry_ptr.fd_type == .proc) {
         return devfiles.procRead(entry_ptr, buf_ptr, count);
-    }
-
-    // Container fd: kernel-generated container info
-    if (entry_ptr.fd_type == .cntr) {
-        return devfiles.cntrRead(entry_ptr, buf_ptr, count);
     }
 
     // Virtual device fds
@@ -760,6 +620,9 @@ pub fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
     if (entry_ptr.fd_type == .dev_trace) {
         return devfiles.traceRead(entry_ptr, buf_ptr, count);
     }
+    if (entry_ptr.fd_type == .dev_ipcctl) {
+        return devfiles.ipcctlRead(entry_ptr, buf_ptr, count);
+    }
 
     const chan = ipc.getChannel(entry_ptr.channel_id) orelse return EBADF;
 
@@ -778,9 +641,9 @@ pub fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
 
     // Server-backed fd: T_READ with [handle: u32][offset: u32][count: u32]
     if (entry_ptr.server_handle > 0) {
-        const read_count: u32 = @intCast(@min(count, ipc.MAX_MSG_DATA));
+        const read_count: u32 = @intCast(@min(count, ipc.effective_max_data));
 
-        proc.ipc_msg = ipc.Message.init(.t_read);
+        proc.ipc_msg.reset(.t_read);
         writeU32LE(proc.ipc_msg.data_buf[0..4], entry_ptr.server_handle);
         writeU32LE(proc.ipc_msg.data_buf[4..8], entry_ptr.read_offset);
         writeU32LE(proc.ipc_msg.data_buf[8..12], read_count);
@@ -796,9 +659,9 @@ pub fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
     }
 
     // Raw IPC read (existing behavior)
-    const len: u32 = @intCast(@min(count, ipc.MAX_MSG_DATA));
+    const len: u32 = @intCast(@min(count, ipc.effective_max_data));
 
-    proc.ipc_msg = ipc.Message.init(.t_read);
+    proc.ipc_msg.reset(.t_read);
     proc.ipc_msg.data_len = len; // requested read size
 
     proc.pending_op = .none;
@@ -924,14 +787,6 @@ pub fn sysClose(fd: u64) u64 {
         return 0;
     }
 
-    // Net fd: dispatch to netfs
-    if (entry.fd_type == .net) {
-        const net = @import("../net.zig");
-        net.netfs.netClose(entry.net_kind, entry.net_conn);
-        proc.closeFd(@intCast(fd));
-        return 0;
-    }
-
     // Proc fd: no cleanup needed, just close
     if (entry.fd_type == .proc) {
         proc.closeFd(@intCast(fd));
@@ -959,7 +814,7 @@ pub fn sysClose(fd: u64) u64 {
             return 0;
         };
 
-        proc.ipc_msg = ipc.Message.init(.t_close);
+        proc.ipc_msg.reset(.t_close);
         writeU32LE(proc.ipc_msg.data_buf[0..4], entry.server_handle);
         proc.ipc_msg.data_len = 4;
 
@@ -1019,29 +874,12 @@ pub fn sysStat(fd: u64, stat_buf_ptr: u64) u64 {
 
     const entry = proc.getFdEntry(@intCast(fd)) orelse return EBADF;
 
-    // Net fds: synthetic stat (size=0, type=file)
-    if (entry.fd_type == .net) {
-        const stat_ptr: *align(1) [64]u8 = @ptrFromInt(stat_buf_ptr);
-        @memset(stat_ptr, 0);
-        return 0;
-    }
-
     // Proc fds: synthetic stat
     if (entry.fd_type == .proc) {
         const stat_ptr: *align(1) [64]u8 = @ptrFromInt(stat_buf_ptr);
         @memset(stat_ptr, 0);
         // file_type at offset 4: 1=directory for dir/pid_dir, 0=file otherwise
         if (entry.proc_kind == .dir or entry.proc_kind == .pid_dir) {
-            writeU32LE(@ptrCast(stat_ptr[4..8]), 1);
-        }
-        return 0;
-    }
-
-    // Container fds: synthetic stat
-    if (entry.fd_type == .cntr) {
-        const stat_ptr: *align(1) [64]u8 = @ptrFromInt(stat_buf_ptr);
-        @memset(stat_ptr, 0);
-        if (entry.cntr_kind == .dir) {
             writeU32LE(@ptrCast(stat_ptr[4..8]), 1);
         }
         return 0;
@@ -1069,7 +907,7 @@ pub fn sysStat(fd: u64, stat_buf_ptr: u64) u64 {
 
     // Server-backed fd: send T_STAT with [handle: u32], block for reply
     if (entry.server_handle > 0) {
-        proc.ipc_msg = ipc.Message.init(.t_stat);
+        proc.ipc_msg.reset(.t_stat);
         writeU32LE(proc.ipc_msg.data_buf[0..4], entry.server_handle);
         proc.ipc_msg.data_len = 4;
 
@@ -1103,7 +941,7 @@ pub fn sysRemove(path_ptr: u64, path_len: u64) u64 {
     if (chan.kernel_data != null) return ENOSYS;
 
     // Send T_REMOVE with [prefix][suffix]
-    proc.ipc_msg = ipc.Message.init(.t_remove);
+    proc.ipc_msg.reset(.t_remove);
     const rm_prefix = resolved.prefix;
     const suffix = resolved.suffix;
     const rm_prefix_len: u32 = @intCast(rm_prefix.len);
@@ -1145,7 +983,7 @@ pub fn sysRename(old_ptr: u64, old_len: u64, new_ptr: u64, new_len: u64) u64 {
     if (chan.kernel_data != null) return ENOSYS;
 
     // Build T_RENAME: [old_prefix][old_suffix] \0 [new_prefix][new_suffix]
-    proc.ipc_msg = ipc.Message.init(.t_rename);
+    proc.ipc_msg.reset(.t_rename);
     const old_prefix = old_resolved.prefix;
     const old_suffix = old_resolved.suffix;
     const new_prefix = new_resolved.prefix;
@@ -1198,7 +1036,7 @@ pub fn sysTruncate(fd: u64, new_size: u64) u64 {
     if (entry.server_handle == 0) return ENOSYS;
 
     // Build T_TRUNCATE: [handle: u32][new_size: u64]
-    proc.ipc_msg = ipc.Message.init(.t_truncate);
+    proc.ipc_msg.reset(.t_truncate);
     writeU32LE(proc.ipc_msg.data_buf[0..4], entry.server_handle);
     writeU64LE(proc.ipc_msg.data_buf[4..12], new_size);
     proc.ipc_msg.data_len = 12;
@@ -1222,7 +1060,7 @@ pub fn sysWstat(fd: u64, mode: u64, uid: u64, gid: u64, mask: u64) u64 {
     if (entry.server_handle == 0) return ENOSYS;
 
     // Build T_WSTAT: [handle:u32][mask:u32][mode:u32][uid:u32][gid:u32][caller_uid:u32] = 24 bytes
-    proc.ipc_msg = ipc.Message.init(.t_wstat);
+    proc.ipc_msg.reset(.t_wstat);
     writeU32LE(proc.ipc_msg.data_buf[0..4], entry.server_handle);
     writeU32LE(proc.ipc_msg.data_buf[4..8], @truncate(mask));
     writeU32LE(proc.ipc_msg.data_buf[8..12], @truncate(mode));
@@ -1238,4 +1076,67 @@ pub fn sysWstat(fd: u64, mode: u64, uid: u64, gid: u64, mask: u64) u64 {
     proc.state = .blocked;
     sendToServer(chan, proc);
     process.scheduleNext();
+}
+
+/// writev(fd, iovecs_ptr, iovecs_count) → total bytes written
+/// For dev_ether fds: batch-send frames via virtio with a single notify.
+/// For other fds: iterate and call sysWrite per iovec.
+pub fn sysWritev(fd: u64, iovecs_ptr: u64, iovecs_count: u64) u64 {
+    if (iovecs_ptr == 0 or iovecs_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+    if (iovecs_count == 0) return 0;
+    if (iovecs_count > 128) return EINVAL;
+
+    const proc = process.getCurrent() orelse return EBADF;
+    const entry = proc.getFdEntry(@intCast(fd)) orelse return EBADF;
+
+    const count: usize = @intCast(iovecs_count);
+
+    // Iovec: { ptr: u64, len: u64 } = 16 bytes each
+    const iov_base: [*]const extern struct { ptr: u64, len: u64 } = @ptrFromInt(iovecs_ptr);
+
+    // Fast path: dev_ether fd → batch send via virtio
+    if (entry.fd_type == .dev_ether) {
+        const virtio_net = @import("../virtio_net.zig");
+        const has_tso = virtio_net.hasTsoOffload();
+        var frame_refs: [128]virtio_net.FrameRef = undefined;
+        var valid: usize = 0;
+        var sent: u32 = 0;
+        for (0..count) |i| {
+            const iov = iov_base[i];
+            if (iov.ptr == 0 or iov.ptr >= 0x0000_8000_0000_0000) continue;
+            if (iov.len == 0) continue;
+            if (iov.len > 1514) {
+                // TSO frame: flush any pending normal frames, then send via sendTso
+                if (has_tso) {
+                    if (valid > 0) {
+                        sent += virtio_net.sendBatch(frame_refs[0..valid]);
+                        valid = 0;
+                    }
+                    const src: [*]const u8 = @ptrFromInt(iov.ptr);
+                    if (virtio_net.sendTso(src[0..iov.len], 1460)) sent += 1;
+                }
+                continue;
+            }
+            frame_refs[valid] = .{
+                .data = @ptrFromInt(iov.ptr),
+                .len = @intCast(iov.len),
+            };
+            valid += 1;
+        }
+        if (valid > 0) {
+            sent += virtio_net.sendBatch(frame_refs[0..valid]);
+        }
+        return sent;
+    }
+
+    // Generic fallback: iterate and write each iovec
+    var total: u64 = 0;
+    for (0..count) |i| {
+        const iov = iov_base[i];
+        if (iov.len == 0) continue;
+        const n = sysWrite(fd, iov.ptr, iov.len);
+        if (n >= 0x8000_0000_0000_0000) return n; // error
+        total += n;
+    }
+    return total;
 }

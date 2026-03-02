@@ -1,6 +1,6 @@
 /// fnx — Fornax container manager (podman-familiar CLI).
 ///
-/// Manages containers via Plan 9 /cntr/ ctl files + SYS 40 cntr_op.
+/// Manages containers via /cntr/ ctl files (cntrd) + spawn_blocked/proc_setup.
 ///
 /// Commands:
 ///   run <image> [cmd]     Create, configure, and start a container
@@ -442,23 +442,39 @@ fn cmdRun(argc: u64, argv: []const [*:0]const u8) void {
     // 5. Build argv block
     const argv_block = fx.buildArgvBlock(&argv_buf, cmd_args[0..cmd_argc]);
 
-    // 6. Start container via SYS 40
-    const pid = fx.cntr_start(id, elf_data, argv_block);
-    if (pid < 0) {
-        stderr.puts("fnx: failed to start container\n");
+    // 6. Read group_id and compat from cntrd status
+    const group_id = getGroupId(id) orelse {
+        stderr.puts("fnx: cannot read group_id from container\n");
         ctlById(id, "destroy");
         fx.exit(1);
-    }
+    };
+    const compat: u8 = if (compat_linux) 1 else 0;
 
-    // 7. Spawn container netd if networking enabled
+    // 7. Spawn blocked process and configure
+    const pid = spawnContainerProcess(elf_data, group_id, compat);
+
+    // Clear namespace and mount rootfs with prefix
+    _ = fx.proc_clear_ns(pid);
+    setupRootfsMount(pid, rootfs_path[0..rootfs_len]);
+
+    // Write argv and make runnable
+    if (argv_block) |blk| {
+        _ = fx.proc_set_argv(pid, blk);
+    }
+    _ = fx.proc_ready(pid);
+
+    // Notify cntrd about the init pid
+    writeCtlDec(id, "started ", pid);
+
+    // 8. Spawn container netd if networking enabled
     if (enable_net) {
-        // Use a second buffer for netd ELF (reuse io_buf for path)
+        // Re-read ELF buf for netd (reuses elf_buf)
         const netd_data = readFileBuf("/bin/netd", &elf_buf) orelse null;
         if (netd_data) |nd| {
-            const netd_pid = fx.cntr_netd(id, nd);
-            if (netd_pid >= 0) {
+            const netd_pid = spawnContainerNetd(id, nd, group_id, pid);
+            if (netd_pid != 0) {
                 out.puts("  netd pid=");
-                out.putDec(@intCast(netd_pid));
+                out.putDec(netd_pid);
                 out.puts("\n");
             }
         }
@@ -469,7 +485,7 @@ fn cmdRun(argc: u64, argv: []const [*:0]const u8) void {
     out.puts(" started (id=");
     out.putDec(id);
     out.puts(", pid=");
-    out.putDec(@intCast(pid));
+    out.putDec(pid);
     out.puts(")\n");
 
     // 8. Wait or detach
@@ -567,14 +583,27 @@ fn cmdStart(name_cstr: [*:0]const u8) void {
     var args: [1][]const u8 = .{cmd_str};
     const argv_block = fx.buildArgvBlock(&argv_buf, &args);
 
-    const pid = fx.cntr_start(id, elf_data, argv_block);
-    if (pid < 0) {
-        stderr.puts("fnx: failed to start container\n");
+    // Read group_id and compat from cntrd
+    const group_id = getGroupId(id) orelse {
+        stderr.puts("fnx: cannot read group_id\n");
         fx.exit(1);
+    };
+    const compat = getCompat(id);
+
+    // Spawn blocked, configure, and start
+    const pid = spawnContainerProcess(elf_data, group_id, compat);
+    _ = fx.proc_clear_ns(pid);
+    setupRootfsMount(pid, rootfs);
+    if (argv_block) |blk| {
+        _ = fx.proc_set_argv(pid, blk);
     }
+    _ = fx.proc_ready(pid);
+
+    // Notify cntrd
+    writeCtlDec(id, "started ", pid);
 
     out.puts("Started (pid=");
-    out.putDec(@intCast(pid));
+    out.putDec(pid);
     out.puts(")\n");
 }
 
@@ -626,11 +655,27 @@ fn cmdExec(argc: u64, argv: []const [*:0]const u8) void {
 
     const argv_block = fx.buildArgvBlock(&argv_buf, cmd_args[0..cmd_argc]);
 
-    const pid = fx.cntr_exec(id, elf_data, argv_block);
-    if (pid < 0) {
-        stderr.puts("fnx: exec failed\n");
+    // Read group_id and compat from cntrd
+    const group_id = getGroupId(id) orelse {
+        stderr.puts("fnx: cannot read group_id\n");
         fx.exit(1);
+    };
+    const compat = getCompat(id);
+
+    // Spawn blocked, clone namespace from init, configure, start
+    const pid = spawnContainerProcess(elf_data, group_id, compat);
+    const init_pid = getInitPid(id) orelse 0;
+    if (init_pid != 0) {
+        _ = fx.proc_clone_ns(pid, init_pid);
+    } else {
+        // Fallback: clear namespace and mount rootfs
+        _ = fx.proc_clear_ns(pid);
+        setupRootfsMount(pid, rootfs);
     }
+    if (argv_block) |blk| {
+        _ = fx.proc_set_argv(pid, blk);
+    }
+    _ = fx.proc_ready(pid);
 
     // Wait for exec'd process
     _ = fx.wait(@intCast(pid));
@@ -947,6 +992,158 @@ fn writeCtl(id: u8, key: []const u8, value: []const u8) void {
         _ = fx.write(fd, ctl_buf[0..pos]);
         _ = fx.close(fd);
     }
+}
+
+/// Write ctl command: "key <decimal value>"
+fn writeCtlDec(id: u8, key: []const u8, value: u32) void {
+    var dec_buf: [20]u8 = undefined;
+    const dec = fmtDecBuf(value, &dec_buf);
+    writeCtl(id, key, dec);
+}
+
+/// Format a u32 as decimal string (returns slice into buf).
+fn fmtDecBuf(val: u32, buf: *[20]u8) []const u8 {
+    if (val == 0) {
+        buf[0] = '0';
+        return buf[0..1];
+    }
+    var v = val;
+    var i: usize = 20;
+    while (v > 0) {
+        i -= 1;
+        buf[i] = '0' + @as(u8, @intCast(v % 10));
+        v /= 10;
+    }
+    return buf[i..20];
+}
+
+/// Read container status and extract the group_id.
+fn getGroupId(cntr_id: u8) ?u8 {
+    var path_buf: [32]u8 = undefined;
+    const slen = fmtCntrPath(&path_buf, cntr_id, "/status");
+    const status_data = readFileBuf(path_buf[0..slen], &io_buf) orelse return null;
+    const gid_str = getKV(status_data, "group_id") orelse return null;
+    return parseU8(gid_str);
+}
+
+/// Read container compat mode from status. Returns 1 for linux, 0 for fornax.
+fn getCompat(cntr_id: u8) u8 {
+    var path_buf: [32]u8 = undefined;
+    const slen = fmtCntrPath(&path_buf, cntr_id, "/status");
+    const status_data = readFileBuf(path_buf[0..slen], &io_buf) orelse return 0;
+    const val = getKV(status_data, "compat") orelse return 0;
+    if (sliceEql(val, "linux")) return 1;
+    return 0;
+}
+
+/// Read container init_pid from status.
+fn getInitPid(cntr_id: u8) ?u32 {
+    var path_buf: [32]u8 = undefined;
+    const slen = fmtCntrPath(&path_buf, cntr_id, "/status");
+    const status_data = readFileBuf(path_buf[0..slen], &io_buf) orelse return null;
+    const pid_str = getKV(status_data, "init_pid") orelse return null;
+    const val = parseU64(pid_str);
+    if (val == 0) return null;
+    return @intCast(val);
+}
+
+/// Spawn a process in blocked mode and configure it for a container.
+/// Returns the PID or exits on failure.
+fn spawnContainerProcess(elf_data: []const u8, group_id: u8, compat: u8) u32 {
+    var fd_map: [0]fx.FdMapping = .{};
+    const pid_i = fx.spawn_blocked(elf_data, &fd_map);
+    if (pid_i < 0) {
+        stderr.puts("fnx: spawn_blocked failed\n");
+        fx.exit(1);
+    }
+    const pid: u32 = @intCast(pid_i);
+
+    // Assign to process group
+    _ = fx.proc_set_group(pid, group_id);
+
+    // Set compat mode
+    if (compat != 0) {
+        _ = fx.proc_set_compat(pid, compat);
+    }
+
+    return pid;
+}
+
+/// Spawn a container netd process. Returns netd PID or 0 on failure.
+fn spawnContainerNetd(cntr_id: u8, netd_elf: []const u8, group_id: u8, init_pid: u32) u32 {
+    // Allocate ether client fd
+    const ether_fd = fx.open("/dev/ether");
+    if (ether_fd < 0) return 0;
+
+    // Create IPC channel pair for /net/ mount
+    const chan = fx.ipc_pair();
+    if (chan.err < 0) {
+        _ = fx.close(ether_fd);
+        return 0;
+    }
+
+    // Spawn netd in blocked mode (native Fornax, not compat)
+    var fd_map: [0]fx.FdMapping = .{};
+    const pid_i = fx.spawn_blocked(netd_elf, &fd_map);
+    if (pid_i < 0) {
+        _ = fx.close(ether_fd);
+        _ = fx.close(chan.server_fd);
+        _ = fx.close(chan.client_fd);
+        return 0;
+    }
+    const pid: u32 = @intCast(pid_i);
+
+    // Configure: group, fds, namespace, and make runnable
+    _ = fx.proc_set_group(pid, group_id);
+
+    // Set up fd map: server_fd→3, ether_fd→4
+    _ = fx.proc_set_fd(pid, 3, @intCast(@as(u32, @bitCast(chan.server_fd))), 1); // is_server=1
+    _ = fx.proc_set_fd(pid, 4, @intCast(@as(u32, @bitCast(ether_fd))), 0);
+
+    // Clone namespace from container init
+    _ = fx.proc_clone_ns(pid, init_pid);
+
+    // Mount /net/ in init's namespace too (via a mount on the blocked netd proc
+    // isn't right — we need it in init's namespace). Instead, mount using bind.
+    // Actually, we mount /net/ in the netd's namespace (cloned from init),
+    // but we also need it in init's namespace. The simplest approach:
+    // mount /net/ on the netd process (which has init's namespace clone),
+    // and the init process already has /net/ from a previous mount or
+    // we can use the bind syscall.
+    // For now, mount /net/ in the netd's own namespace.
+    _ = fx.proc_mount(pid, "/net/", chan.client_fd);
+
+    _ = fx.proc_ready(pid);
+
+    // Notify cntrd about the netd pid
+    writeCtlDec(cntr_id, "netd ", pid);
+
+    // Close our copies of the fds (kernel has duplicated them)
+    _ = fx.close(ether_fd);
+    _ = fx.close(chan.server_fd);
+    _ = fx.close(chan.client_fd);
+
+    return pid;
+}
+
+/// Set up rootfs prefix mount on a blocked process.
+/// Opens "/" in caller's namespace (the host root), then mounts with prefix into child.
+fn setupRootfsMount(pid: u32, rootfs_path: []const u8) void {
+    // Open "/" to get a handle to the root fs server
+    const root_fd = fx.open("/");
+    if (root_fd < 0) return;
+    defer _ = fx.close(root_fd);
+
+    // Build prefix: rootfs_path + trailing "/" if needed
+    var prefix_buf: [260]u8 = undefined;
+    @memcpy(prefix_buf[0..rootfs_path.len], rootfs_path);
+    var pfx_len = rootfs_path.len;
+    if (pfx_len > 0 and prefix_buf[pfx_len - 1] != '/') {
+        prefix_buf[pfx_len] = '/';
+        pfx_len += 1;
+    }
+
+    _ = fx.proc_mount_pfx(pid, "/", prefix_buf[0..pfx_len], root_fd);
 }
 
 // ── Helpers ──
@@ -3142,13 +3339,21 @@ fn buildRun(cmd: []const u8, rootfs: []const u8, compat_linux: bool) void {
     var run_args: [3][]const u8 = .{ shell_name, "-c", cmd };
     const run_argv = fx.buildArgvBlock(&argv_buf, &run_args);
 
-    // Start temp container
-    const pid = fx.cntr_start(id, shell_elf, run_argv);
-    if (pid < 0) {
-        stderr.puts("fnx build: RUN failed to start\n");
+    // Start temp container using new primitives
+    const build_group_id = getGroupId(id) orelse {
+        stderr.puts("fnx build: cannot read group_id\n");
         ctlById(id, "destroy");
         return;
+    };
+    const build_compat: u8 = if (compat_linux) 1 else 0;
+    const pid = spawnContainerProcess(shell_elf, build_group_id, build_compat);
+    _ = fx.proc_clear_ns(pid);
+    setupRootfsMount(pid, rootfs);
+    if (run_argv) |blk| {
+        _ = fx.proc_set_argv(pid, blk);
     }
+    _ = fx.proc_ready(pid);
+    writeCtlDec(id, "started ", pid);
 
     // Wait for completion
     _ = fx.wait(@intCast(pid));

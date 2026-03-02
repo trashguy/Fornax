@@ -13,6 +13,22 @@
 |-------|-------------|------------|
 | 1001e-k | fay package manager (sync, install, build, zig compiler) | 1001a-d |
 
+## Future: Containers + POSIX (1000-series)
+
+| Phase | Description | Depends On |
+|-------|-------------|------------|
+| 1003 | Dynamic linker support (ET_DYN / PIE, PT_INTERP, auxv) | 1000, 1002 |
+
+## Completed: Network Dekernel + Container Externalization (1010-series)
+
+Migrated kernel networking and container orchestration to userspace.
+
+| Phase | Description | Status |
+|-------|-------------|--------|
+| ~~1010~~ | ~~Socket shim — rewrite linux_socket.zig to use Plan 9 /net/ file ops via IPC to netd~~ | **Done** |
+| ~~1011~~ | ~~Delete kernel network stack — gut src/net.zig, remove FdType.net, NetFdKind~~ | **Done** |
+| ~~1012~~ | ~~Container orchestration to userspace~~ | **Done** |
+
 ## Future: NIC Drivers (2100-series)
 
 Userspace NIC drivers via shared 2000-series device-driver primitives (PCI enhancement, device mmap, DMA alloc).
@@ -84,7 +100,7 @@ Phases 1-24, 100-101 (done)
 ├── A-G SMP (done) ── H-K threads (done)
 ├── 1000 POSIX realms (done) ── 1001i TCC (done)
 ├── 1001a-d,l foundation libs (done)
-├── 1002 containers (done)
+├── 1002 containers (done) ── 1010 socket shim (done) ── 1011 dekernel net (done) ── 1012 container userspace (done)
 ├── 3A-3D userspace networking (done)
 ├── TLS + OCI registry pull (done)
 ├── Kernel trace, time/cron, ctl files, RISC-V port (done)
@@ -92,7 +108,8 @@ Phases 1-24, 100-101 (done)
 ├── Next:
 │   ├── 202 file management
 │   ├── 207 envfs
-│   └── 1001e-k fay package manager
+│   ├── 1001e-k fay package manager
+│   └── 1003 dynamic linker (ET_DYN, PT_INTERP, auxv)
 │
 ├── Future: NIC Drivers
 │   └── 2000a + 2000c ── 2100 RTL8125 r8169 driver
@@ -118,6 +135,9 @@ Phases 1-24, 100-101 (done)
 | # | Goal | Phases | Status |
 |---|------|--------|--------|
 | 20 | `fay install` fetches and installs a package | 1001e-k | Not started |
+| 29 | Container iperf3 uses container IP (10.0.1.x) | 1010 | **Done** |
+| 30 | Kernel has no TCP/IP stack — all networking via netd | 1011 | **Done** |
+| 31 | Container lifecycle managed entirely from userspace fnx | 1012 | **Done** |
 | 21 | RTL8125 NIC driver serves /dev/ether0 on real hardware | 2100 | Not started |
 | 22 | Framebuffer accessible from userspace srv/gpu | 2000 | Not started |
 | 23 | Native app draws in a window | 2004 | Not started |

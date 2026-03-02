@@ -322,7 +322,7 @@ No sockets API. To make an HTTP request:
 
 ## Container Networking
 
-When containers are enabled (`-Dcontainers=true`), each container can have its own netd instance with independent network state.
+Each container can have its own netd instance with independent network state.
 
 ### Shared Ether Model
 

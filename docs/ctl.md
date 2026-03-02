@@ -162,7 +162,7 @@ Served by netd (userspace daemon). Mounted via IPC.
 
 ## Container Control (`/cntr/`)
 
-Kernel-intercepted. Feature-gated behind `-Dcontainers=true`.
+Served by `srv/cntrd` userspace IPC server.
 
 ### `/cntr/clone` (read)
 

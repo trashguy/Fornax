@@ -4,6 +4,11 @@
 /// riscv64: CLINT via SBI set_timer at ~18 Hz (10 MHz timebase / 555555).
 const builtin = @import("builtin");
 
+const tsc = switch (builtin.cpu.arch) {
+    .x86_64 => @import("arch/x86_64/tsc.zig"),
+    else => struct {},
+};
+
 const pic = switch (builtin.cpu.arch) {
     .x86_64 => @import("pic.zig"),
     else => struct {
@@ -37,6 +42,7 @@ pub fn init() void {
 
     switch (builtin.cpu.arch) {
         .x86_64 => {
+            tsc.calibrate();
             pic.unmask(0);
         },
         .riscv64 => {
@@ -67,6 +73,10 @@ pub fn getTicks() u32 {
 
 pub fn getMillis() u64 {
     switch (builtin.cpu.arch) {
+        .x86_64 => {
+            if (tsc.isCalibrated()) return tsc.getMillis();
+            return @as(u64, ticks) * 1000 / TICKS_PER_SEC;
+        },
         .riscv64 => {
             const cpu = @import("arch/riscv64/cpu.zig");
             return cpu.rdtime() / 10_000; // 10 MHz timebase
@@ -79,8 +89,30 @@ pub fn getMillis() u64 {
             return cnt * 1000 / freq;
         },
         else => {
-            // x86_64: fallback to tick counter (~55ms granularity)
             return @as(u64, ticks) * 1000 / TICKS_PER_SEC;
+        },
+    }
+}
+
+pub fn getMicros() u64 {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            if (tsc.isCalibrated()) return tsc.getMicros();
+            return @as(u64, ticks) * 1_000_000 / TICKS_PER_SEC;
+        },
+        .riscv64 => {
+            const cpu = @import("arch/riscv64/cpu.zig");
+            return cpu.rdtime() / 10; // 10 MHz timebase → µs
+        },
+        .aarch64 => {
+            const cpu = @import("arch/aarch64/cpu.zig");
+            const cnt = cpu.readCntvct();
+            const freq = cpu.readCntfrq();
+            if (freq == 0) return @as(u64, ticks) * 1_000_000 / TICKS_PER_SEC;
+            return cnt * 1_000_000 / freq;
+        },
+        else => {
+            return @as(u64, ticks) * 1_000_000 / TICKS_PER_SEC;
         },
     }
 }
@@ -114,7 +146,7 @@ fn handleIrq() bool {
     const process = @import("process.zig");
     const table = process.getProcessTable();
     for (table) |*p| {
-        if (p.state == .blocked and p.pending_op == .sleep) {
+        if (p.state == .blocked and (p.pending_op == .sleep or p.pending_op == .poll_wait)) {
             if ((ticks -% p.sleep_until) < 0x8000_0000) {
                 process.markReady(p);
             }

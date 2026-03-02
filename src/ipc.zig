@@ -16,8 +16,11 @@ const SpinLock = @import("spinlock.zig").SpinLock;
 /// Maximum number of channels system-wide.
 const MAX_CHANNELS = 256;
 
-/// Maximum inline message data size.
-pub const MAX_MSG_DATA = 4096;
+/// Maximum inline message data size (compile-time ceiling).
+pub const MAX_MSG_DATA = 65536;
+
+/// Runtime-configurable effective max data size, clamped to [4096, MAX_MSG_DATA].
+pub var effective_max_data: u32 = 65536;
 
 /// Maximum number of clients that can queue on a single channel.
 pub const MAX_CLIENT_WAITERS = 16;
@@ -56,6 +59,16 @@ pub const Message = struct {
             .data_buf = undefined,
             .passed_channel = null,
         };
+    }
+
+    /// Reset a Message in-place — no by-value return, no stack temporary.
+    /// Use this instead of `msg = Message.init(tag)` when msg is a field
+    /// of a heap/global struct (e.g. proc.ipc_msg) to avoid a 64 KB+
+    /// stack temporary in Debug builds.
+    pub fn reset(self: *Message, tag: Tag) void {
+        self.tag = tag;
+        self.data_len = 0;
+        self.passed_channel = null;
     }
 
     pub fn initWithData(tag: Tag, payload: []const u8) Message {

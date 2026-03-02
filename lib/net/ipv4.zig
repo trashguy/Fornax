@@ -77,7 +77,7 @@ pub fn build(buf: []u8, src: [4]u8, dst: [4]u8, protocol: u8, ttl: u8, packet_id
     buf[1] = 0; // TOS
     writeBe16(buf, 2, total);
     writeBe16(buf, 4, packet_id);
-    writeBe16(buf, 6, 0x4000); // Don't Fragment
+    writeBe16(buf, 6, 0x0000); // No flags (DF cleared for PMTU compat)
     buf[8] = ttl;
     buf[9] = protocol;
     writeBe16(buf, 10, 0); // checksum placeholder
@@ -89,6 +89,32 @@ pub fn build(buf: []u8, src: [4]u8, dst: [4]u8, protocol: u8, ttl: u8, packet_id
     writeBe16(buf, 10, cksum);
 
     @memcpy(buf[HEADER_SIZE..][0..payload.len], payload);
+
+    return total_len;
+}
+
+/// Build IP header in-place. Payload is already at buf[HEADER_SIZE..].
+/// Returns total length (header + payload) or null on error.
+pub fn buildHeaderOnly(buf: []u8, src: [4]u8, dst: [4]u8, protocol: u8, ttl: u8, packet_id: u16, payload_len: usize) ?usize {
+    const total_len = HEADER_SIZE + payload_len;
+    if (total_len > buf.len or total_len > 65535) return null;
+
+    const total: u16 = @intCast(total_len);
+
+    buf[0] = 0x45; // version 4, IHL 5
+    buf[1] = 0; // TOS
+    writeBe16(buf, 2, total);
+    writeBe16(buf, 4, packet_id);
+    writeBe16(buf, 6, 0x0000); // No flags
+    buf[8] = ttl;
+    buf[9] = protocol;
+    writeBe16(buf, 10, 0); // checksum placeholder
+    @memcpy(buf[12..16], &src);
+    @memcpy(buf[16..20], &dst);
+
+    // Compute and fill checksum
+    const cksum = computeChecksum(buf[0..HEADER_SIZE]);
+    writeBe16(buf, 10, cksum);
 
     return total_len;
 }

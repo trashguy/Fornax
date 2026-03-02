@@ -458,14 +458,21 @@ pub fn osversionRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 
 
 pub fn timeRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
     const time_mod = @import("time.zig");
+    const timer_mod = @import("timer.zig");
     const epoch = time_mod.wallClock();
     const up = time_mod.uptime();
+    const millis = timer_mod.getMillis();
+    const micros = timer_mod.getMicros();
 
-    var text_buf: [48]u8 = undefined;
+    var text_buf: [96]u8 = undefined;
     var dec1: [20]u8 = undefined;
     var dec2: [20]u8 = undefined;
+    var dec3: [20]u8 = undefined;
+    var dec4: [20]u8 = undefined;
     const epoch_str = fmtDecimal(epoch, &dec1);
     const up_str = fmtDecimal(up, &dec2);
+    const millis_str = fmtDecimal(millis, &dec3);
+    const micros_str = fmtDecimal(micros, &dec4);
     var pos: usize = 0;
     @memcpy(text_buf[pos..][0..epoch_str.len], epoch_str);
     pos += epoch_str.len;
@@ -473,6 +480,14 @@ pub fn timeRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
     pos += 1;
     @memcpy(text_buf[pos..][0..up_str.len], up_str);
     pos += up_str.len;
+    text_buf[pos] = ' ';
+    pos += 1;
+    @memcpy(text_buf[pos..][0..millis_str.len], millis_str);
+    pos += millis_str.len;
+    text_buf[pos] = ' ';
+    pos += 1;
+    @memcpy(text_buf[pos..][0..micros_str.len], micros_str);
+    pos += micros_str.len;
     text_buf[pos] = '\n';
     pos += 1;
 
@@ -888,7 +903,7 @@ pub fn etherRead(proc: *process.Process, fd_num: u64, entry_ptr: *process.FdEntr
         ether_mod.setReadWaiter(client_idx, @intCast(proc.pid));
         proc.pending_op = .ether_read;
         proc.ipc_recv_buf_ptr = buf_ptr;
-        // Stash fd number in pending_fd, max count in syscall_ret (net_read pattern)
+        // Stash fd number in pending_fd, max count in syscall_ret (ether_read pattern)
         proc.pending_fd = @intCast(fd_num);
         proc.syscall_ret = @min(count, ether_mod.MAX_FRAME);
         proc.state = .blocked;
@@ -916,314 +931,46 @@ pub fn sysnameWrite(buf_ptr: u64, count: u64) u64 {
     return len;
 }
 
-// ---------- /cntr read ----------
+/// /dev/ipcctl: read returns current effective_max_data as decimal text + newline.
+pub fn ipcctlRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
+    const ipc = @import("ipc.zig");
+    var num_buf: [20]u8 = undefined;
+    const num_str = fmtDecimal(@as(u64, ipc.effective_max_data), &num_buf);
+    // Build "NNN\n"
+    var text_buf: [21]u8 = undefined;
+    @memcpy(text_buf[0..num_str.len], num_str);
+    text_buf[num_str.len] = '\n';
+    const total = num_str.len + 1;
 
-/// Read from /cntr/ virtual files.
-pub fn cntrRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
-    const container = @import("container.zig");
     const dest: [*]u8 = @ptrFromInt(buf_ptr);
-    const max: usize = @intCast(@min(count, 4096));
-
-    switch (entry_ptr.cntr_kind) {
-        .dir => {
-            // List active containers as DirEntry structs (72 bytes each)
-            const entry_size = 72;
-            const all = container.getAll();
-            var total: usize = 0;
-            var offset: usize = entry_ptr.read_offset;
-
-            for (all) |*ct| {
-                if (!ct.active) continue;
-                if (total + entry_size > max) break;
-
-                if (offset > 0) {
-                    offset -= 1;
-                    continue;
-                }
-
-                // Build DirEntry: name[64], file_type u32, size u32
-                var ent_buf: [entry_size]u8 = @splat(0);
-                // Format ID as name
-                var dec_buf: [20]u8 = undefined;
-                const id_str = fmtDecimal(ct.id, &dec_buf);
-                @memcpy(ent_buf[0..id_str.len], id_str);
-                // file_type = 1 (directory)
-                ent_buf[64] = 1;
-                @memcpy(dest[total..][0..entry_size], &ent_buf);
-                total += entry_size;
-            }
-            entry_ptr.read_offset += @intCast(total / entry_size);
-            return total;
-        },
-        .clone => {
-            // Allocate a new container on first read
-            if (entry_ptr.read_offset > 0) return 0; // Already read
-
-            const ct = container.allocSlot() orelse return 0;
-            entry_ptr.read_offset = 1;
-            entry_ptr.cntr_id = ct.id;
-
-            // Return decimal ID string
-            var dec_buf: [20]u8 = undefined;
-            const id_str = fmtDecimal(ct.id, &dec_buf);
-            if (id_str.len <= max) {
-                @memcpy(dest[0..id_str.len], id_str);
-                return id_str.len;
-            }
-            return 0;
-        },
-        .status => {
-            if (entry_ptr.read_offset > 0) return 0; // One-shot read
-            const ct = container.getById(entry_ptr.cntr_id) orelse return 0;
-
-            // Build key-value status text using appendStr/appendKV helpers
-            var buf: [512]u8 = undefined;
-            var pos: usize = 0;
-
-            // "id N\n"
-            pos = appendKV(&buf, pos, "id", ct.id);
-
-            // "name <name>\n"
-            pos = appendStr(&buf, pos, "name ");
-            pos = appendStr(&buf, pos, ct.name[0..ct.name_len]);
-            if (pos < buf.len) {
-                buf[pos] = '\n';
-                pos += 1;
-            }
-
-            // "state <state>\n"
-            const state_str = switch (ct.state) {
-                .free => "free",
-                .created => "created",
-                .running => "running",
-                .stopped => "stopped",
-                .failed => "failed",
-            };
-            pos = appendStr(&buf, pos, "state ");
-            pos = appendStr(&buf, pos, state_str);
-            if (pos < buf.len) {
-                buf[pos] = '\n';
-                pos += 1;
-            }
-
-            // "compat <mode>\n"
-            pos = appendStr(&buf, pos, "compat ");
-            pos = appendStr(&buf, pos, if (ct.compat == .linux) "linux" else "fornax");
-            if (pos < buf.len) {
-                buf[pos] = '\n';
-                pos += 1;
-            }
-
-            // "init_pid N|none\n"
-            if (ct.init_pid) |pid| {
-                pos = appendKV(&buf, pos, "init_pid", pid);
-            } else {
-                pos = appendStr(&buf, pos, "init_pid none\n");
-            }
-
-            // Numeric KV fields
-            pos = appendKV(&buf, pos, "procs", ct.process_count);
-            pos = appendKV(&buf, pos, "pages", ct.pages_used_total);
-            pos = appendKV(&buf, pos, "quota_pages", ct.quotas.max_memory_pages);
-            pos = appendKV(&buf, pos, "quota_children", ct.quotas.max_children);
-
-            // "rootfs <path>\n"
-            pos = appendStr(&buf, pos, "rootfs ");
-            pos = appendStr(&buf, pos, ct.rootfs_path[0..ct.rootfs_path_len]);
-            if (pos < buf.len) {
-                buf[pos] = '\n';
-                pos += 1;
-            }
-
-            // "ip <a.b.c.d>\n" (if assigned)
-            if (ct.net_ip != 0) {
-                pos = appendStr(&buf, pos, "ip ");
-                const ip: u64 = ct.net_ip;
-                var dec_buf2: [20]u8 = undefined;
-                pos = appendStr(&buf, pos, fmtDecimal(ip & 0xFF, &dec_buf2));
-                if (pos < buf.len) {
-                    buf[pos] = '.';
-                    pos += 1;
-                }
-                pos = appendStr(&buf, pos, fmtDecimal((ip >> 8) & 0xFF, &dec_buf2));
-                if (pos < buf.len) {
-                    buf[pos] = '.';
-                    pos += 1;
-                }
-                pos = appendStr(&buf, pos, fmtDecimal((ip >> 16) & 0xFF, &dec_buf2));
-                if (pos < buf.len) {
-                    buf[pos] = '.';
-                    pos += 1;
-                }
-                pos = appendStr(&buf, pos, fmtDecimal((ip >> 24) & 0xFF, &dec_buf2));
-                if (pos < buf.len) {
-                    buf[pos] = '\n';
-                    pos += 1;
-                }
-            }
-
-            // "cmd <command>\n"
-            if (ct.cmd_len > 0) {
-                pos = appendStr(&buf, pos, "cmd ");
-                pos = appendStr(&buf, pos, ct.cmd[0..ct.cmd_len]);
-                if (pos < buf.len) {
-                    buf[pos] = '\n';
-                    pos += 1;
-                }
-            }
-
-            const to_copy = @min(pos, max);
-            @memcpy(dest[0..to_copy], buf[0..to_copy]);
-            entry_ptr.read_offset = 1;
-            return to_copy;
-        },
-        .procs => {
-            if (entry_ptr.read_offset > 0) return 0;
-            const ct = container.getById(entry_ptr.cntr_id) orelse return 0;
-
-            // List PIDs of processes in this container
-            var buf: [512]u8 = undefined;
-            var pos: usize = 0;
-            const table = process.getProcessTable();
-            for (table) |*p| {
-                if (p.state != .free and p.container_id == ct.id) {
-                    var dec_buf: [20]u8 = undefined;
-                    const pid_str = fmtDecimal(p.pid, &dec_buf);
-                    pos = appendStr(&buf, pos, pid_str);
-                    if (pos < buf.len) {
-                        buf[pos] = '\n';
-                        pos += 1;
-                    }
-                    if (pos >= buf.len - 16) break;
-                }
-            }
-
-            const to_copy = @min(pos, max);
-            @memcpy(dest[0..to_copy], buf[0..to_copy]);
-            entry_ptr.read_offset = 1;
-            return to_copy;
-        },
-        .ctl => return 0, // write-only
-    }
+    const max_bytes: usize = @intCast(@min(count, 4096));
+    const offset: usize = entry_ptr.read_offset;
+    if (offset >= total) return 0;
+    const available = total - offset;
+    const to_copy = @min(available, max_bytes);
+    @memcpy(dest[0..to_copy], text_buf[offset..][0..to_copy]);
+    entry_ptr.read_offset += @intCast(to_copy);
+    return to_copy;
 }
 
-// ---------- /cntr write ----------
+/// /dev/ipcctl: write sets effective_max_data, clamped to [4096, MAX_MSG_DATA]. Root only.
+pub fn ipcctlWrite(buf_ptr: u64, count: u64) u64 {
+    const ipc = @import("ipc.zig");
+    const caller = process.getCurrent() orelse return EBADF;
+    if (caller.uid != 0) return EBADF; // permission denied
 
-/// Write to /cntr/N/ctl.
-pub fn cntrWrite(entry: process.FdEntry, buf_ptr: u64, count: u64) u64 {
-    const container = @import("container.zig");
-
-    // Container processes cannot manage containers
-    if (process.getCurrent()) |caller| {
-        if (caller.container_id != container.HOST_CONTAINER) return @bitCast(@as(i64, -1));
-    }
-
-    if (entry.cntr_kind != .ctl) return EBADF;
-
-    const ct = container.getById(entry.cntr_id) orelse return ENOENT;
-    const buf: [*]const u8 = @ptrFromInt(buf_ptr);
-    const len: usize = @intCast(@min(count, 256));
-
+    const src: [*]const u8 = @ptrFromInt(buf_ptr);
+    const len: usize = @intCast(@min(count, 20));
     // Strip trailing whitespace
-    var cmd_len = len;
-    while (cmd_len > 0 and (buf[cmd_len - 1] == '\n' or buf[cmd_len - 1] == ' ')) {
-        cmd_len -= 1;
+    var end = len;
+    while (end > 0 and (src[end - 1] == '\n' or src[end - 1] == ' ')) {
+        end -= 1;
     }
-    if (cmd_len == 0) return EINVAL;
-
-    const cmd = buf[0..cmd_len];
-
-    // "stop" — kill all container processes
-    if (cmd_len == 4 and cmd[0] == 's' and cmd[1] == 't' and cmd[2] == 'o' and cmd[3] == 'p') {
-        container.stop(ct);
-        return len;
-    }
-
-    // "destroy" — stop + free slot
-    if (cmd_len == 7 and cmd[0] == 'd' and cmd[1] == 'e' and cmd[2] == 's' and
-        cmd[3] == 't' and cmd[4] == 'r' and cmd[5] == 'o' and cmd[6] == 'y')
-    {
-        container.destroy(ct);
-        return len;
-    }
-
-    // "name <name>" — set container name (created state only)
-    if (cmd_len > 5 and cmd[0] == 'n' and cmd[1] == 'a' and cmd[2] == 'm' and
-        cmd[3] == 'e' and cmd[4] == ' ')
-    {
-        if (ct.state != .created) return EINVAL;
-        const name = cmd[5..];
-        if (name.len > container.MAX_NAME) return EINVAL;
-        @memcpy(ct.name[0..name.len], name);
-        ct.name_len = @intCast(name.len);
-        return len;
-    }
-
-    // "rootfs <path>" — set rootfs path (created state only)
-    if (cmd_len > 7 and cmd[0] == 'r' and cmd[1] == 'o' and cmd[2] == 'o' and
-        cmd[3] == 't' and cmd[4] == 'f' and cmd[5] == 's' and cmd[6] == ' ')
-    {
-        if (ct.state != .created) return EINVAL;
-        const path = cmd[7..];
-        if (path.len > container.MAX_PATH) return EINVAL;
-        @memcpy(ct.rootfs_path[0..path.len], path);
-        ct.rootfs_path_len = @intCast(path.len);
-        return len;
-    }
-
-    // "compat linux" or "compat fornax"
-    if (cmd_len >= 12 and cmd[0] == 'c' and cmd[1] == 'o' and cmd[2] == 'm' and
-        cmd[3] == 'p' and cmd[4] == 'a' and cmd[5] == 't' and cmd[6] == ' ')
-    {
-        const arg = cmd[7..];
-        if (arg.len == 5 and arg[0] == 'l' and arg[1] == 'i' and arg[2] == 'n' and
-            arg[3] == 'u' and arg[4] == 'x')
-        {
-            ct.compat = .linux;
-            return len;
-        }
-        if (arg.len == 6 and arg[0] == 'f' and arg[1] == 'o' and arg[2] == 'r' and
-            arg[3] == 'n' and arg[4] == 'a' and arg[5] == 'x')
-        {
-            ct.compat = .fornax;
-            return len;
-        }
-        return EINVAL;
-    }
-
-    // "cmd <command>"
-    if (cmd_len > 4 and cmd[0] == 'c' and cmd[1] == 'm' and cmd[2] == 'd' and cmd[3] == ' ') {
-        const command = cmd[4..];
-        if (command.len > container.MAX_PATH) return EINVAL;
-        @memcpy(ct.cmd[0..command.len], command);
-        ct.cmd_len = @intCast(command.len);
-        return len;
-    }
-
-    // "quota pages N" or "quota children N"
-    if (cmd_len > 6 and cmd[0] == 'q' and cmd[1] == 'u' and cmd[2] == 'o' and
-        cmd[3] == 't' and cmd[4] == 'a' and cmd[5] == ' ')
-    {
-        const arg = cmd[6..];
-        if (arg.len > 6 and arg[0] == 'p' and arg[1] == 'a' and arg[2] == 'g' and
-            arg[3] == 'e' and arg[4] == 's' and arg[5] == ' ')
-        {
-            const val = parseDecimal(arg[6..]) orelse return EINVAL;
-            ct.quotas.max_memory_pages = @intCast(val);
-            return len;
-        }
-        if (arg.len > 9 and arg[0] == 'c' and arg[1] == 'h' and arg[2] == 'i' and
-            arg[3] == 'l' and arg[4] == 'd' and arg[5] == 'r' and arg[6] == 'e' and
-            arg[7] == 'n' and arg[8] == ' ')
-        {
-            const val = parseDecimal(arg[9..]) orelse return EINVAL;
-            ct.quotas.max_children = @intCast(val);
-            return len;
-        }
-        return EINVAL;
-    }
-
-    return EINVAL;
+    if (end == 0) return EINVAL;
+    const val = parseDecimal(src[0..end]) orelse return EINVAL;
+    if (val < 4096 or val > ipc.MAX_MSG_DATA) return EINVAL;
+    ipc.effective_max_data = @intCast(val);
+    return len;
 }
 
 pub fn traceRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {

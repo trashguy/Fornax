@@ -92,15 +92,15 @@ pub const ProcessState = enum {
 };
 
 pub const ResourceQuotas = struct {
-    max_memory_pages: u32 = 256, // 1 MB default
+    max_memory_pages: u32 = 2048, // 8 MB default
     max_channels: u32 = 16,
     max_children: u32 = 8,
     cpu_priority: u8 = 128, // 0=lowest, 255=highest
 };
 
-pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, remove, rename, truncate, wstat, console_read, net_read, net_connect, net_listen, dns_query, icmp_read, pipe_read, pipe_write, sleep, ether_read, linux_stat_open, linux_stat_done };
+pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, remove, rename, truncate, wstat, console_read, pipe_read, pipe_write, sleep, ether_read, linux_stat_open, linux_stat_done, poll_wait, linux_sock_step };
 
-pub const FdType = enum(u8) { ipc, net, pipe, blk, proc, cntr, dev_null, dev_zero, dev_random, dev_pci, dev_usb, dev_mouse, dev_cpu, dev_ether, dev_sysname, dev_osversion, dev_time, dev_kmesg, dev_reboot, dev_drivers, dev_pid, dev_user, dev_consctl, dev_sysstat, dev_trace };
+pub const FdType = enum(u8) { ipc, pipe, blk, proc, dev_null, dev_zero, dev_random, dev_pci, dev_usb, dev_mouse, dev_cpu, dev_ether, dev_sysname, dev_osversion, dev_time, dev_kmesg, dev_reboot, dev_drivers, dev_pid, dev_user, dev_consctl, dev_sysstat, dev_trace, dev_ipcctl };
 
 pub const ProcFdKind = enum(u8) {
     dir,
@@ -112,31 +112,6 @@ pub const ProcFdKind = enum(u8) {
     supervisor_ctl,
 };
 
-pub const CntrFdKind = enum(u8) {
-    dir, // /cntr/ directory listing
-    clone, // /cntr/clone — allocate container
-    status, // /cntr/N/status
-    ctl, // /cntr/N/ctl
-    procs, // /cntr/N/procs
-};
-
-pub const NetFdKind = enum(u8) {
-    tcp_clone,
-    tcp_ctl,
-    tcp_data,
-    tcp_listen,
-    tcp_local,
-    tcp_remote,
-    tcp_status,
-    dns_query,
-    dns_ctl,
-    dns_cache,
-    icmp_clone,
-    icmp_ctl,
-    icmp_data,
-    net_status,
-};
-
 /// File descriptor entry: channel ID + which end of the channel.
 pub const FdEntry = struct {
     fd_type: FdType = .ipc,
@@ -146,10 +121,6 @@ pub const FdEntry = struct {
     read_offset: u32,
     /// Server-assigned handle (0 = none / raw channel or kernel-backed, >0 = server file handle).
     server_handle: u32,
-    /// Net-specific fields (only used when fd_type == .net)
-    net_kind: NetFdKind = .tcp_clone,
-    net_conn: u8 = 0,
-    net_read_done: bool = false,
     /// Pipe-specific fields (only used when fd_type == .pipe)
     pipe_id: u8 = 0,
     pipe_is_read: bool = false,
@@ -162,9 +133,6 @@ pub const FdEntry = struct {
     proc_pid: u32 = 0,
     /// Ether-specific fields (only used when fd_type == .dev_ether)
     ether_client: u8 = 0,
-    /// Container-specific fields (only used when fd_type == .cntr)
-    cntr_kind: CntrFdKind = .dir,
-    cntr_id: u8 = 0,
 };
 
 pub const Process = struct {
@@ -240,8 +208,8 @@ pub const Process = struct {
     ipc_serving_client: u32 = 0,
     /// Process name (basename of executable), for /proc/N/status.
     name: [16]u8 = .{0} ** 16,
-    /// Container ID: 0xFF = host, 0..15 = container index.
-    container_id: u8 = 0xFF,
+    /// Process group ID: 0xFF = host, 0..15 = group index.
+    group_id: u8 = 0xFF,
     /// Compatibility mode: 0 = fornax, 1 = linux syscall translation.
     compat: u8 = 0,
     /// Linux compat: user buffer ptr for multi-step stat (0 = not in multi-step stat).
@@ -266,30 +234,6 @@ pub const Process = struct {
         for (3..MAX_FDS) |i| {
             if (fds[i] == null) {
                 fds[i] = .{ .channel_id = channel_id, .is_server = is_server, .read_offset = 0, .server_handle = 0 };
-                return @intCast(i);
-            }
-        }
-        return null;
-    }
-
-    /// Allocate a net fd for /net/* paths.
-    pub fn allocNetFd(self: *Process, kind: NetFdKind, conn: u8) ?u32 {
-        const fds = if (self.thread_group) |tg|
-            (if (tg.fd_table) |ft| &ft.fds else &self.fds)
-        else
-            &self.fds;
-        for (3..MAX_FDS) |i| {
-            if (fds[i] == null) {
-                fds[i] = .{
-                    .fd_type = .net,
-                    .channel_id = 0,
-                    .is_server = false,
-                    .read_offset = 0,
-                    .server_handle = 0,
-                    .net_kind = kind,
-                    .net_conn = conn,
-                    .net_read_done = false,
-                };
                 return @intCast(i);
             }
         }
@@ -381,28 +325,6 @@ pub const Process = struct {
             return null;
         }
 
-    pub fn allocCntrFd(self: *Process, kind: CntrFdKind, cntr_id: u8) ?u32 {
-        const fds = if (self.thread_group) |tg|
-            (if (tg.fd_table) |ft| &ft.fds else &self.fds)
-        else
-            &self.fds;
-        for (3..MAX_FDS) |i| {
-            if (fds[i] == null) {
-                fds[i] = .{
-                    .fd_type = .cntr,
-                    .channel_id = 0,
-                    .is_server = false,
-                    .read_offset = 0,
-                    .server_handle = 0,
-                    .cntr_kind = kind,
-                    .cntr_id = cntr_id,
-                };
-                return @intCast(i);
-            }
-        }
-        return null;
-    }
-
     /// Set a specific fd to a channel entry.
     pub fn setFd(self: *Process, fd: u32, channel_id: ipc.ChannelId, is_server: bool) void {
         if (fd < MAX_FDS) {
@@ -493,7 +415,7 @@ pub fn init() void {
         p.brk = 0;
         p.pages_used = 0;
         p.quotas = .{};
-        p.ipc_msg = ipc.Message.init(.t_open);
+        p.ipc_msg.reset(.t_open);
         p.ipc_recv_buf_ptr = 0;
         p.ipc_pending_msg = null;
         p.ipc_serving_client = 0;
@@ -507,7 +429,7 @@ pub fn init() void {
         p.vt = 0;
         p.thread_group = null;
         p.ctid_ptr = 0;
-        p.container_id = 0xFF;
+        p.group_id = 0xFF;
         p.compat = 0;
         p.uid = 0;
         p.gid = 0;
@@ -666,13 +588,13 @@ pub fn create() ?*Process {
     proc.ctid_ptr = 0;
     proc.fs_base = 0;
     proc.mmap_next = 0x0000_4000_0000_0000;
-    proc.container_id = 0xFF; // host (not in any container)
+    proc.group_id = 0xFF; // host (not in any group)
     proc.compat = 0; // native Fornax
     proc.name = .{0} ** 16;
     proc.linux_stat_buf = 0;
     proc.linux_stat_fd = 0;
     namespace.getRootNamespace().cloneInto(&proc.ns);
-    proc.ipc_msg = ipc.Message.init(.t_open);
+    proc.ipc_msg.reset(.t_open);
 
     // Assign core: kernel-spawned → BSP; otherwise least-loaded core
     proc.assigned_core = if (current()) |_| leastLoadedCore() else 0;
@@ -784,8 +706,10 @@ pub fn createThread(parent: *Process) ?*Process {
     proc.vt = parent.vt;
     proc.uid = parent.uid;
     proc.gid = parent.gid;
+    proc.group_id = parent.group_id;
+    proc.compat = parent.compat;
     proc.ns = namespace.Namespace{ .mounts = undefined, .count = 0 };
-    proc.ipc_msg = ipc.Message.init(.t_open);
+    proc.ipc_msg.reset(.t_open);
     proc.fs_base = 0;
     proc.ctid_ptr = 0;
     proc.mmap_next = 0; // not used directly, group has the shared value
@@ -974,6 +898,13 @@ pub fn killChildren(parent_pid: u32) void {
                 // Skip threads in the same thread group — they're siblings, not children.
                 // Thread cleanup is handled by the exit group mechanism.
                 if (p.thread_group != null) continue;
+                // Skip processes in a group — they survive when their
+                // spawner exits (fnx run -d detached mode). Group
+                // cleanup is handled by process_group.killAll.
+                if (p.group_id != 0xFF) {
+                    p.parent_pid = null; // orphan for zombie reclamation
+                    continue;
+                }
                 // Recurse first (kill grandchildren before child)
                 killChildren(p.pid);
                 // Use CAS to safely transition the process state.
@@ -1317,6 +1248,23 @@ fn switchTo(proc: *Process) noreturn {
         }
     }
 
+    // Temporary: trace blocked resume for Linux compat processes (BEFORE handlers clear pending_op)
+    if (proc.compat == 1 and proc.saved_kernel_rsp != 0 and proc.pending_op != .none) {
+        klog.info("[blk-resume p");
+        klog.infoDec(proc.pid);
+        klog.info(" op=");
+        klog.infoDec(@intFromEnum(proc.pending_op));
+        klog.info(" ret=");
+        const ret = proc.syscall_ret;
+        if (ret >= @as(u64, @bitCast(@as(i64, -4096)))) {
+            klog.info("E-");
+            klog.infoDec(0 -% ret);
+        } else {
+            klog.infoDec(ret);
+        }
+        klog.info("]\n");
+    }
+
     // Sleep delivery — check if the sleep timer has elapsed
     if (proc.pending_op == .sleep) {
         const timer = @import("timer.zig");
@@ -1334,112 +1282,23 @@ fn switchTo(proc: *Process) noreturn {
         }
     }
 
-    // Net read delivery — address space is active, so user pointers are valid
-    if (proc.pending_op == .net_read) {
-        const net_mod = @import("net.zig");
-        const netfs = net_mod.netfs;
-        const tcp = net_mod.tcp;
-
-        if (proc.ipc_recv_buf_ptr != 0 and proc.ipc_recv_buf_ptr < 0x0000_8000_0000_0000) {
-            const fd_entry = proc.getFdEntryPtr(proc.pending_fd) orelse {
-                proc.syscall_ret = 0;
-                proc.pending_op = .none;
-                proc.ipc_recv_buf_ptr = 0;
-                proc.pending_fd = 0;
-                // fall through to resume
-                if (proc.saved_kernel_rsp != 0) {
-                    const frame: [*]u64 = @ptrFromInt(proc.saved_kernel_rsp);
-                    frame[RET_SLOT] = proc.syscall_ret;
-                    proc.saved_kernel_rsp = 0;
-                    syscall_entry.resume_from_kernel_frame(@intFromPtr(frame));
-                } else {
-                    resume_user_mode(proc.user_rip, proc.user_rsp, proc.user_rflags, proc.syscall_ret);
-                }
-            };
-
-            const dest: [*]u8 = @ptrFromInt(proc.ipc_recv_buf_ptr);
-            const buf_size: u16 = @intCast(@min(proc.syscall_ret, 4096));
-            const result = netfs.netRead(fd_entry.net_kind, fd_entry.net_conn, dest[0..buf_size], &fd_entry.net_read_done);
-
-            if (result) |n| {
-                proc.syscall_ret = n;
-            } else {
-                // Still no data — set .blocked BEFORE registering waiter
-                // (same SMP race prevention as pipe_read).
-                proc.state = .blocked;
-                tcp.setReadWaiter(fd_entry.net_conn, @intCast(proc.pid));
-                // Re-check: TCP data may have arrived in the gap
-                const retry = netfs.netRead(fd_entry.net_kind, fd_entry.net_conn, dest[0..buf_size], &fd_entry.net_read_done);
-                if (retry) |n2| {
-                    proc.state = .running;
-                    proc.syscall_ret = n2;
-                } else {
-                    setCurrentInternal(null);
-                    scheduleNext();
-                }
-            }
+    // Poll/select wait — woken by timer tick, re-check fd readiness
+    if (proc.pending_op == .poll_wait) {
+        const linux_socket = @import("linux_socket.zig");
+        if (linux_socket.handlePollResume(proc)) {
+            // Done — clean up stashed state
+            proc.pending_op = .none;
+            proc.sleep_until = 0;
+            proc.ipc_recv_buf_ptr = 0;
+            proc.pending_fd = 0;
+            proc.linux_stat_buf = 0;
+            proc.linux_stat_fd = 0;
         } else {
-            proc.syscall_ret = 0;
+            // Re-block for another check (sleep_until already set by handler)
+            proc.state = .blocked;
+            setCurrentInternal(null);
+            scheduleNext();
         }
-        proc.ipc_recv_buf_ptr = 0;
-        proc.pending_op = .none;
-        proc.pending_fd = 0;
-    }
-
-    // ICMP read delivery — address space is active, so user pointers are valid
-    if (proc.pending_op == .icmp_read) {
-        const net_mod = @import("net.zig");
-        const netfs = net_mod.netfs;
-        const icmp_mod = net_mod.icmp;
-
-        if (proc.ipc_recv_buf_ptr != 0 and proc.ipc_recv_buf_ptr < 0x0000_8000_0000_0000) {
-            const fd_entry = proc.getFdEntryPtr(proc.pending_fd) orelse {
-                proc.syscall_ret = 0;
-                proc.pending_op = .none;
-                proc.ipc_recv_buf_ptr = 0;
-                proc.pending_fd = 0;
-                if (proc.saved_kernel_rsp != 0) {
-                    const frame: [*]u64 = @ptrFromInt(proc.saved_kernel_rsp);
-                    frame[RET_SLOT] = proc.syscall_ret;
-                    proc.saved_kernel_rsp = 0;
-                    syscall_entry.resume_from_kernel_frame(@intFromPtr(frame));
-                } else {
-                    resume_user_mode(proc.user_rip, proc.user_rsp, proc.user_rflags, proc.syscall_ret);
-                }
-            };
-
-            const dest: [*]u8 = @ptrFromInt(proc.ipc_recv_buf_ptr);
-            const buf_size: u16 = @intCast(@min(proc.syscall_ret, 4096));
-            const result = netfs.netRead(fd_entry.net_kind, fd_entry.net_conn, dest[0..buf_size], &fd_entry.net_read_done);
-
-            if (result) |n| {
-                proc.syscall_ret = n;
-            } else {
-                // Still no data — set .blocked BEFORE registering waiter
-                // (same SMP race prevention as pipe_read).
-                proc.state = .blocked;
-                icmp_mod.setReadWaiter(fd_entry.net_conn, @intCast(proc.pid));
-                const retry = netfs.netRead(fd_entry.net_kind, fd_entry.net_conn, dest[0..buf_size], &fd_entry.net_read_done);
-                if (retry) |n2| {
-                    proc.state = .running;
-                    proc.syscall_ret = n2;
-                } else {
-                    setCurrentInternal(null);
-                    scheduleNext();
-                }
-            }
-        } else {
-            proc.syscall_ret = 0;
-        }
-        proc.ipc_recv_buf_ptr = 0;
-        proc.pending_op = .none;
-        proc.pending_fd = 0;
-    }
-
-    // Net connect/listen/dns delivery — just clear pending_op (syscall_ret already set by waker)
-    if (proc.pending_op == .net_connect or proc.pending_op == .net_listen or proc.pending_op == .dns_query) {
-        proc.pending_op = .none;
-        proc.pending_fd = 0;
     }
 
     // Console read delivery — address space is active, so user pointers are valid
@@ -1640,8 +1499,7 @@ fn switchTo(proc: *Process) noreturn {
         proc.pending_op = .none;
     }
 
-    if (proc.saved_kernel_rsp != 0) {
-        // Resume from blocked syscall: the process's kernel stack still has
+    if (proc.saved_kernel_rsp != 0) {        // Resume from blocked syscall: the process's kernel stack still has
         // the full GPR frame from entry.S. Write the return value into the
         // saved return register slot and jump to the restore/return path.
         const saved_ksp = proc.saved_kernel_rsp;
@@ -1691,20 +1549,20 @@ fn deliverIpcMessage(msg: *const ipc.Message, user_buf_ptr: u64) void {
 /// Allocate a physical page for a process, checking quotas.
 pub fn allocPageForProcess(proc: *Process) ?u64 {
     if (proc.pages_used >= proc.quotas.max_memory_pages) return null;
-    // Container-wide memory quota check
-    if (proc.container_id != 0xFF) {
-        const container = @import("container.zig");
-        if (container.getById(proc.container_id)) |ct| {
-            if (!container.canAllocPage(ct)) return null;
+    // Group-wide memory quota check
+    if (proc.group_id != 0xFF) {
+        const pg = @import("process_group.zig");
+        if (pg.getById(proc.group_id)) |g| {
+            if (!pg.canAllocPage(g)) return null;
         }
     }
     const page = pmm.allocPage() orelse return null;
     proc.pages_used += 1;
-    // Track container aggregate
-    if (proc.container_id != 0xFF) {
-        const container = @import("container.zig");
-        if (container.getById(proc.container_id)) |ct| {
-            container.addPages(ct, 1);
+    // Track group aggregate
+    if (proc.group_id != 0xFF) {
+        const pg = @import("process_group.zig");
+        if (pg.getById(proc.group_id)) |g| {
+            pg.addPages(g, 1);
         }
     }
     return page;
@@ -1713,11 +1571,11 @@ pub fn allocPageForProcess(proc: *Process) ?u64 {
 /// Free the user address space (page tables and user pages).
 /// Safe to call even if pml4 is null.
 pub fn freeUserMemory(proc: *Process) void {
-    // Decrement container page aggregate before zeroing
-    if (proc.container_id != 0xFF and proc.pages_used > 0) {
-        const container = @import("container.zig");
-        if (container.getById(proc.container_id)) |ct| {
-            container.subPages(ct, proc.pages_used);
+    // Decrement group page aggregate before zeroing
+    if (proc.group_id != 0xFF and proc.pages_used > 0) {
+        const pg = @import("process_group.zig");
+        if (pg.getById(proc.group_id)) |g| {
+            pg.subPages(g, proc.pages_used);
         }
     }
 

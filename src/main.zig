@@ -12,7 +12,7 @@ const heap = @import("heap.zig");
 const ipc = @import("ipc.zig");
 const process = @import("process.zig");
 const supervisor = @import("supervisor.zig");
-const container = @import("container.zig");
+const process_group = @import("process_group.zig");
 const virtio_net = @import("virtio_net.zig");
 const virtio_blk = @import("virtio_blk.zig");
 const net = @import("net.zig");
@@ -172,8 +172,8 @@ pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize, rsdp: ?[*]const
     // Phase 13: Fault supervisor
     supervisor.init();
 
-    // Phase 14: Containers
-    container.init();
+    // Phase 14: Process Groups
+    process_group.init();
 
     // Phase 15: PCI + virtio-net
     if (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .riscv64 or builtin.cpu.arch == .aarch64) {
@@ -246,7 +246,7 @@ pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize, rsdp: ?[*]const
     const timer = @import("timer.zig");
     timer.init();
 
-    // Phase 16+100: IP stack + TCP/DNS
+    // Phase 16: NIC MAC + frame delivery (TCP/IP lives in userspace netd)
     net.init();
     const ether = @import("ether.zig");
     ether.init();
@@ -258,6 +258,7 @@ pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize, rsdp: ?[*]const
     initrd.mountFiles();
     spawnPartfs();
     spawnFxfs();
+    spawnCntrd();
     spawnInit();
 
     klog.info("Kernel initialized.\n");
@@ -504,6 +505,72 @@ fn spawnFxfs() void {
     }
 
     klog.info("Spawned fxfs (PID ");
+    klog.infoDec(proc.pid);
+    klog.info(")\n");
+}
+
+/// Spawn cntrd — container management IPC server at /cntr/.
+fn spawnCntrd() void {
+    const cntrd_elf = initrd.findFile("cntrd") orelse {
+        klog.warn("No cntrd in initrd — containers disabled.\n");
+        return;
+    };
+
+    const proc = process.create() orelse {
+        klog.err("Failed to create cntrd process!\n");
+        return;
+    };
+
+    const load_result = elf.load(proc.pml4.?, cntrd_elf) catch {
+        klog.err("Failed to load cntrd ELF!\n");
+        proc.state = .dead;
+        return;
+    };
+
+    proc.user_rip = load_result.entry_point;
+    proc.brk = load_result.brk;
+
+    for (0..process.USER_STACK_PAGES) |i| {
+        const page = pmm.allocPage() orelse {
+            klog.err("Failed to allocate cntrd stack!\n");
+            proc.state = .dead;
+            return;
+        };
+        const ptr: [*]u8 = paging.physPtr(page);
+        @memset(ptr[0..mem.PAGE_SIZE], 0);
+        const vaddr = mem.USER_STACK_TOP - (process.USER_STACK_PAGES - i) * mem.PAGE_SIZE;
+        paging.mapPage(proc.pml4.?, vaddr, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
+            klog.err("Failed to map cntrd stack!\n");
+            proc.state = .dead;
+            return;
+        };
+    }
+    proc.user_rsp = mem.USER_STACK_INIT;
+
+    // Create IPC channel for /cntr/
+    const chan = ipc.channelCreate() catch {
+        klog.err("Failed to create cntrd channel!\n");
+        proc.state = .dead;
+        return;
+    };
+
+    // Server end as fd 3
+    proc.setFd(3, chan.server, true);
+
+    // Mount client end at "/cntr/" in root namespace
+    const root_ns = namespace.getRootNamespace();
+    root_ns.mount("/cntr/", chan.client, .{}) catch {
+        klog.err("Failed to mount cntrd at /cntr/!\n");
+        proc.state = .dead;
+        return;
+    };
+
+    proc.parent_pid = null;
+    root_ns.cloneInto(&proc.ns);
+
+    process.markReady(proc);
+
+    klog.info("Spawned cntrd (PID ");
     klog.infoDec(proc.pid);
     klog.info(")\n");
 }

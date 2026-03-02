@@ -178,3 +178,32 @@ pub fn sysArchPrctl(cmd: u64, addr: u64) u64 {
     }
     return EINVAL;
 }
+
+/// Create a shared memory segment. arg0 = size in bytes.
+/// Returns shmem_id or ENOMEM.
+pub fn sysShmemCreate(size: u64) u64 {
+    const shmem = @import("../shmem.zig");
+    const proc = process.getCurrent() orelse return EBADF;
+    if (size == 0 or size > shmem.MAX_SHMEM_PAGES * 4096) return EINVAL;
+    const id = shmem.create(@intCast(size), proc.pid) orelse return ENOMEM;
+    return @as(u64, id);
+}
+
+/// Map a shared memory segment into the caller's address space.
+/// arg0 = shmem_id. Returns virtual address or EINVAL.
+pub fn sysShmemMap(shmem_id: u64) u64 {
+    const shmem = @import("../shmem.zig");
+    const proc = process.getCurrent() orelse return EBADF;
+    const page_table = proc.pml4 orelse return EINVAL;
+    const vaddr = shmem.map(@intCast(shmem_id), page_table, &proc.mmap_next) orelse return EINVAL;
+    return vaddr;
+}
+
+/// Destroy a shared memory segment (creator only). arg0 = shmem_id.
+/// Returns 0 on success, EINVAL on failure.
+pub fn sysShmemDestroy(shmem_id: u64) u64 {
+    const shmem = @import("../shmem.zig");
+    const proc = process.getCurrent() orelse return EBADF;
+    if (shmem.destroy(@intCast(shmem_id), proc.pid)) return 0;
+    return EINVAL;
+}

@@ -12,7 +12,7 @@ const ipc = @import("ipc.zig");
 const heap = @import("heap.zig");
 
 const MAX_MOUNTS = 32;
-const MAX_PATH = 256;
+pub const MAX_PATH = 256;
 
 pub const MountFlags = packed struct {
     replace: bool = false,

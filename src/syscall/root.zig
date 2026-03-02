@@ -14,7 +14,7 @@ pub const proc = @import("proc.zig");
 pub const ipc_handlers = @import("ipc_handlers.zig");
 pub const mem_handlers = @import("mem.zig");
 pub const ns = @import("ns.zig");
-pub const container = @import("container.zig");
+pub const proc_setup = @import("proc_setup.zig");
 
 pub const SYS = enum(u64) {
     open = 0,
@@ -57,8 +57,13 @@ pub const SYS = enum(u64) {
     clone = 37,
     futex = 38,
     ipc_pair = 39,
-    cntr_op = 40,
+    reserved_40 = 40,
     thread_exit = 41,
+    writev = 42,
+    shmem_create = 43,
+    shmem_map = 44,
+    shmem_destroy = 45,
+    proc_setup = 46,
 };
 
 /// Error return values.
@@ -179,21 +184,6 @@ pub fn strEql(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-/// Check if the namespace has a mount specifically at /net/ (userspace netd).
-/// Used to skip the kernel /net/* interception when a userspace server handles it.
-pub fn hasNetMount(ns_arg: *const namespace.Namespace) bool {
-    const prefix = "/net/";
-    for (&ns_arg.mounts) |*m| {
-        if (!m.active) continue;
-        if (m.path_len >= prefix.len) {
-            const mp = m.path[0..m.path_len];
-            if (mp[0] == '/' and mp[1] == 'n' and mp[2] == 'e' and mp[3] == 't' and mp[4] == '/')
-                return true;
-        }
-    }
-    return false;
-}
-
 /// Userspace FdMapping: which parent fd maps to which child fd.
 pub const FdMapping = extern struct {
     child_fd: u32,
@@ -202,6 +192,7 @@ pub const FdMapping = extern struct {
 
 // --- Re-exports for backward compatibility (linux_compat.zig uses syscall.sysRead, etc.) ---
 pub const sysWrite = fs.sysWrite;
+pub const sysWritev = fs.sysWritev;
 pub const sysRead = fs.sysRead;
 pub const sysOpen = fs.sysOpen;
 pub const sysCreate = fs.sysCreate;
@@ -238,6 +229,9 @@ pub const sysMunmap = mem_handlers.sysMunmap;
 pub const sysDup = mem_handlers.sysDup;
 pub const sysDup2 = mem_handlers.sysDup2;
 pub const sysArchPrctl = mem_handlers.sysArchPrctl;
+pub const sysShmemCreate = mem_handlers.sysShmemCreate;
+pub const sysShmemMap = mem_handlers.sysShmemMap;
+pub const sysShmemDestroy = mem_handlers.sysShmemDestroy;
 
 pub const sysMount = ns.sysMount;
 pub const sysBind = ns.sysBind;
@@ -247,7 +241,7 @@ pub const sysSysinfo = ns.sysSysinfo;
 pub const sysSleep = ns.sysSleep;
 pub const sysShutdown = ns.sysShutdown;
 
-pub const sysCntrOp = container.sysCntrOp;
+pub const sysProcSetup = proc_setup.sysProcSetup;
 
 /// Main syscall dispatch. Called from arch-specific entry point.
 pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) u64 {
@@ -269,7 +263,39 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         const cur_proc = process.getCurrent() orelse return ENOSYS;
         if (cur_proc.compat == 1) {
             const linux_compat = @import("../linux_compat.zig");
-            return linux_compat.linuxDispatch(nr, arg0, arg1, arg2, arg3, arg4);
+            const ret = linux_compat.linuxDispatch(nr, arg0, arg1, arg2, arg3, arg4);
+            // Temporary: trace all container syscalls to serial (with PID)
+            klog.info("[lnx p");
+            klog.infoDec(cur_proc.pid);
+            klog.info(" ");
+            klog.infoDec(nr);
+            // For write/close/read: show fd argument
+            if (nr == 0 or nr == 1 or nr == 3 or nr == 20) {
+                klog.info("(fd=");
+                klog.infoDec(arg0);
+                klog.info(")");
+            }
+            // For brk: show requested address
+            if (nr == 12) {
+                klog.info("(a=");
+                klog.infoHex(arg0);
+                klog.info(")");
+            }
+            // For mmap: show length
+            if (nr == 9) {
+                klog.info("(len=");
+                klog.infoDec(arg1);
+                klog.info(")");
+            }
+            if (ret >= @as(u64, @bitCast(@as(i64, -4096)))) {
+                klog.info(" E-");
+                klog.infoDec(0 -% ret);
+            } else {
+                klog.info(" =");
+                klog.infoDec(ret);
+            }
+            klog.info("]\n");
+            return ret;
         }
     }
 
@@ -321,8 +347,13 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         .bind => sysBind(arg0, arg1, arg2, arg3),
         .unmount => sysUnmount(arg0, arg1),
         .ipc_pair => sysIpcPair(arg0),
-        .cntr_op => sysCntrOp(arg0, arg1, arg2, arg3, arg4),
+        .reserved_40 => ENOSYS,
         .thread_exit => sysThreadExit(arg0),
+        .writev => sysWritev(arg0, arg1, arg2),
+        .shmem_create => sysShmemCreate(arg0),
+        .shmem_map => sysShmemMap(arg0),
+        .shmem_destroy => sysShmemDestroy(arg0),
+        .proc_setup => sysProcSetup(arg0, arg1, arg2, arg3, arg4),
     };
 
     @import("../trace.zig").trace(.syscall_exit, @truncate(nr));

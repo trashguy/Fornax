@@ -45,8 +45,13 @@ pub const SYS = enum(u64) {
     clone = 37,
     futex = 38,
     ipc_pair = 39,
-    cntr_op = 40,
+    reserved_40 = 40,
     thread_exit = 41,
+    writev = 42,
+    shmem_create = 43,
+    shmem_map = 44,
+    shmem_destroy = 45,
+    proc_setup = 46,
 };
 
 const ipc = @import("ipc.zig");
@@ -70,6 +75,15 @@ pub const ARGV_BASE: u64 = 0x0000_7FFF_FFEF_F000;
 
 pub fn write(fd: i32, buf: []const u8) usize {
     return syscall3(.write, @bitCast(@as(i64, fd)), @intFromPtr(buf.ptr), buf.len);
+}
+
+pub const Iovec = extern struct {
+    ptr: u64, // pointer to buffer
+    len: u64, // buffer length
+};
+
+pub fn writev(fd: i32, iovecs: []const Iovec) usize {
+    return syscall3(.writev, @bitCast(@as(i64, fd)), @intFromPtr(iovecs.ptr), iovecs.len);
 }
 
 pub fn exit(status: u8) noreturn {
@@ -170,43 +184,101 @@ pub fn ipc_pair() struct { server_fd: i32, client_fd: i32, err: i32 } {
     return .{ .server_fd = result[0], .client_fd = result[1], .err = 0 };
 }
 
-/// Container operations.
-pub const CNTR_START: u64 = 0;
-pub const CNTR_STOP: u64 = 1;
-pub const CNTR_DESTROY: u64 = 2;
-pub const CNTR_EXEC: u64 = 3;
-pub const CNTR_NETD: u64 = 4;
+// ── proc_setup syscall wrappers ─────────────────────────────────────
 
-/// cntr_start(cntr_id, elf_data, argv_block) → pid or negative error
-pub fn cntr_start(cntr_id: u32, elf_data: []const u8, argv_block: ?[]const u8) i32 {
-    const argv_ptr: u64 = if (argv_block) |blk| @intFromPtr(blk.ptr) else 0;
-    const result = syscall5(.cntr_op, CNTR_START, cntr_id, @intFromPtr(elf_data.ptr), elf_data.len, argv_ptr);
+pub const PROC_SETUP_MOUNT = 0;
+pub const PROC_SETUP_SETFD = 1;
+pub const PROC_SETUP_SETCOMPAT = 2;
+pub const PROC_SETUP_SETQUOTA = 3;
+pub const PROC_SETUP_READY = 4;
+pub const PROC_SETUP_SETARGV = 5;
+pub const PROC_SETUP_SETGROUP = 6;
+pub const PROC_SETUP_CLEARNM = 7;
+pub const PROC_SETUP_MOUNTPFX = 8;
+pub const PROC_SETUP_CLONENM = 9;
+pub const PROC_SETUP_ALLOCGROUP = 10;
+pub const PROC_SETUP_GROUPKILL = 11;
+pub const PROC_SETUP_FREEGROUP = 12;
+pub const PROC_SETUP_SETQUOTA_GROUP = 13;
+
+/// Raw proc_setup syscall.
+pub fn proc_setup(op: u64, target_pid: u32, a0: u64, a1: u64, a2: u64) i32 {
+    const result = syscall5(.proc_setup, op, target_pid, a0, a1, a2);
     return @bitCast(@as(u32, @truncate(result)));
 }
 
-/// cntr_stop(cntr_id) → 0 or negative error
-pub fn cntr_stop(cntr_id: u32) i32 {
-    const result = syscall2(.cntr_op, CNTR_STOP, cntr_id);
-    return @bitCast(@as(u32, @truncate(result)));
+/// Allocate a new process group. Returns group_id (0..15) or negative error.
+pub fn group_alloc() i32 {
+    return proc_setup(PROC_SETUP_ALLOCGROUP, 0, 0, 0, 0);
 }
 
-/// cntr_destroy(cntr_id) → 0 or negative error
-pub fn cntr_destroy(cntr_id: u32) i32 {
-    const result = syscall2(.cntr_op, CNTR_DESTROY, cntr_id);
-    return @bitCast(@as(u32, @truncate(result)));
+/// Free a process group.
+pub fn group_free(group_id: u8) i32 {
+    return proc_setup(PROC_SETUP_FREEGROUP, group_id, 0, 0, 0);
 }
 
-/// cntr_exec(cntr_id, elf_data, argv_block) → pid or negative error
-pub fn cntr_exec(cntr_id: u32, elf_data: []const u8, argv_block: ?[]const u8) i32 {
-    const argv_ptr: u64 = if (argv_block) |blk| @intFromPtr(blk.ptr) else 0;
-    const result = syscall5(.cntr_op, CNTR_EXEC, cntr_id, @intFromPtr(elf_data.ptr), elf_data.len, argv_ptr);
-    return @bitCast(@as(u32, @truncate(result)));
+/// Kill all processes in a group.
+pub fn group_kill(group_id: u8) i32 {
+    return proc_setup(PROC_SETUP_GROUPKILL, group_id, 0, 0, 0);
 }
 
-/// cntr_netd(cntr_id, netd_elf) → netd_pid or negative error
-pub fn cntr_netd(cntr_id: u32, netd_elf: []const u8) i32 {
-    const result = syscall5(.cntr_op, CNTR_NETD, cntr_id, @intFromPtr(netd_elf.ptr), netd_elf.len, 0);
-    return @bitCast(@as(u32, @truncate(result)));
+/// Set a quota on a process group.
+pub fn group_set_quota(group_id: u8, field: u32, value: u32) i32 {
+    return proc_setup(PROC_SETUP_SETQUOTA_GROUP, group_id, field, value, 0);
+}
+
+/// Mark a blocked process as ready (runnable).
+pub fn proc_ready(pid: u32) i32 {
+    return proc_setup(PROC_SETUP_READY, pid, 0, 0, 0);
+}
+
+/// Set compat mode on a blocked process. mode: 0=fornax, 1=linux.
+pub fn proc_set_compat(pid: u32, mode: u8) i32 {
+    return proc_setup(PROC_SETUP_SETCOMPAT, pid, mode, 0, 0);
+}
+
+/// Set group_id on a blocked process.
+pub fn proc_set_group(pid: u32, group_id: u8) i32 {
+    return proc_setup(PROC_SETUP_SETGROUP, pid, group_id, 0, 0);
+}
+
+/// Clear namespace on a blocked process.
+pub fn proc_clear_ns(pid: u32) i32 {
+    return proc_setup(PROC_SETUP_CLEARNM, pid, 0, 0, 0);
+}
+
+/// Clone namespace from source_pid into target. source_pid=0 means root namespace.
+pub fn proc_clone_ns(target_pid: u32, source_pid: u32) i32 {
+    return proc_setup(PROC_SETUP_CLONENM, target_pid, source_pid, 0, 0);
+}
+
+/// Mount in a blocked process's namespace using caller's fd for the channel.
+pub fn proc_mount(target_pid: u32, path: []const u8, caller_fd: i32) i32 {
+    return proc_setup(PROC_SETUP_MOUNT, target_pid, @intFromPtr(path.ptr), path.len, @intCast(@as(u32, @bitCast(caller_fd))));
+}
+
+/// Mount with prefix in a blocked process's namespace using caller's fd.
+pub fn proc_mount_pfx(target_pid: u32, path: []const u8, prefix: []const u8, caller_fd: i32) i32 {
+    const fd_u32: u32 = @bitCast(caller_fd);
+    const args_packed: u64 = @as(u64, @intCast(path.len)) |
+        (@as(u64, @intCast(prefix.len)) << 16) |
+        (@as(u64, fd_u32) << 32);
+    return proc_setup(PROC_SETUP_MOUNTPFX, target_pid, @intFromPtr(path.ptr), @intFromPtr(prefix.ptr), args_packed);
+}
+
+/// Copy an fd from caller to target process.
+pub fn proc_set_fd(target_pid: u32, child_fd: u32, parent_fd: u32, flags: u32) i32 {
+    return proc_setup(PROC_SETUP_SETFD, target_pid, child_fd, parent_fd, flags);
+}
+
+/// Set resource quota on a blocked process.
+pub fn proc_set_quota(target_pid: u32, field: u32, value: u32) i32 {
+    return proc_setup(PROC_SETUP_SETQUOTA, target_pid, field, value, 0);
+}
+
+/// Write argv to a blocked process.
+pub fn proc_set_argv(target_pid: u32, argv_block: []const u8) i32 {
+    return proc_setup(PROC_SETUP_SETARGV, target_pid, @intFromPtr(argv_block.ptr), argv_block.len, 0);
 }
 
 pub fn brk(new_brk: u64) u64 {
@@ -223,9 +295,18 @@ pub fn ipc_reply(fd: i32, msg: *IpcMessage) i32 {
     return @bitCast(@as(u32, @truncate(result)));
 }
 
+pub const SPAWN_BLOCKED: u64 = 0x8000_0000;
+
 pub fn spawn(elf_data: []const u8, fd_map: []const FdMapping, argv_block: ?[]const u8) i32 {
     const argv_ptr: u64 = if (argv_block) |blk| @intFromPtr(blk.ptr) else 0;
     const result = syscall5(.spawn, @intFromPtr(elf_data.ptr), elf_data.len, @intFromPtr(fd_map.ptr), fd_map.len, argv_ptr);
+    return @bitCast(@as(u32, @truncate(result)));
+}
+
+/// Spawn a process in blocked state. It stays in .blocked until proc_ready(pid) is called.
+/// Returns the child PID (positive) or negative error.
+pub fn spawn_blocked(elf_data: []const u8, fd_map: []const FdMapping) i32 {
+    const result = syscall5(.spawn, @intFromPtr(elf_data.ptr), elf_data.len, @intFromPtr(fd_map.ptr), fd_map.len | SPAWN_BLOCKED, 0);
     return @bitCast(@as(u32, @truncate(result)));
 }
 
@@ -262,13 +343,14 @@ pub const SysInfo = extern struct {
     uptime_secs: u64,
     ether_mac: u64,
     net_ip: u64,
+    uptime_ms: u64,
 };
 
 pub fn sysinfo() ?SysInfo {
-    var buf: [6]u64 = undefined;
+    var buf: [7]u64 = undefined;
     const result = syscall1(.sysinfo, @intFromPtr(&buf));
     if (result != 0) return null;
-    return .{ .total_pages = buf[0], .free_pages = buf[1], .page_size = buf[2], .uptime_secs = buf[3], .ether_mac = buf[4], .net_ip = buf[5] };
+    return .{ .total_pages = buf[0], .free_pages = buf[1], .page_size = buf[2], .uptime_secs = buf[3], .ether_mac = buf[4], .net_ip = buf[5], .uptime_ms = buf[6] };
 }
 
 pub fn sleep(ms: u64) void {
@@ -341,6 +423,25 @@ pub fn futex(addr: u64, op: u64, val: u64, timeout: u64) u64 {
     return syscall4(.futex, addr, op, val, timeout);
 }
 
+/// Create a shared memory segment of `size` bytes. Returns shmem_id or null on failure.
+pub fn shmemCreate(size: u32) ?u32 {
+    const result = syscall1(.shmem_create, @as(u64, size));
+    if (result >= 0x8000_0000_0000_0000) return null; // error
+    return @intCast(result);
+}
+
+/// Map a shared memory segment into the caller's address space. Returns pointer or null.
+pub fn shmemMap(id: u32) ?[*]u8 {
+    const result = syscall1(.shmem_map, @as(u64, id));
+    if (result >= 0x8000_0000_0000_0000 or result == 0) return null; // error
+    return @ptrFromInt(result);
+}
+
+/// Destroy a shared memory segment (creator only). Returns true on success.
+pub fn shmemDestroy(id: u32) bool {
+    return syscall1(.shmem_destroy, @as(u64, id)) == 0;
+}
+
 pub const RFNAMEG: u64 = 0x08;
 
 // rfork flags (Plan 9)
@@ -405,11 +506,19 @@ pub fn getUptime() u64 {
     return readTimeField(1);
 }
 
+pub fn getMillis() u64 {
+    return readTimeField(2);
+}
+
+pub fn getMicros() u64 {
+    return readTimeField(3);
+}
+
 fn readTimeField(field: usize) u64 {
     const fd_raw = open("/dev/time");
     if (fd_raw < 0) return 0;
     const fd: i32 = @intCast(fd_raw);
-    var buf: [64]u8 = undefined;
+    var buf: [96]u8 = undefined;
     const n = read(fd, &buf);
     _ = close(fd);
     if (n <= 0) return 0;

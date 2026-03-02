@@ -21,6 +21,7 @@ pub const dispatch = root.dispatch;
 
 // --- Re-exported handlers (for linux_compat.zig backward compat) ---
 pub const sysWrite = root.sysWrite;
+pub const sysWritev = root.sysWritev;
 pub const sysRead = root.sysRead;
 pub const sysOpen = root.sysOpen;
 pub const sysCreate = root.sysCreate;

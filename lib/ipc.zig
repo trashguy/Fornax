@@ -4,19 +4,19 @@
 /// shared between clients and servers.
 
 /// IPC message structure for user-space (matches kernel layout).
-/// Layout: tag(u32) + data_len(u32) + data([4096]u8) = 4104 bytes.
+/// Layout: tag(u32) + data_len(u32) + data([65536]u8) = 65544 bytes.
 pub const IpcMessage = extern struct {
     tag: u32,
     data_len: u32,
-    data: [4096]u8,
+    data: [65536]u8,
 
     pub fn init(tag: u32) IpcMessage {
-        return .{ .tag = tag, .data_len = 0, .data = .{0} ** 4096 };
+        return .{ .tag = tag, .data_len = 0, .data = .{0} ** 65536 };
     }
 
     pub fn initWithData(tag: u32, payload: []const u8) IpcMessage {
         var msg = IpcMessage.init(tag);
-        const len: u32 = @intCast(@min(payload.len, 4096));
+        const len: u32 = @intCast(@min(payload.len, 65536));
         @memcpy(msg.data[0..len], payload[0..len]);
         msg.data_len = len;
         return msg;

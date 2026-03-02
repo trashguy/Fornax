@@ -12,16 +12,28 @@ const PROTO_IPV4: u16 = 0x0800;
 const ARP_PACKET_SIZE = 28;
 
 pub const CACHE_SIZE = 32;
+const ARP_HASH_BITS = 6; // 64 buckets
+const ARP_HASH_SIZE = 1 << ARP_HASH_BITS;
+const ARP_HASH_MASK = ARP_HASH_SIZE - 1;
+const HASH_END: u8 = 0xFF;
+
+fn arpHash(ip: [4]u8) usize {
+    const v = @as(u32, ip[0]) | (@as(u32, ip[1]) << 8) |
+        (@as(u32, ip[2]) << 16) | (@as(u32, ip[3]) << 24);
+    return (v *% 2654435761) >> (32 - ARP_HASH_BITS);
+}
 
 pub const CacheEntry = struct {
     ip: [4]u8,
     mac: [6]u8,
     valid: bool,
+    hash_next: u8, // next entry in hash chain, 0xFF = end
 };
 
 pub const ArpTable = struct {
     cache: [CACHE_SIZE]CacheEntry,
     next_slot: usize,
+    hash_buckets: [ARP_HASH_SIZE]u8, // index into cache[], HASH_END = empty
 
     pub fn init() ArpTable {
         return .{
@@ -29,17 +41,20 @@ pub const ArpTable = struct {
                 .ip = .{ 0, 0, 0, 0 },
                 .mac = .{ 0, 0, 0, 0, 0, 0 },
                 .valid = false,
+                .hash_next = HASH_END,
             }} ** CACHE_SIZE,
             .next_slot = 0,
+            .hash_buckets = [_]u8{HASH_END} ** ARP_HASH_SIZE,
         };
     }
 
-    /// Look up a MAC address for the given IP.
+    /// Look up a MAC address for the given IP (O(1) hash chain walk).
     pub fn lookup(self: *const ArpTable, ip: [4]u8) ?[6]u8 {
-        for (&self.cache) |*entry| {
-            if (entry.valid and ipv4.ipEqual(entry.ip, ip)) {
-                return entry.mac;
-            }
+        var idx = self.hash_buckets[arpHash(ip)];
+        while (idx != HASH_END) {
+            const e = &self.cache[idx];
+            if (e.valid and ipv4.ipEqual(e.ip, ip)) return e.mac;
+            idx = e.hash_next;
         }
         return null;
     }
@@ -92,33 +107,72 @@ pub const ArpTable = struct {
         return ethernet.build(buf, ethernet.BROADCAST, our_mac, ethernet.ETHER_ARP, &arp);
     }
 
-    /// Insert or update a cache entry.
+    /// Insert or update a cache entry (hash-accelerated).
     pub fn insert(self: *ArpTable, ip: [4]u8, mac: [6]u8) void {
-        // Update existing
-        for (&self.cache) |*entry| {
-            if (entry.valid and ipv4.ipEqual(entry.ip, ip)) {
-                entry.mac = mac;
+        const bucket = arpHash(ip);
+        // Update existing entry in hash chain
+        var idx = self.hash_buckets[bucket];
+        while (idx != HASH_END) {
+            const e = &self.cache[idx];
+            if (e.valid and ipv4.ipEqual(e.ip, ip)) {
+                e.mac = mac;
                 return;
             }
+            idx = e.hash_next;
         }
-        // Insert new (round-robin eviction)
-        self.cache[self.next_slot] = .{ .ip = ip, .mac = mac, .valid = true };
+        // Insert new — evict at next_slot (round-robin)
+        const slot: u8 = @intCast(self.next_slot);
+        const evicted = &self.cache[slot];
+        // Remove evicted entry from its old hash chain
+        if (evicted.valid) {
+            self.hashRemoveEntry(slot, arpHash(evicted.ip));
+        }
+        // Insert new entry
+        evicted.ip = ip;
+        evicted.mac = mac;
+        evicted.valid = true;
+        // Prepend to new bucket's chain
+        evicted.hash_next = self.hash_buckets[bucket];
+        self.hash_buckets[bucket] = slot;
         self.next_slot = (self.next_slot + 1) % CACHE_SIZE;
+    }
+
+    /// Remove an entry from a hash chain by slot index.
+    fn hashRemoveEntry(self: *ArpTable, slot: u8, bucket: usize) void {
+        if (self.hash_buckets[bucket] == slot) {
+            self.hash_buckets[bucket] = self.cache[slot].hash_next;
+            return;
+        }
+        var prev = self.hash_buckets[bucket];
+        while (prev != HASH_END) {
+            if (self.cache[prev].hash_next == slot) {
+                self.cache[prev].hash_next = self.cache[slot].hash_next;
+                return;
+            }
+            prev = self.cache[prev].hash_next;
+        }
     }
 
     /// Flush all entries.
     pub fn flush(self: *ArpTable) void {
         for (&self.cache) |*entry| {
             entry.valid = false;
+            entry.hash_next = HASH_END;
         }
+        @memset(&self.hash_buckets, HASH_END);
     }
 
     pub fn remove(self: *ArpTable, ip: [4]u8) void {
-        for (&self.cache) |*entry| {
-            if (entry.valid and ipv4.ipEqual(entry.ip, ip)) {
-                entry.valid = false;
+        const bucket = arpHash(ip);
+        var idx = self.hash_buckets[bucket];
+        while (idx != HASH_END) {
+            const e = &self.cache[idx];
+            if (e.valid and ipv4.ipEqual(e.ip, ip)) {
+                e.valid = false;
+                self.hashRemoveEntry(idx, bucket);
                 return;
             }
+            idx = e.hash_next;
         }
     }
 

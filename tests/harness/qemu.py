@@ -14,7 +14,7 @@ from .config import sanitize_serial
 
 class QemuDriver:
     def __init__(self, ovmf, esp_dir, disk_img, smp=1, memory="4G", arch="x86_64",
-                 kernel=None, initrd=None):
+                 kernel=None, initrd=None, tap_iface=None):
         self.ovmf = ovmf
         self.esp_dir = esp_dir
         self.disk_img = disk_img
@@ -23,6 +23,7 @@ class QemuDriver:
         self.arch = arch
         self.kernel = kernel      # riscv64: path to kernel ELF
         self.initrd = initrd      # riscv64: path to initrd
+        self.tap_iface = tap_iface  # TAP interface name (None = SLiRP)
         self.proc = None
         self.buf = b""
         self.full_log = b""
@@ -36,6 +37,12 @@ class QemuDriver:
             return False
 
     def start(self):
+        # Build netdev argument: TAP or SLiRP
+        if self.tap_iface:
+            netdev_arg = f"tap,id=net0,ifname={self.tap_iface},script=no,downscript=no"
+        else:
+            netdev_arg = "user,id=net0"
+
         if self.arch == "aarch64":
             cmd = [
                 "qemu-system-aarch64",
@@ -51,7 +58,7 @@ class QemuDriver:
                 "-no-reboot",
                 "-no-shutdown",
                 "-device", "virtio-net-pci,disable-legacy=off,disable-modern=on,netdev=net0",
-                "-netdev", "user,id=net0",
+                "-netdev", netdev_arg,
                 "-drive", f"file={self.disk_img},format=raw,if=none,id=blk0,cache=writeback",
                 "-device", "virtio-blk-pci,drive=blk0",
             ]
@@ -68,7 +75,7 @@ class QemuDriver:
                 "-nographic",
                 "-drive", f"file={self.disk_img},format=raw,if=none,id=blk0,cache=writeback",
                 "-device", "virtio-blk-pci,drive=blk0",
-                "-netdev", "user,id=net0",
+                "-netdev", netdev_arg,
                 "-device", "virtio-net-pci,netdev=net0",
             ]
         else:
@@ -82,7 +89,7 @@ class QemuDriver:
                 "-display", "none",
                 "-no-reboot",
                 "-device", "virtio-net-pci,netdev=net0",
-                "-netdev", "user,id=net0",
+                "-netdev", netdev_arg,
                 "-device", "virtio-keyboard-pci",
                 "-device", "nec-usb-xhci,id=xhci",
                 "-device", "usb-kbd,bus=xhci.0",

@@ -66,7 +66,7 @@ pub fn sysSysinfo(info_ptr: u64) u64 {
     if (info_ptr >= 0x0000_8000_0000_0000) return EFAULT;
     if (info_ptr % 8 != 0) return EFAULT;
 
-    const ptr: *[6]u64 = @ptrFromInt(info_ptr);
+    const ptr: *[7]u64 = @ptrFromInt(info_ptr);
     ptr[0] = pmm.getTotalPages();
     ptr[1] = pmm.getFreePages();
     ptr[2] = 4096;
@@ -79,16 +79,18 @@ pub fn sysSysinfo(info_ptr: u64) u64 {
         (@as(u64, mac[2]) << 16) | (@as(u64, mac[3]) << 24) |
         (@as(u64, mac[4]) << 32) | (@as(u64, mac[5]) << 40);
 
-    // Container IP: if caller is in a container with a net_ip, return it
-    const container_mod = @import("../container.zig");
+    // Group IP: if caller is in a process group with a net_ip, return it
+    const pg = @import("../process_group.zig");
     ptr[5] = 0;
     if (process.getCurrent()) |proc| {
-        if (proc.container_id != container_mod.HOST_CONTAINER) {
-            if (container_mod.getById(proc.container_id)) |ct| {
-                ptr[5] = ct.net_ip;
+        if (proc.group_id != pg.HOST_GROUP) {
+            if (pg.getById(proc.group_id)) |g| {
+                ptr[5] = g.net_ip;
             }
         }
     }
+
+    ptr[6] = timer.getMillis();
     return 0;
 }
 
@@ -112,7 +114,7 @@ pub fn sysShutdown(flags: u64) noreturn {
     };
     // Container processes cannot shut down the host
     if (process.getCurrent()) |proc| {
-        if (proc.container_id != 0xFF) {
+        if (proc.group_id != 0xFF) {
             proc.state = .dead;
             process.scheduleNext();
         }

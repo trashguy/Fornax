@@ -7,6 +7,7 @@ pub const arp = @import("arp.zig");
 pub const tcp = @import("tcp.zig");
 pub const dns = @import("dns.zig");
 pub const icmp = @import("icmp.zig");
+pub const dhcp = @import("dhcp.zig");
 
 // Convenience type aliases
 pub const TcpStack = tcp.TcpStack;

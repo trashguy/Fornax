@@ -1093,6 +1093,20 @@ const touch_bin = b.addExecutable(.{
     });
     crond_bin.image_base = user_image_base;
 
+    const cntrd_bin = b.addExecutable(.{
+        .name = "cntrd",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("srv/cntrd/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    cntrd_bin.image_base = user_image_base;
+
     const crontab_bin = b.addExecutable(.{
         .name = "crontab",
         .root_module = b.createModule(.{
@@ -1162,6 +1176,20 @@ const touch_bin = b.addExecutable(.{
         }),
     });
     smp_test_bin.image_base = user_image_base;
+
+    const iperf_bin = b.addExecutable(.{
+        .name = "iperf",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("../fornax-extra/iperf/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    iperf_bin.image_base = user_image_base;
 
     // ── TLS support (BearSSL, x86_64 only) ────────────────────────────
     // BearSSL compiled as static library, linked into TLS-capable programs.
@@ -1624,11 +1652,13 @@ const touch_bin = b.addExecutable(.{
         curl_bin,
         netd_bin,
         crond_bin,
+        cntrd_bin,
         crontab_bin,
         date_bin,
         uptime_bin,
         ktrace_bin,
         smp_test_bin,
+        iperf_bin,
     };
     for (disk_programs) |prog| {
         const install = b.addInstallArtifact(prog, .{
@@ -1704,6 +1734,10 @@ const touch_bin = b.addExecutable(.{
         });
         x86_initrd.step.dependOn(&bridge_install.step);
     }
+
+    // Install /etc/net.conf to rootfs
+    const net_conf_install = b.addInstallFile(b.path("etc/net.conf"), "rootfs/etc/net.conf");
+    x86_initrd.step.dependOn(&net_conf_install.step);
 
     // Install test packages (if enabled)
     if (xxd_test_bin) |xxd_exe| {
@@ -1807,9 +1841,11 @@ const touch_bin = b.addExecutable(.{
         .{ "smp-test", "cmd/smp-test/main.zig" },
         .{ "netd", "srv/netd/main.zig" },
         .{ "crond", "srv/crond/main.zig" },
+        .{ "cntrd", "srv/cntrd/main.zig" },
         .{ "crontab", "cmd/crontab/main.zig" },
         .{ "date", "cmd/date/main.zig" },
         .{ "uptime", "cmd/uptime/main.zig" },
+        .{ "iperf", "../fornax-extra/iperf/main.zig" },
     };
 
     var aa64_initrd_bins: [3]*std.Build.Step.Compile = undefined;
@@ -1973,6 +2009,10 @@ const touch_bin = b.addExecutable(.{
         aarch64_initrd.step.dependOn(&aa64_fnx_install.step);
     }
 
+    // Install /etc/net.conf to aarch64 rootfs
+    const aa64_net_conf = b.addInstallFile(b.path("etc/net.conf"), "rootfs-aarch64/etc/net.conf");
+    aarch64_initrd.step.dependOn(&aa64_net_conf.step);
+
     // ── riscv64 freestanding kernel ─────────────────────────────────
     // RISC-V boots via OpenSBI + direct kernel load (not UEFI PE/COFF,
     // which Zig's linker doesn't support for riscv64).
@@ -2065,9 +2105,11 @@ const touch_bin = b.addExecutable(.{
         .{ "smp-test", "cmd/smp-test/main.zig" },
         .{ "netd", "srv/netd/main.zig" },
         .{ "crond", "srv/crond/main.zig" },
+        .{ "cntrd", "srv/cntrd/main.zig" },
         .{ "crontab", "cmd/crontab/main.zig" },
         .{ "date", "cmd/date/main.zig" },
         .{ "uptime", "cmd/uptime/main.zig" },
+        .{ "iperf", "../fornax-extra/iperf/main.zig" },
     };
 
     // Build riscv64 initrd programs (init, partfs, fxfs)
@@ -2231,6 +2273,10 @@ const touch_bin = b.addExecutable(.{
         });
         rv_initrd.step.dependOn(&rv_fnx_install.step);
     }
+
+    // Install /etc/net.conf to riscv64 rootfs
+    const rv_net_conf = b.addInstallFile(b.path("etc/net.conf"), "rootfs-riscv64/etc/net.conf");
+    rv_initrd.step.dependOn(&rv_net_conf.step);
 
     // ── Named steps ─────────────────────────────────────────────────
     const mkfxfs_install = b.addInstallArtifact(mkfxfs, .{});

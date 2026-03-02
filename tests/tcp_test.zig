@@ -17,12 +17,13 @@ var mock_tick_count: u32 = 0;
 const OUR_IP = [_]u8{ 10, 0, 2, 15 };
 const REMOTE_IP = [_]u8{ 93, 184, 216, 34 };
 
-fn mockSend(dst_ip: [4]u8, tcp_segment: []const u8) void {
+fn mockSend(dst_ip: [4]u8, tcp_segment: []const u8) bool {
     mock_send_dst = dst_ip;
     const len = @min(tcp_segment.len, mock_send_buf.len);
     @memcpy(mock_send_buf[0..len], tcp_segment[0..len]);
     mock_send_len = len;
     mock_send_count += 1;
+    return true;
 }
 
 fn mockGetIp() [4]u8 {
@@ -40,16 +41,40 @@ fn resetMock() void {
     mock_send_dst = .{ 0, 0, 0, 0 };
 }
 
-// TcpStack is ~5MB, use heap allocation for tests
+// ── Test buffer alloc/free callbacks ────────────────────────────────
+
+fn testAllocBuf(len: u32) ?[*]u8 {
+    const slice = std.testing.allocator.alloc(u8, len) catch return null;
+    return slice.ptr;
+}
+
+fn testFreeBuf(ptr: [*]u8, len: u32) void {
+    std.testing.allocator.free(ptr[0..len]);
+}
+
+// TcpStack connection array is ~336KB with 4096 slots, use heap
 fn createStack() !*tcp.TcpStack {
     const allocator = std.testing.allocator;
     const stack = try allocator.create(tcp.TcpStack);
     stack.initInPlace(&mockSend, &mockGetIp, &mockGetTicks);
+    stack.allocBufFn = &testAllocBuf;
+    stack.freeBufFn = &testFreeBuf;
     stack.setMaxConnections(8); // small for testing
     return stack;
 }
 
 fn destroyStack(stack: *tcp.TcpStack) void {
+    // Free any allocated connection buffers to avoid test leaks
+    for (&stack.connections) |*c| {
+        if (c.rx_buf) |rx| {
+            testFreeBuf(rx, c.buf_size);
+            c.rx_buf = null;
+        }
+        if (c.tx_buf) |tx| {
+            testFreeBuf(tx, c.tx_buf_size);
+            c.tx_buf = null;
+        }
+    }
     std.testing.allocator.destroy(stack);
 }
 
@@ -157,7 +182,7 @@ test "sendData and recvData" {
 
     // Send data
     const sent = stack.sendData(idx, "hello");
-    try expectEqual(@as(u16, 5), sent);
+    try expectEqual(@as(u32, 5), sent);
     try expect(mock_send_count > 0);
 }
 
@@ -168,7 +193,7 @@ test "sendData on non-established returns 0" {
 
     const idx = stack.alloc() orelse return error.TestUnexpectedResult;
     // Still in closed state
-    try expectEqual(@as(u16, 0), stack.sendData(idx, "hello"));
+    try expectEqual(@as(u32, 0), stack.sendData(idx, "hello"));
 }
 
 // ── announce (listen) ───────────────────────────────────────────────
@@ -336,7 +361,7 @@ fn makeIpHdr(src: [4]u8, dst: [4]u8) ipv4.Header {
     };
 }
 
-fn transitionToEstablished(stack: *tcp.TcpStack, idx: u8) void {
+fn transitionToEstablished(stack: *tcp.TcpStack, idx: u16) void {
     const c = &stack.connections[idx];
     const our_seq = c.snd_una;
     const expected_ack = our_seq +% 1;

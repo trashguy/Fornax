@@ -42,11 +42,18 @@ const cpu = switch (@import("builtin").cpu.arch) {
     },
 };
 
+const SpinLock = @import("spinlock.zig").SpinLock;
+
 const RX_QUEUE = 0;
 const TX_QUEUE = 1;
-const RX_BUFFERS = 16;
-const TX_BUFFERS = 16;
+const RX_BUFFERS = 256;
+const TX_BUFFERS = 256;
 const FRAME_SIZE = 1514 + 10; // Max Ethernet frame + virtio-net header
+
+// TSO: large buffers for offloaded segmentation
+const TSO_BUFFERS = 16;
+const TSO_BUF_SIZE = 65536 + @sizeOf(VirtioNetHeader); // 64KB payload + virtio header
+const TSO_PAGES = (TSO_BUF_SIZE + 4095) / 4096; // pages per TSO buffer (17)
 
 /// virtio-net header prepended to every packet.
 pub const VirtioNetHeader = extern struct {
@@ -65,9 +72,15 @@ pub const NetDevice = struct {
     tx_queue: ?virtio.Virtqueue,
     mac: [6]u8,
     rx_buffers: [RX_BUFFERS]u64, // physical addresses of receive buffers
+    tx_buffers: [TX_BUFFERS]u64, // pre-allocated TX buffer pages (physical)
+    tx_free_mask: u256, // bitmask: bit i = 1 means TX slot i is free
+    tx_lock: SpinLock, // protects TX queue and tx_free_mask
     initialized: bool,
-    /// Index of the RX buffer to recycle on next poll (0xFF = none pending).
-    pending_recycle: u8,
+    /// Index of the RX buffer to recycle on next poll (0xFFFF = none pending).
+    pending_recycle: u16,
+    // TSO large buffers
+    tso_buffers: [TSO_BUFFERS]u64, // physical addresses of TSO buffers
+    tso_free_mask: u16, // bitmask: bit i = 1 means TSO slot i is free
 };
 
 var net_dev: NetDevice = .{
@@ -76,8 +89,13 @@ var net_dev: NetDevice = .{
     .tx_queue = null,
     .mac = .{ 0, 0, 0, 0, 0, 0 },
     .rx_buffers = .{0} ** RX_BUFFERS,
+    .tx_buffers = .{0} ** TX_BUFFERS,
+    .tx_free_mask = ~@as(u256, 0),
+    .tx_lock = .{},
     .initialized = false,
-    .pending_recycle = 0xFF,
+    .pending_recycle = 0xFFFF,
+    .tso_buffers = .{0} ** TSO_BUFFERS,
+    .tso_free_mask = 0,
 };
 
 /// Initialize the virtio-net device.
@@ -119,9 +137,10 @@ pub fn init() bool {
     printMac(net_dev.mac);
     klog.info("\n");
 
-    // Negotiate features — we want MAC and basic packet support
+    // Negotiate features — MAC, status, checksum offload, TSO
     // Don't request MRG_RXBUF to keep things simple
-    virtio.finishInit(&dev, virtio.VIRTIO_NET_F_MAC | virtio.VIRTIO_NET_F_STATUS);
+    virtio.finishInit(&dev, virtio.VIRTIO_NET_F_MAC | virtio.VIRTIO_NET_F_STATUS |
+        virtio.VIRTIO_NET_F_CSUM | virtio.VIRTIO_NET_F_HOST_TSO4);
 
     // Set up receive queue (before DRIVER_OK per virtio spec)
     net_dev.rx_queue = virtio.setupQueue(&dev, RX_QUEUE);
@@ -149,6 +168,37 @@ pub fn init() bool {
     virtio.setDriverOk(&dev);
 
     postRxBuffers();
+
+    // Pre-allocate TX buffer pages (avoids per-packet alloc/free)
+    for (0..TX_BUFFERS) |i| {
+        net_dev.tx_buffers[i] = pmm.allocPage() orelse {
+            klog.err("virtio-net: failed to alloc TX buffer\n");
+            return false;
+        };
+        // Zero via higher-half pointer
+        const ptr: [*]u8 = paging.physPtr(net_dev.tx_buffers[i]);
+        @memset(ptr[0..4096], 0);
+    }
+    net_dev.tx_free_mask = ~@as(u256, 0); // all 256 slots free
+
+    // Pre-allocate TSO large buffers — each needs TSO_PAGES contiguous pages.
+    // We use the regular TX descriptor slots for TSO (slot < TX_BUFFERS), so
+    // TSO buffers are separate staging areas that get copied into a TX slot.
+    // For simplicity, allocate a single page per TSO buffer and limit TSO
+    // frames to what fits in one virtio descriptor (4096 - hdr_size bytes).
+    // True 64KB TSO requires scatter-gather or contiguous alloc; for now
+    // we just enable the feature and cap at the page-size minus header.
+    net_dev.tso_free_mask = 0;
+    if (dev.negotiated_features & virtio.VIRTIO_NET_F_HOST_TSO4 != 0) {
+        for (0..TSO_BUFFERS) |i| {
+            const page = pmm.allocPage() orelse break;
+            net_dev.tso_buffers[i] = page;
+            net_dev.tso_free_mask |= @as(u16, 1) << @intCast(i);
+        }
+        if (net_dev.tso_free_mask != 0) {
+            klog.info("virtio-net: TSO enabled\n");
+        }
+    }
 
     net_dev.dev = dev;
     net_dev.initialized = true;
@@ -204,70 +254,277 @@ fn postRxBuffers() void {
     klog.debug(" RX buffers\n");
 }
 
-/// Send a raw Ethernet frame.
+/// Send a raw Ethernet frame (async — returns immediately after submission).
 /// `data` should NOT include the virtio-net header — this function prepends it.
 pub fn send(data: []const u8) bool {
     if (!net_dev.initialized) return false;
     if (data.len > 1514) return false; // Max Ethernet frame
 
+    net_dev.tx_lock.lock();
+    defer net_dev.tx_lock.unlock();
+
     const tx = &(net_dev.tx_queue.?);
 
-    // Allocate a page for the TX buffer
-    const buf_phys = pmm.allocPage() orelse return false;
-    // Use higher-half pointer — identity-map may have been modified by user
-    // ELF mappings (huge page splits), so @ptrFromInt(buf_phys) can write
-    // to the wrong physical page.
-    const buf: [*]u8 = paging.physPtr(buf_phys);
+    // Reclaim completed TX descriptors
+    while (virtio.pollUsed(tx)) |used| {
+        const completed_idx: u8 = @intCast(used.id & 0xFF);
+        net_dev.tx_free_mask |= @as(u256, 1) << completed_idx;
+    }
 
-    // Write virtio-net header (all zeros = no offloading)
+    // Find a free TX slot
+    if (net_dev.tx_free_mask == 0) {
+        // All slots busy — do a brief spin to reclaim
+        var spins: u32 = 0;
+        while (net_dev.tx_free_mask == 0 and spins < 100_000) : (spins += 1) {
+            if (virtio.pollUsed(tx)) |used| {
+                const completed_idx: u8 = @intCast(used.id & 0xFF);
+                net_dev.tx_free_mask |= @as(u256, 1) << completed_idx;
+            } else {
+                cpu.spinHint();
+            }
+        }
+        if (net_dev.tx_free_mask == 0) return false; // still full
+    }
+
+    const slot: u8 = @intCast(@ctz(net_dev.tx_free_mask));
+    net_dev.tx_free_mask &= ~(@as(u256, 1) << slot);
+
+    // Copy data into pre-allocated buffer
+    const buf_phys = net_dev.tx_buffers[slot];
+    const buf: [*]u8 = paging.physPtr(buf_phys);
     const hdr_size = @sizeOf(VirtioNetHeader);
     @memset(buf[0..hdr_size], 0);
-
-    // Copy frame data after header
     @memcpy(buf[hdr_size..][0..data.len], data);
 
     const total_len: u32 = @intCast(hdr_size + data.len);
 
-    // Add to TX queue
-    _ = virtio.addBuffer(tx, buf_phys, total_len, false) orelse {
-        pmm.freePage(buf_phys);
+    // Submit at explicit descriptor index (no next_desc management)
+    if (!virtio.addBufferAt(tx, @as(u16, slot), buf_phys, total_len, false)) {
+        net_dev.tx_free_mask |= @as(u256, 1) << slot;
         return false;
-    };
+    }
 
-    // Re-arm RX descriptors before TX notify — the TX triggers SLIRP to
-    // respond (ARP reply, TCP SYN-ACK), and the device reads RX descriptors
-    // to deliver the response.  On aarch64, descriptors may be corrupted.
+    // Re-arm RX descriptors before TX notify (aarch64 workaround)
     rearmRxDescs();
 
     virtio.notify(tx);
+    return true;
+}
 
-    // Poll for TX completion so we can free the buffer page.
-    var spins: u32 = 0;
-    while (virtio.pollUsed(tx) == null) : (spins += 1) {
-        if (spins > 10_000_000) {
-            klog.err("virtio-net: TX timeout\n");
-            tx.next_desc = 0;
-            pmm.freePage(buf_phys);
-            return false;
-        }
-        if (spins % 4096 == 0) {
-            // On QEMU TCG, virtio TX is processed in a bottom-half that
-            // only runs when QEMU's main loop iterates.  Halting the vCPU
-            // (wfi/hlt) forces QEMU to exit the execution loop and process
-            // pending bottom-halves.  Brief enable/halt/disable keeps the
-            // re-entrancy window minimal.
-            cpu.enableInterrupts();
-            cpu.hltOnce();
-            cpu.disableInterrupts();
-        } else {
-            cpu.spinHint();
-        }
+/// Returns true if the device negotiated CSUM offload.
+pub fn hasCsumOffload() bool {
+    return net_dev.initialized and
+        (net_dev.dev.negotiated_features & virtio.VIRTIO_NET_F_CSUM != 0);
+}
+
+/// Returns true if the device negotiated TSO (host segmentation).
+pub fn hasTsoOffload() bool {
+    return net_dev.initialized and
+        (net_dev.dev.negotiated_features & virtio.VIRTIO_NET_F_HOST_TSO4 != 0);
+}
+
+/// Send a frame with virtio NEEDS_CSUM flag set. The device will compute
+/// the checksum at csum_start+csum_offset. Used for TCP TX offload.
+pub fn sendWithCsum(data: []const u8, csum_start: u16, csum_offset: u16) bool {
+    if (!net_dev.initialized) return false;
+    if (data.len > 1514) return false;
+
+    net_dev.tx_lock.lock();
+    defer net_dev.tx_lock.unlock();
+
+    const tx = &(net_dev.tx_queue.?);
+
+    // Reclaim completed TX descriptors
+    while (virtio.pollUsed(tx)) |used| {
+        const completed_idx: u8 = @intCast(used.id & 0xFF);
+        net_dev.tx_free_mask |= @as(u256, 1) << completed_idx;
     }
 
-    // Synchronous TX complete — recycle descriptor for next send
-    tx.next_desc = 0;
+    // Find a free TX slot
+    if (net_dev.tx_free_mask == 0) {
+        var spins: u32 = 0;
+        while (net_dev.tx_free_mask == 0 and spins < 100_000) : (spins += 1) {
+            if (virtio.pollUsed(tx)) |used| {
+                const completed_idx: u8 = @intCast(used.id & 0xFF);
+                net_dev.tx_free_mask |= @as(u256, 1) << completed_idx;
+            } else {
+                cpu.spinHint();
+            }
+        }
+        if (net_dev.tx_free_mask == 0) return false;
+    }
 
-    pmm.freePage(buf_phys);
+    const slot: u8 = @intCast(@ctz(net_dev.tx_free_mask));
+    net_dev.tx_free_mask &= ~(@as(u256, 1) << slot);
+
+    const buf_phys = net_dev.tx_buffers[slot];
+    const buf: [*]u8 = paging.physPtr(buf_phys);
+    const hdr_size = @sizeOf(VirtioNetHeader);
+
+    // Set NEEDS_CSUM in the virtio-net header
+    const hdr: *VirtioNetHeader = @ptrCast(@alignCast(buf));
+    hdr.flags = virtio.VIRTIO_NET_HDR_F_NEEDS_CSUM;
+    hdr.gso_type = virtio.VIRTIO_NET_HDR_GSO_NONE;
+    hdr.hdr_len = 0;
+    hdr.gso_size = 0;
+    hdr.csum_start = csum_start;
+    hdr.csum_offset = csum_offset;
+
+    @memcpy(buf[hdr_size..][0..data.len], data);
+
+    const total_len: u32 = @intCast(hdr_size + data.len);
+
+    if (!virtio.addBufferAt(tx, @as(u16, slot), buf_phys, total_len, false)) {
+        net_dev.tx_free_mask |= @as(u256, 1) << slot;
+        return false;
+    }
+
+    rearmRxDescs();
+    virtio.notify(tx);
+    return true;
+}
+
+pub const FrameRef = struct {
+    data: [*]const u8,
+    len: u16,
+};
+
+/// Send multiple frames with a single virtio notify. Returns number of frames sent.
+pub fn sendBatch(frames: []const FrameRef) u32 {
+    if (!net_dev.initialized) return 0;
+
+    net_dev.tx_lock.lock();
+    defer net_dev.tx_lock.unlock();
+
+    const tx = &(net_dev.tx_queue.?);
+    const hdr_size = @sizeOf(VirtioNetHeader);
+    const has_csum = net_dev.dev.negotiated_features & virtio.VIRTIO_NET_F_CSUM != 0;
+
+    // Reclaim completed TX descriptors
+    while (virtio.pollUsed(tx)) |used| {
+        const completed_idx: u8 = @intCast(used.id & 0xFF);
+        net_dev.tx_free_mask |= @as(u256, 1) << completed_idx;
+    }
+
+    var sent: u32 = 0;
+    for (frames) |frame| {
+        if (frame.len > 1514 or frame.len == 0) continue;
+
+        if (net_dev.tx_free_mask == 0) {
+            // Try to reclaim
+            while (virtio.pollUsed(tx)) |used| {
+                const completed_idx: u8 = @intCast(used.id & 0xFF);
+                net_dev.tx_free_mask |= @as(u256, 1) << completed_idx;
+            }
+            if (net_dev.tx_free_mask == 0) break; // all slots full
+        }
+
+        const slot: u8 = @intCast(@ctz(net_dev.tx_free_mask));
+        net_dev.tx_free_mask &= ~(@as(u256, 1) << slot);
+
+        const buf_phys = net_dev.tx_buffers[slot];
+        const buf: [*]u8 = paging.physPtr(buf_phys);
+
+        // Set virtio-net header
+        const hdr: *VirtioNetHeader = @ptrCast(@alignCast(buf));
+        if (has_csum and frame.len >= 34) {
+            const src = frame.data;
+            const ethertype = @as(u16, src[12]) << 8 | src[13];
+            if (ethertype == 0x0800 and src[23] == 6) { // IPv4 + TCP
+                const ip_hdr_len: u16 = @as(u16, src[14] & 0x0F) * 4;
+                hdr.flags = virtio.VIRTIO_NET_HDR_F_NEEDS_CSUM;
+                hdr.gso_type = virtio.VIRTIO_NET_HDR_GSO_NONE;
+                hdr.hdr_len = 0;
+                hdr.gso_size = 0;
+                hdr.csum_start = 14 + ip_hdr_len;
+                hdr.csum_offset = 16;
+            } else {
+                @memset(buf[0..hdr_size], 0);
+            }
+        } else {
+            @memset(buf[0..hdr_size], 0);
+        }
+
+        @memcpy(buf[hdr_size..][0..frame.len], frame.data[0..frame.len]);
+        const total_len: u32 = @intCast(hdr_size + frame.len);
+
+        if (!virtio.addBufferAt(tx, @as(u16, slot), buf_phys, total_len, false)) {
+            net_dev.tx_free_mask |= @as(u256, 1) << slot;
+            break;
+        }
+        sent += 1;
+    }
+
+    if (sent > 0) {
+        rearmRxDescs();
+        virtio.notify(tx); // ONE notify for entire batch
+    }
+    return sent;
+}
+
+/// Max frame size for TSO path (limited by single-page TX buffer: 4096 - virtio header)
+pub const TSO_MAX_FRAME: usize = 4096 - @sizeOf(VirtioNetHeader);
+
+/// Send a large TCP frame with TSO (segmentation offload). The virtio device
+/// segments at `mss`. Frame must contain ETH+IP+TCP headers + payload.
+/// Max frame size: TSO_MAX_FRAME bytes.
+pub fn sendTso(data: []const u8, mss: u16) bool {
+    if (!net_dev.initialized) return false;
+    if (data.len > TSO_MAX_FRAME or data.len == 0) return false;
+    if (net_dev.dev.negotiated_features & virtio.VIRTIO_NET_F_HOST_TSO4 == 0) return false;
+
+    net_dev.tx_lock.lock();
+    defer net_dev.tx_lock.unlock();
+
+    const tx = &(net_dev.tx_queue.?);
+    const hdr_size = @sizeOf(VirtioNetHeader);
+
+    // Reclaim completed TX descriptors
+    while (virtio.pollUsed(tx)) |used| {
+        const completed_idx: u8 = @intCast(used.id & 0xFF);
+        net_dev.tx_free_mask |= @as(u256, 1) << completed_idx;
+    }
+
+    // Find a free TX slot
+    if (net_dev.tx_free_mask == 0) {
+        var spins: u32 = 0;
+        while (net_dev.tx_free_mask == 0 and spins < 100_000) : (spins += 1) {
+            if (virtio.pollUsed(tx)) |used| {
+                const completed_idx: u8 = @intCast(used.id & 0xFF);
+                net_dev.tx_free_mask |= @as(u256, 1) << completed_idx;
+            } else {
+                cpu.spinHint();
+            }
+        }
+        if (net_dev.tx_free_mask == 0) return false;
+    }
+
+    const slot: u8 = @intCast(@ctz(net_dev.tx_free_mask));
+    net_dev.tx_free_mask &= ~(@as(u256, 1) << slot);
+
+    const buf_phys = net_dev.tx_buffers[slot];
+    const buf: [*]u8 = paging.physPtr(buf_phys);
+
+    // Populate virtio-net header for TSO
+    const hdr: *VirtioNetHeader = @ptrCast(@alignCast(buf));
+    hdr.flags = virtio.VIRTIO_NET_HDR_F_NEEDS_CSUM;
+    hdr.gso_type = virtio.VIRTIO_NET_HDR_GSO_TCPV4;
+    hdr.hdr_len = 54; // ETH(14) + IP(20) + TCP(20)
+    hdr.gso_size = mss;
+    hdr.csum_start = 34; // ETH(14) + IP(20)
+    hdr.csum_offset = 16; // TCP checksum field offset
+
+    @memcpy(buf[hdr_size..][0..data.len], data);
+
+    const total_len: u32 = @intCast(hdr_size + data.len);
+
+    if (!virtio.addBufferAt(tx, @as(u16, slot), buf_phys, total_len, false)) {
+        net_dev.tx_free_mask |= @as(u256, 1) << slot;
+        return false;
+    }
+
+    rearmRxDescs();
+    virtio.notify(tx);
     return true;
 }
 
@@ -279,7 +536,7 @@ pub fn poll() ?[]u8 {
 
     // Recycle the previous RX buffer before polling for a new one.
     // The caller has finished processing the frame returned by the last poll().
-    if (net_dev.pending_recycle != 0xFF) {
+    if (net_dev.pending_recycle != 0xFFFF) {
         const idx: u16 = net_dev.pending_recycle;
         // Zero the buffer before re-posting
         const buf_phys = net_dev.rx_buffers[idx];
@@ -291,7 +548,7 @@ pub fn poll() ?[]u8 {
         // Re-arm descriptors before notifying the device (aarch64 workaround)
         rearmRxDescs();
         virtio.notify(rx);
-        net_dev.pending_recycle = 0xFF;
+        net_dev.pending_recycle = 0xFFFF;
     }
 
     // Re-arm RX descriptors before checking the used ring (aarch64 workaround).

@@ -9,6 +9,7 @@
 const process = @import("process.zig");
 const ipc = @import("ipc.zig");
 const builtin = @import("builtin");
+const klog = @import("klog.zig");
 
 // ── Linux syscall numbers (per-arch) ──────────────────────────────────────
 // x86_64 has legacy syscalls (open=2, stat=4, pipe=22, etc.)
@@ -88,6 +89,32 @@ const LNX_RENAMEAT: u64 = if (is_x86_64) 264 else 0x8000_0010;
 const LNX_DUP3: u64 = if (is_x86_64) 0x8000_0011 else 24;
 const LNX_FACCESSAT: u64 = if (is_x86_64) 0x8000_0012 else 48;
 
+// Socket syscalls
+const LNX_SOCKET: u64 = if (is_x86_64) 41 else 198;
+const LNX_CONNECT: u64 = if (is_x86_64) 42 else 203;
+const LNX_ACCEPT: u64 = if (is_x86_64) 43 else 202;
+const LNX_SENDTO: u64 = if (is_x86_64) 44 else 206;
+const LNX_RECVFROM: u64 = if (is_x86_64) 45 else 207;
+const LNX_SENDMSG: u64 = if (is_x86_64) 46 else 211;
+const LNX_RECVMSG: u64 = if (is_x86_64) 47 else 212;
+const LNX_SHUTDOWN: u64 = if (is_x86_64) 48 else 210;
+const LNX_BIND: u64 = if (is_x86_64) 49 else 200;
+const LNX_LISTEN: u64 = if (is_x86_64) 50 else 201;
+const LNX_GETSOCKNAME: u64 = if (is_x86_64) 51 else 204;
+const LNX_GETPEERNAME: u64 = if (is_x86_64) 52 else 205;
+const LNX_SOCKETPAIR: u64 = if (is_x86_64) 53 else 199;
+const LNX_SETSOCKOPT: u64 = if (is_x86_64) 54 else 208;
+const LNX_GETSOCKOPT: u64 = if (is_x86_64) 55 else 209;
+const LNX_ACCEPT4: u64 = if (is_x86_64) 288 else 242;
+
+// Poll/select/nanosleep
+const LNX_POLL: u64 = if (is_x86_64) 7 else 0x8000_0017;
+const LNX_SELECT: u64 = if (is_x86_64) 23 else 0x8000_0018;
+const LNX_PPOLL: u64 = if (is_x86_64) 271 else 73;
+const LNX_PSELECT6: u64 = if (is_x86_64) 270 else 72;
+const LNX_NANOSLEEP: u64 = if (is_x86_64) 35 else 101;
+const LNX_GETRUSAGE: u64 = if (is_x86_64) 98 else 165;
+
 // Linux constants
 const AT_FDCWD: u64 = @bitCast(@as(i64, -100));
 const O_CREAT: u64 = 0o100;
@@ -107,6 +134,7 @@ const RFFDG: u64 = 0x04;
 
 // Import Fornax syscall handlers
 const syscall = @import("syscall.zig");
+const linux_socket = @import("linux_socket.zig");
 
 // Error constants (same as Fornax — already Linux-compatible negative values)
 const ENOSYS: u64 = @bitCast(@as(i64, -38)); // Linux ENOSYS = 38
@@ -131,7 +159,7 @@ pub fn linuxDispatch(nr: u64, a: u64, b: u64, c: u64, d: u64, e: u64) u64 {
         LNX_WRITE => syscall.sysWrite(a, b, c),
         LNX_OPEN => linuxOpen(a, b, c),
         LNX_OPENAT => linuxOpenat(a, b, c, d),
-        LNX_CLOSE => syscall.sysClose(a),
+        LNX_CLOSE => linux_socket.linuxClose(a),
         LNX_LSEEK => syscall.sysSeek(a, b, c),
         LNX_READV => linuxReadv(a, b, c),
         LNX_WRITEV => linuxWritev(a, b, c),
@@ -209,7 +237,36 @@ pub fn linuxDispatch(nr: u64, a: u64, b: u64, c: u64, d: u64, e: u64) u64 {
         // ── Random ────────────────────────────────────────────────
         LNX_GETRANDOM => linuxGetrandom(a, b),
 
-        else => ENOSYS,
+        // ── Sockets ──────────────────────────────────────────────
+        LNX_SOCKET => linux_socket.linuxSocket(a, b, c),
+        LNX_CONNECT => linux_socket.linuxConnect(a, b, c),
+        LNX_BIND => linux_socket.linuxBind(a, b, c),
+        LNX_LISTEN => linux_socket.linuxListen(a, b),
+        LNX_ACCEPT, LNX_ACCEPT4 => linux_socket.linuxAccept(a, b, c),
+        LNX_SETSOCKOPT => linux_socket.linuxSetsockopt(a, b, c, d, e),
+        LNX_GETSOCKOPT => linux_socket.linuxGetsockopt(a, b, c, d, e),
+        LNX_SHUTDOWN => linux_socket.linuxShutdown(a, b),
+        LNX_GETPEERNAME => linux_socket.linuxGetpeername(a, b, c),
+        LNX_GETSOCKNAME => linux_socket.linuxGetsockname(a, b, c),
+        LNX_SENDTO => linux_socket.linuxSendto(a, b, c, d, e),
+        LNX_RECVFROM => linux_socket.linuxRecvfrom(a, b, c, d, e),
+        LNX_SENDMSG, LNX_RECVMSG => 0, // stub
+        LNX_SOCKETPAIR => ENOSYS,
+
+        // ── Poll / Select / Sleep ────────────────────────────────
+        LNX_POLL, LNX_PPOLL => linux_socket.linuxPoll(a, b, c),
+        LNX_SELECT, LNX_PSELECT6 => linux_socket.linuxSelect(a, b, c, d, e),
+        LNX_NANOSLEEP => linux_socket.linuxNanosleep(a, b),
+
+        // ── Resource usage ───────────────────────────────────────
+        LNX_GETRUSAGE => linuxGetrusage(a, b),
+
+        else => {
+            klog.info("linux: unknown nr=");
+            klog.infoDec(nr);
+            klog.info("\n");
+            return ENOSYS;
+        },
     };
 }
 
@@ -448,20 +505,25 @@ fn linuxClockGettime(clk_id: u64, tp_ptr: u64) u64 {
     _ = clk_id;
     if (tp_ptr == 0 or tp_ptr >= 0x0000_8000_0000_0000) return EFAULT;
     // struct timespec { i64 tv_sec, i64 tv_nsec }
-    const result = syscall.sysSysinfo(tp_ptr);
-    // sysSysinfo writes to user buf. We need uptime_secs from the result.
-    // Fornax sysinfo format: [total_mem:u64][free_mem:u64][procs:u64][uptime_secs:u64]
-    // We need a temp buf to get the sysinfo, then extract uptime.
-    _ = result;
-    // Simpler approach: read uptime from timer directly
-    const timer = @import("timer.zig");
-    const uptime_ticks = timer.getTicks();
-    const uptime_secs = uptime_ticks / timer.TICKS_PER_SEC;
+    const timer_mod = @import("timer.zig");
+    const uptime_ticks: u64 = timer_mod.getTicks();
+    const tps: u64 = timer_mod.TICKS_PER_SEC;
+    const uptime_secs = uptime_ticks / tps;
+    const remainder_ticks = uptime_ticks % tps;
+    const nsec = (remainder_ticks * 1_000_000_000) / tps;
 
     const sec_ptr: *align(1) u64 = @ptrFromInt(tp_ptr);
     const nsec_ptr: *align(1) u64 = @ptrFromInt(tp_ptr + 8);
     sec_ptr.* = uptime_secs;
-    nsec_ptr.* = 0;
+    nsec_ptr.* = nsec;
+    return 0;
+}
+
+fn linuxGetrusage(_: u64, usage_ptr: u64) u64 {
+    if (usage_ptr == 0 or usage_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+    // Zero-fill the rusage struct (144 bytes on x86_64)
+    const dest: [*]u8 = @ptrFromInt(usage_ptr);
+    @memset(dest[0..144], 0);
     return 0;
 }
 

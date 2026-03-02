@@ -108,6 +108,11 @@ pub fn setupArgv(child_pml4: *paging.PageTable, argv_ptr: u64, child: *process.P
     child.user_rsp = mem.ARGV_BASE - 8;
 
     // Set process name from argv[0] basename
+    setNameFromArgv(argv_ptr, child);
+}
+
+/// Set process name from the basename of argv[0] in the wire argv format.
+pub fn setNameFromArgv(argv_ptr: u64, child: *process.Process) void {
     if (argv_ptr != 0 and argv_ptr < 0x0000_8000_0000_0000) {
         const w: [*]const u8 = @ptrFromInt(argv_ptr);
         const wargc = @as(u32, w[0]) |
@@ -173,20 +178,11 @@ pub fn sysExit(status: u64) noreturn {
     // Check if this is a supervised service exiting
     _ = @import("../supervisor.zig").handleProcessExit(proc.pid);
 
-    // Decrement container process count + update state if init exits
-    if (proc.container_id != 0xFF) {
-        const container = @import("../container.zig");
-        if (container.getById(proc.container_id)) |ct| {
-            container.removeProcess(ct);
-            // If this is the container's init process, kill all other
-            // container processes (netd + threads) and mark stopped/failed.
-            // Must happen BEFORE killChildren so thread-grouped processes
-            // (which killChildren would skip) are properly terminated.
-            if (ct.init_pid != null and ct.init_pid.? == proc.pid) {
-                container.killAllProcessesExcept(ct, proc.pid);
-                ct.state = if (status == 0) .stopped else .failed;
-                ct.init_pid = null;
-            }
+    // Decrement process group count
+    if (proc.group_id != 0xFF) {
+        const pg = @import("../process_group.zig");
+        if (pg.getById(proc.group_id)) |g| {
+            pg.removeProcess(g);
         }
     }
 
@@ -261,7 +257,7 @@ pub fn sysExit(status: u64) noreturn {
                         const queue_empty = chan.client.pending_count == 0;
                         chan.lock.unlock();
                         if (has_waiter and queue_empty) {
-                            proc.ipc_msg = ipc.Message.init(.t_close);
+                            proc.ipc_msg.reset(.t_close);
                             writeU32LE(proc.ipc_msg.data_buf[0..4], entry.server_handle);
                             proc.ipc_msg.data_len = 4;
                             sendToServer(chan, proc);
@@ -319,7 +315,13 @@ pub fn sysExit(status: u64) noreturn {
                     }
                 }
             }
-            // Parent exists but not waiting — become zombie
+            // Parent exists but is dead/free — orphan the zombie for reclamation
+            if (parent.state == .dead or parent.state == .free or parent.state == .zombie) {
+                proc.state = .zombie;
+                proc.parent_pid = null;
+                process.scheduleNext();
+            }
+            // Parent exists but not waiting — become zombie (parent will reap later)
             proc.state = .zombie;
             process.scheduleNext();
         }
@@ -395,7 +397,7 @@ pub fn sysThreadExit(status: u64) noreturn {
                         const queue_empty = chan.client.pending_count == 0;
                         chan.lock.unlock();
                         if (has_waiter and queue_empty) {
-                            proc.ipc_msg = ipc.Message.init(.t_close);
+                            proc.ipc_msg.reset(.t_close);
                             writeU32LE(proc.ipc_msg.data_buf[0..4], entry.server_handle);
                             proc.ipc_msg.data_len = 4;
                             sendToServer(chan, proc);
@@ -693,7 +695,7 @@ pub fn sysRfork(flags: u64) u64 {
         child.ipc_pending_msg = null;
         child.thread_group = null;
         child.ctid_ptr = 0;
-        child.ipc_msg = ipc.Message.init(.t_open);
+        child.ipc_msg.reset(.t_open);
 
         // File descriptor table
         if (flags & RFCFDG != 0) {
@@ -909,9 +911,17 @@ pub fn sysExec(elf_ptr: u64, elf_len: u64, argv_ptr: u64) u64 {
     process.scheduleNext(); // noreturn — process resumes with new image
 }
 
-pub fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64, argv_ptr: u64) u64 {
+/// Flag: bit 31 of fd_map_len means "spawn blocked" — process stays in .blocked
+/// state and is not made runnable.  Caller must use proc_setup(READY) to start it.
+pub const SPAWN_BLOCKED: u64 = 0x8000_0000;
+
+pub fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len_raw: u64, argv_ptr: u64) u64 {
     const initrd = @import("../initrd.zig");
     const parent = process.getCurrent() orelse return ENOSYS;
+
+    // Extract blocked flag and actual fd_map count
+    const blocked = (fd_map_len_raw & SPAWN_BLOCKED) != 0;
+    const fd_map_len = fd_map_len_raw & ~SPAWN_BLOCKED;
 
     // Validate ELF pointer
     if (elf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
@@ -923,11 +933,11 @@ pub fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64, ar
 
     const elf_data: []const u8 = @as([*]const u8, @ptrFromInt(elf_ptr))[0..@intCast(elf_len)];
 
-    // Container process count quota check
-    if (parent.container_id != 0xFF) {
-        const container = @import("../container.zig");
-        if (container.getById(parent.container_id)) |ct| {
-            if (!container.canSpawnProcess(ct)) return ENOMEM;
+    // Process group quota check
+    if (parent.group_id != 0xFF) {
+        const pg = @import("../process_group.zig");
+        if (pg.getById(parent.group_id)) |g| {
+            if (!pg.canSpawnProcess(g)) return ENOMEM;
         }
     }
 
@@ -1013,7 +1023,11 @@ pub fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64, ar
     // Layout: [argc: u64][argv[0]: ptr][argv[1]: ptr]...[str0\0str1\0...]
     // Stack pointer is set to ARGV_BASE - 8 (aligned for x86_64 ABI).
     const child_pml4 = child.pml4.?;
-    if (argv_ptr != 0 and argv_ptr < 0x0000_8000_0000_0000) {
+    if (blocked) {
+        // Blocked mode: skip argv setup, caller will use proc_setup(SETARGV).
+        // Set a default RSP pointing to top of user stack.
+        child.user_rsp = mem.USER_STACK_INIT;
+    } else if (argv_ptr != 0 and argv_ptr < 0x0000_8000_0000_0000) {
         // Read wire format from parent's memory: [argc: u32][total: u32][str0\0str1\0...]
         const wire: [*]const u8 = @ptrFromInt(argv_ptr);
         const wire_argc = @as(u32, wire[0]) |
@@ -1137,18 +1151,21 @@ pub fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64, ar
         _ = writeToChildMem(child_pml4, AUXV_BASE, auxv_buf[0..off]);
     }
 
-    // Copy namespace from parent (Plan 9: children inherit namespace)
-    parent.getNs().cloneInto(&child.ns);
-    child.uid = parent.uid;
-    child.gid = parent.gid;
+    // In blocked mode, skip namespace/group inheritance — caller configures via proc_setup.
+    if (!blocked) {
+        // Copy namespace from parent (Plan 9: children inherit namespace)
+        parent.getNs().cloneInto(&child.ns);
+        child.uid = parent.uid;
+        child.gid = parent.gid;
 
-    // Inherit container association
-    child.container_id = parent.container_id;
-    child.compat = parent.compat;
-    if (child.container_id != 0xFF) {
-        const container = @import("../container.zig");
-        if (container.getById(child.container_id)) |ct| {
-            container.addProcess(ct);
+        // Inherit process group association
+        child.group_id = parent.group_id;
+        child.compat = parent.compat;
+        if (child.group_id != 0xFF) {
+            const pg = @import("../process_group.zig");
+            if (pg.getById(child.group_id)) |g| {
+                pg.addProcess(g);
+            }
         }
     }
 
@@ -1179,8 +1196,8 @@ pub fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64, ar
         }
     }
 
-    // Set process name from argv[0] basename
-    if (argv_ptr != 0 and argv_ptr < 0x0000_8000_0000_0000) {
+    // Set process name from argv[0] basename (skip in blocked mode)
+    if (!blocked and argv_ptr != 0 and argv_ptr < 0x0000_8000_0000_0000) {
         const wire: [*]const u8 = @ptrFromInt(argv_ptr);
         const wire_argc = @as(u32, wire[0]) |
             (@as(u32, wire[1]) << 8) |
@@ -1220,8 +1237,11 @@ pub fn sysSpawn(elf_ptr: u64, elf_len: u64, fd_map_ptr: u64, fd_map_len: u64, ar
     }
     klog.debug("]\n");
 
-    // Process is fully initialized — make it runnable
-    process.markReady(child);
+    // In blocked mode, leave process in .blocked state for proc_setup configuration.
+    // Caller must call proc_setup(READY, pid) to make it runnable.
+    if (!blocked) {
+        process.markReady(child);
+    }
 
     return child.pid;
 }

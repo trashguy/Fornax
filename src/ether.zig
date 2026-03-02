@@ -10,7 +10,7 @@ const SpinLock = @import("spinlock.zig").SpinLock;
 const process = @import("process.zig");
 
 pub const MAX_ETHER_CLIENTS = 8;
-const FRAME_RING_SIZE = 64;
+const FRAME_RING_SIZE = 256;
 pub const MAX_FRAME = 1518;
 
 const MAX_WAITERS = 4;
@@ -21,8 +21,8 @@ pub const EtherClient = struct {
     refcount: u8, // number of fds pointing to this client
     ring: [FRAME_RING_SIZE][MAX_FRAME]u8,
     frame_lens: [FRAME_RING_SIZE]u16,
-    head: u8, // next write position
-    count: u8, // frames in ring
+    head: u16, // next write position
+    count: u16, // frames in ring
     read_waiters: [MAX_WAITERS]?u16,
     lock: SpinLock,
 };
@@ -101,8 +101,7 @@ pub fn freeClient(idx: u8) void {
     c.lock.unlock();
 }
 
-/// Deliver a frame to all active ether clients. Called from net.handleFrame.
-/// Returns true if any exclusive client consumed the frame (kernel should skip).
+/// Deliver a frame to all active ether clients. Called from net.poll().
 pub fn deliverFrame(frame: []const u8) bool {
     if (frame.len > MAX_FRAME or frame.len == 0) return false;
     var any_exclusive = false;
@@ -203,6 +202,12 @@ pub fn handleCtl(idx: u8, cmd: []const u8) bool {
     if (strEql(cmd, "shared")) {
         c.exclusive = false;
         return true;
+    }
+    if (strEql(cmd, "csum_offload")) {
+        return @import("virtio_net.zig").hasCsumOffload();
+    }
+    if (strEql(cmd, "tso_offload")) {
+        return @import("virtio_net.zig").hasTsoOffload();
     }
     return false;
 }

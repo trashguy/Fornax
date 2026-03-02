@@ -4,6 +4,7 @@
 .PHONY: run-containers run-containers-dev run-containers-riscv64 run-containers-aarch64
 .PHONY: run-dev test unit-test integration-test
 .PHONY: debug debug-smp debug-dev debug-containers
+.PHONY: cleanup-network setup-network
 
 all: x86_64 aarch64
 
@@ -136,6 +137,20 @@ clean-disk:
 clean:
 	rm -rf zig-out .zig-cache *.img
 
+# Network bridge teardown for TAP-based tests (requires sudo).
+# Detaches host NIC from br-fornax, deletes bridge + TAP, restores host networking.
+cleanup-network:
+	@python3 -c "\
+	import subprocess, sys; \
+	r = subprocess.run(['ip', '-o', 'link', 'show', 'master', 'br-fornax'], capture_output=True, text=True); \
+	nics = [l.split(':')[1].strip().split('@')[0] for l in r.stdout.splitlines() if 'fornax' not in l.split(':')[1]]; \
+	[subprocess.run(['sudo', 'ip', 'link', 'set', n, 'nomaster']) for n in nics]; \
+	subprocess.run(['sudo', 'ip', 'link', 'del', 'br-fornax'], capture_output=True); \
+	subprocess.run(['sudo', 'ip', 'tuntap', 'del', 'dev', 'fornax0', 'mode', 'tap'], capture_output=True); \
+	print('Cleaned up br-fornax' + ((' (detached: ' + ', '.join(nics) + ')') if nics else '')); \
+	print('Restore host IP: sudo dhclient ' + (nics[0] if nics else '<NIC>') + '  or  nmcli d reapply ' + (nics[0] if nics else '<NIC>')) \
+	"
+
 help:
 	@echo "Fornax build targets:"
 	@echo "  make                Build both architectures (debug kernel, ReleaseSafe userspace)"
@@ -171,4 +186,5 @@ help:
 	@echo "    INTEGRATION_ARGS='--session riscv64 --filter container_pull'  Single test"
 	@echo "  make disk            Create x86_64 bootable disk image"
 	@echo "  make clean-disk      Remove disk image (re-created and formatted on next run)"
+	@echo "  make cleanup-network Tear down TAP bridge (br-fornax) and restore host NIC"
 	@echo "  make clean           Remove build artifacts and disk images"
