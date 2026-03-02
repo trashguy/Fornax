@@ -139,6 +139,7 @@ pub const T_CREATE = ipc.T_CREATE;
 pub const T_REMOVE = ipc.T_REMOVE;
 pub const R_OK = ipc.R_OK;
 pub const R_ERROR = ipc.R_ERROR;
+pub const R_AGAIN = ipc.R_AGAIN;
 pub const T_RENAME = ipc.T_RENAME;
 pub const T_TRUNCATE = ipc.T_TRUNCATE;
 pub const T_WSTAT = ipc.T_WSTAT;

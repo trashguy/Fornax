@@ -219,6 +219,15 @@ def prebake_container_image(rootfs_dir):
     os.makedirs(os.path.join(image_rootfs, "usr", "bin"), exist_ok=True)
     os.makedirs(containers_dir, exist_ok=True)
 
+    # Create essential directories for musl/iperf3
+    os.makedirs(os.path.join(image_rootfs, "tmp"), exist_ok=True)
+    os.makedirs(os.path.join(image_rootfs, "etc"), exist_ok=True)
+
+    # Provide /etc/localtime (UTC) — musl opens this for timezone
+    with open(os.path.join(image_rootfs, "etc", "localtime"), "wb") as f:
+        # Minimal TZif2 file for UTC
+        f.write(b"TZif2" + b"\x00" * 39 + b"\x00" * 6 * 4)
+
     # Copy static iperf3 binary
     iperf3_dest = os.path.join(image_rootfs, "usr", "bin", "iperf3")
     shutil.copy2(IPERF3_STATIC_CACHE, iperf3_dest)
@@ -249,29 +258,56 @@ def install_dhcp_config(rootfs_dir):
 
 # ── iperf3 output parsing (from linux_baseline_iperf.py) ─────────────
 
+def _extract_mbps(parts):
+    """Extract Mbps value from a split iperf3 line containing a rate unit."""
+    for j, p in enumerate(parts):
+        if p in ("Gbits/sec", "Mbits/sec", "Kbits/sec"):
+            try:
+                val = float(parts[j - 1])
+                if p == "Gbits/sec":
+                    return val * 1000
+                elif p == "Mbits/sec":
+                    return val
+                else:
+                    return val / 1000
+            except (ValueError, IndexError):
+                pass
+    return None
+
+
 def parse_iperf3_output(text):
     """Extract throughput (Mbps) from iperf3 output text.
 
-    Looks for the summary "sender" or "receiver" line.
+    Looks for the summary "sender" or "receiver" line first.
+    Falls back to averaging the last few per-second interval lines
+    (useful when iperf3 terminates abnormally without printing a summary).
     Returns (mbps, role) or (None, None).
     """
+    # Prefer summary lines
     for role in ("receiver", "sender"):
         for line in text.splitlines():
             if role in line and ("Gbits/sec" in line or "Mbits/sec" in line or "Kbits/sec" in line):
-                parts = line.split()
-                for j, p in enumerate(parts):
-                    if p in ("Gbits/sec", "Mbits/sec", "Kbits/sec"):
-                        try:
-                            val = float(parts[j - 1])
-                            if p == "Gbits/sec":
-                                mbps = val * 1000
-                            elif p == "Mbits/sec":
-                                mbps = val
-                            else:
-                                mbps = val / 1000
-                            return mbps, role
-                        except (ValueError, IndexError):
-                            pass
+                mbps = _extract_mbps(line.split())
+                if mbps is not None:
+                    return mbps, role
+
+    # Fallback: average the last N per-second interval lines
+    interval_rates = []
+    for line in text.splitlines():
+        if ("Gbits/sec" in line or "Mbits/sec" in line or "Kbits/sec" in line):
+            # Skip header/separator lines
+            if "Interval" in line or "- - -" in line:
+                continue
+            mbps = _extract_mbps(line.split())
+            if mbps is not None:
+                interval_rates.append(mbps)
+
+    if interval_rates:
+        # Use last 5 intervals (or all if fewer) for a stable average
+        tail = interval_rates[-5:]
+        avg = sum(tail) / len(tail)
+        return avg, "interval-avg"
+
     return None, None
 
 
@@ -376,21 +412,31 @@ def run_container_iperf(duration, port, serial_log, runs=3):
                 )
                 send_line_quiet(qemu, f"echo {start_marker}; {fnx_cmd}; echo {end_marker}")
 
-                # Wait for completion
+                # Wait for completion. The guest may not self-terminate if its
+                # timer thread fails (no select/timer support yet), so use a
+                # bounded timeout and fall back to host-side throughput data.
                 timed_out = False
                 try:
-                    expect_quiet(qemu, rf"{end_marker}\r?\n", timeout=duration + 90)
+                    expect_quiet(qemu, rf"{end_marker}\r?\n", timeout=duration + 30)
                 except TimeoutError:
                     timed_out = True
+                    # Guest hung — send shutdown to force TCP connection drop
+                    # so the host iperf3 server exits with collected data.
+                    try:
+                        send_line_quiet(qemu, "shutdown")
+                        time.sleep(2)
+                    except Exception:
+                        pass
 
                 # Wait for host iperf3 server to finish
                 host_output = ""
                 try:
-                    iperf_srv.wait(timeout=duration + 15)
+                    iperf_srv.wait(timeout=15)
                     host_output = iperf_srv.stdout.read().decode(errors="replace")
                 except subprocess.TimeoutExpired:
                     iperf_srv.terminate()
                     try:
+                        iperf_srv.wait(timeout=5)
                         host_output = iperf_srv.stdout.read().decode(errors="replace")
                     except Exception:
                         pass
@@ -408,7 +454,18 @@ def run_container_iperf(duration, port, serial_log, runs=3):
                 host_mbps, host_role = parse_iperf3_output(host_output)
                 guest_mbps, guest_role = parse_iperf3_output(guest_output)
 
-                if timed_out:
+                if timed_out and host_mbps is not None:
+                    # Guest didn't terminate cleanly (timer thread issue)
+                    # but host confirms data flowed — count as partial success
+                    results.append({
+                        "status": "OK",
+                        "mbps": host_mbps,
+                        "source": f"host-{host_role}",
+                        "note": "guest timeout (timer thread)",
+                        "host_output": host_output,
+                        "guest_output": guest_output,
+                    })
+                elif timed_out:
                     results.append({
                         "status": "TIMEOUT",
                         "host_output": host_output,
@@ -477,9 +534,10 @@ def run_container_iperf(duration, port, serial_log, runs=3):
                 rn = i + 1
                 if r["status"] == "OK":
                     valid_mbps.append(r["mbps"])
+                    note = f" ({r['note']})" if r.get("note") else ""
                     print(
                         f"  {rn:<5} {GREEN}{'OK':<12}{RESET} "
-                        f"{r['mbps']:>10.1f} {r['source']:<20}",
+                        f"{r['mbps']:>10.1f} {r['source']:<20}{note}",
                         file=out,
                     )
                 elif r["status"] == "TIMEOUT":

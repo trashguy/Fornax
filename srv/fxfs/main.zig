@@ -112,34 +112,65 @@ const Handle = struct {
     inode_nr: u64,
     write_offset: u64,
     active: bool,
+    generation: u16,
+    /// Set by handleRemove when the directory entry was deleted but handles
+    /// are still open.  The last handleClose on this inode frees the data.
+    orphan: bool,
 };
 
 var handles: [MAX_HANDLES]Handle linksection(".bss") = undefined;
+
+/// Rotating allocation cursor — avoids reusing recently freed handles.
+var next_handle_idx: u32 = 1;
+
+/// Encode handle: lower 8 bits = slot index, upper 24 bits = generation.
+/// This prevents stale T_CLOSE messages from freeing freshly allocated handles
+/// when multiple processes share the same IPC channel to fxfs.
+fn encodeHandle(idx: u32, gen: u16) u32 {
+    return ((@as(u32, gen) << 8) | (idx & 0xFF));
+}
+
+fn decodeIndex(handle: u32) u32 {
+    return handle & 0xFF;
+}
+
+fn decodeGeneration(handle: u32) u16 {
+    return @truncate(handle >> 8);
+}
 
 fn allocHandle(inode_nr: u64) ?u32 {
     return allocHandleAt(inode_nr, 0);
 }
 
 fn allocHandleAt(inode_nr: u64, write_offset: u64) ?u32 {
-    for (1..MAX_HANDLES) |i| {
-        if (!handles[i].active) {
-            handles[i] = .{ .inode_nr = inode_nr, .write_offset = write_offset, .active = true };
-            return @intCast(i);
+    var attempts: u32 = 0;
+    while (attempts < MAX_HANDLES - 1) : (attempts += 1) {
+        const idx = next_handle_idx;
+        next_handle_idx = if (next_handle_idx >= MAX_HANDLES - 1) 1 else next_handle_idx + 1;
+        if (!handles[idx].active) {
+            const gen = handles[idx].generation +% 1;
+            handles[idx] = .{ .inode_nr = inode_nr, .write_offset = write_offset, .active = true, .generation = gen, .orphan = false };
+            return encodeHandle(idx, gen);
         }
     }
     return null;
 }
 
 fn freeHandle(handle: u32) void {
-    if (handle > 0 and handle < MAX_HANDLES) {
-        handles[handle].active = false;
+    const idx = decodeIndex(handle);
+    if (idx == 0 or idx >= MAX_HANDLES) return;
+    // Only free if the generation matches — stale closes are silently ignored
+    if (handles[idx].active and handles[idx].generation == decodeGeneration(handle)) {
+        handles[idx].active = false;
     }
 }
 
 fn getHandle(handle: u32) ?*Handle {
-    if (handle == 0 or handle >= MAX_HANDLES) return null;
-    if (!handles[handle].active) return null;
-    return &handles[handle];
+    const idx = decodeIndex(handle);
+    if (idx == 0 or idx >= MAX_HANDLES) return null;
+    if (!handles[idx].active) return null;
+    if (handles[idx].generation != decodeGeneration(handle)) return null;
+    return &handles[idx];
 }
 
 // ── Node cache ─────────────────────────────────────────────────────
@@ -2020,7 +2051,37 @@ fn handleClose(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
         return;
     }
     const handle_id = readU32LE(req.data[0..4]);
+
+    // Save info before freeing so we can check for orphan cleanup
+    const idx = decodeIndex(handle_id);
+    var inode_nr: u64 = 0;
+    var is_orphan = false;
+    if (idx > 0 and idx < MAX_HANDLES and handles[idx].active and
+        handles[idx].generation == decodeGeneration(handle_id))
+    {
+        inode_nr = handles[idx].inode_nr;
+        is_orphan = handles[idx].orphan;
+    }
+
     freeHandle(handle_id);
+
+    // Orphan cleanup: if this was the last handle to an unlinked inode,
+    // free the inode data now (deferred from handleRemove).
+    if (is_orphan and inode_nr > 1) {
+        var still_open = false;
+        for (1..MAX_HANDLES) |i| {
+            if (handles[i].active and handles[i].inode_nr == inode_nr) {
+                still_open = true;
+                break;
+            }
+        }
+        if (!still_open) {
+            freeAllExtents(inode_nr);
+            _ = btreeDelete(.{ .inode_nr = inode_nr, .item_type = INODE_ITEM, .offset = 0 });
+            _ = commitTransaction();
+        }
+    }
+
     resp.* = fx.IpcMessage.init(fx.R_OK);
     resp.data_len = 0;
 }
@@ -2668,21 +2729,24 @@ fn handleRemove(req: *fx.IpcMessage, resp: *fx.IpcMessage) void {
         };
     }
 
-    // Delete DIR_ENTRY from parent
+    // Delete DIR_ENTRY from parent (unlink the name)
     const name_hash = fnvHash(file_name);
     _ = btreeDelete(.{ .inode_nr = parent_inode, .item_type = DIR_ENTRY, .offset = name_hash });
 
-    // Free all extent data blocks and delete all EXTENT_DATA items
-    freeAllExtents(inode_nr);
-
-    // Delete INODE_ITEM
-    _ = btreeDelete(.{ .inode_nr = inode_nr, .item_type = INODE_ITEM, .offset = 0 });
-
-    // Invalidate handles
+    // POSIX: keep inode data alive while open fds exist.
+    // Mark open handles as orphans — the last handleClose frees the data.
+    var has_open_handles = false;
     for (1..MAX_HANDLES) |i| {
         if (handles[i].active and handles[i].inode_nr == inode_nr) {
-            handles[i].active = false;
+            handles[i].orphan = true;
+            has_open_handles = true;
         }
+    }
+
+    if (!has_open_handles) {
+        // No open handles — safe to free inode data immediately
+        freeAllExtents(inode_nr);
+        _ = btreeDelete(.{ .inode_nr = inode_nr, .item_type = INODE_ITEM, .offset = 0 });
     }
 
     if (!commitTransaction()) {
@@ -3092,7 +3156,7 @@ export fn _start() noreturn {
     // Initialize
     cacheInit();
     for (0..MAX_HANDLES) |i| {
-        handles[i] = .{ .inode_nr = 0, .write_offset = 0, .active = false };
+        handles[i] = .{ .inode_nr = 0, .write_offset = 0, .active = false, .generation = 0, .orphan = false };
     }
 
     // Load superblock from /dev/blk0 (fd 4)

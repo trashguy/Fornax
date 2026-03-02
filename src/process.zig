@@ -216,6 +216,13 @@ pub const Process = struct {
     linux_stat_buf: u64 = 0,
     /// Linux compat: temp fd used during multi-step path stat.
     linux_stat_fd: u32 = 0,
+    /// Linux compat: R_AGAIN retry count for current blocked read.
+    ipc_again_count: u8 = 0,
+    /// PID of a child thread that should be woken after the parent has made
+    /// enough syscalls to initialize shared state. Set by sysClone.
+    pending_child_wake: u32 = 0,
+    /// Countdown: number of parent syscalls remaining before waking the child.
+    child_wake_countdown: u8 = 0,
 
     pub fn initFds(self: *Process) void {
         for (&self.fds) |*fd| {
@@ -712,6 +719,9 @@ pub fn createThread(parent: *Process) ?*Process {
     proc.ipc_msg.reset(.t_open);
     proc.fs_base = 0;
     proc.ctid_ptr = 0;
+    proc.ipc_again_count = 0;
+    proc.pending_child_wake = 0;
+    proc.child_wake_countdown = 0;
     proc.mmap_next = 0; // not used directly, group has the shared value
 
     // Join the thread group
@@ -1246,23 +1256,6 @@ fn switchTo(proc: *Process) noreturn {
                 : [v] "r" (proc.fs_base),
             );
         }
-    }
-
-    // Temporary: trace blocked resume for Linux compat processes (BEFORE handlers clear pending_op)
-    if (proc.compat == 1 and proc.saved_kernel_rsp != 0 and proc.pending_op != .none) {
-        klog.info("[blk-resume p");
-        klog.infoDec(proc.pid);
-        klog.info(" op=");
-        klog.infoDec(@intFromEnum(proc.pending_op));
-        klog.info(" ret=");
-        const ret = proc.syscall_ret;
-        if (ret >= @as(u64, @bitCast(@as(i64, -4096)))) {
-            klog.info("E-");
-            klog.infoDec(0 -% ret);
-        } else {
-            klog.infoDec(ret);
-        }
-        klog.info("]\n");
     }
 
     // Sleep delivery — check if the sleep timer has elapsed

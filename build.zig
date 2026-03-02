@@ -1631,7 +1631,7 @@ const touch_bin = b.addExecutable(.{
     });
 
     // ── Initrd: boot-critical servers only ───────────────────────────
-    const x86_initrd = addInitrdStep(b, mkinitrd, "esp/EFI/BOOT", &.{ init_bin, partfs_bin, fxfs_bin });
+    const x86_initrd = addInitrdStep(b, mkinitrd, "esp/EFI/BOOT", &.{ init_bin, partfs_bin, fxfs_bin, cntrd_bin });
     x86_initrd.step.dependOn(&x86_install.step); // ensure ESP dir exists
 
     // ── Rootfs: install disk-bound programs to zig-out/rootfs/bin/ ──
@@ -1848,7 +1848,7 @@ const touch_bin = b.addExecutable(.{
         .{ "iperf", "../fornax-extra/iperf/main.zig" },
     };
 
-    var aa64_initrd_bins: [3]*std.Build.Step.Compile = undefined;
+    var aa64_initrd_bins: [4]*std.Build.Step.Compile = undefined;
     var aa64_disk_bin_buf: [64]*std.Build.Step.Compile = undefined;
     var aa64_disk_bin_count: usize = 0;
 
@@ -1874,6 +1874,8 @@ const touch_bin = b.addExecutable(.{
             aa64_initrd_bins[1] = aa64_prog;
         } else if (std.mem.eql(u8, name, "fxfs")) {
             aa64_initrd_bins[2] = aa64_prog;
+        } else if (std.mem.eql(u8, name, "cntrd")) {
+            aa64_initrd_bins[3] = aa64_prog;
         } else {
             aa64_disk_bin_buf[aa64_disk_bin_count] = aa64_prog;
             aa64_disk_bin_count += 1;
@@ -2112,8 +2114,8 @@ const touch_bin = b.addExecutable(.{
         .{ "iperf", "../fornax-extra/iperf/main.zig" },
     };
 
-    // Build riscv64 initrd programs (init, partfs, fxfs)
-    var rv_initrd_bins: [3]*std.Build.Step.Compile = undefined;
+    // Build riscv64 initrd programs (init, partfs, fxfs, cntrd)
+    var rv_initrd_bins: [4]*std.Build.Step.Compile = undefined;
     var rv_disk_bin_buf: [64]*std.Build.Step.Compile = undefined;
     var rv_disk_bin_count: usize = 0;
 
@@ -2139,6 +2141,8 @@ const touch_bin = b.addExecutable(.{
             rv_initrd_bins[1] = rv_prog;
         } else if (std.mem.eql(u8, name, "fxfs")) {
             rv_initrd_bins[2] = rv_prog;
+        } else if (std.mem.eql(u8, name, "cntrd")) {
+            rv_initrd_bins[3] = rv_prog;
         } else {
             rv_disk_bin_buf[rv_disk_bin_count] = rv_prog;
             rv_disk_bin_count += 1;

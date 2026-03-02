@@ -22,7 +22,8 @@ const ETHER_FD: i32 = 4;
 const MAX_HANDLES = 64;
 const TICK_MS: u32 = 10;
 const POLL_SLEEP_MS: u32 = 2;
-const MAX_POLL_ITERS: u32 = 3000; // ~30 seconds max block
+const MAX_POLL_ITERS: u32 = 3000; // ~6 seconds max block (for listeners/icmp)
+const TCP_DATA_POLL_ITERS: u32 = 50; // ~100ms for TCP data reads (enables select/poll)
 const NUM_WORKERS = 3; // + main thread = 4
 
 // Network config (QEMU defaults)
@@ -678,9 +679,9 @@ fn handleRead(msg: *fx.IpcMessage, reply: *fx.IpcMessage) void {
             // Respect the caller's requested read count (offset 8 in T_READ msg)
             const max_read: u32 = 65536 - 4; // IPC data minus handle prefix
             const requested: u32 = if (msg.data_len >= 12) @intCast(@min(readU32LE(msg.data[8..12]), max_read)) else max_read;
-            // Poll for data with sleep
+            // Poll for data with short timeout (~100ms) to support select/poll
             var iters: u32 = 0;
-            while (iters < MAX_POLL_ITERS) : (iters += 1) {
+            while (iters < TCP_DATA_POLL_ITERS) : (iters += 1) {
                 if (tcp_stack.hasData(h.conn)) {
                     // Read directly into reply.data to avoid stack-allocated temp buffer
                     reply.* = fx.IpcMessage.init(fx.R_OK);
@@ -695,8 +696,9 @@ fn handleRead(msg: *fx.IpcMessage, reply: *fx.IpcMessage) void {
                 }
                 fx.sleep(POLL_SLEEP_MS);
             }
-            // Timeout — return 0 bytes (EOF)
-            reply.* = fx.IpcMessage.init(fx.R_OK);
+            // No data available yet (not EOF) — return R_AGAIN so clients
+            // can distinguish "try later" from "connection closed"
+            reply.* = fx.IpcMessage.init(fx.R_AGAIN);
             reply.data_len = 0;
         },
         .tcp_status => {

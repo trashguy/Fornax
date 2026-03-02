@@ -580,22 +580,95 @@ pub fn sysGetuid() u64 {
 pub fn sysClone(stack_top: u64, tls: u64, ctid_ptr: u64, ptid_ptr: u64, flags: u64) u64 {
     _ = flags;
     const parent = process.getCurrent() orelse return ENOSYS;
+    const syscall_entry = switch (@import("builtin").cpu.arch) {
+        .x86_64 => @import("../arch/x86_64/syscall_entry.zig"),
+        .riscv64 => @import("../arch/riscv64/syscall_entry.zig"),
+        .aarch64 => @import("../arch/aarch64/syscall_entry.zig"),
+        else => unreachable,
+    };
 
     const child = process.createThread(parent) orelse return ENOMEM;
 
-    // Child resumes at instruction after the syscall.
-    // On x86_64, user_rip already points past SYSCALL (hardware sets RCX = next RIP).
-    // On aarch64, hardware sets ELR_EL1 past SVC (preferred return address), same as x86_64.
-    // On riscv64, SEPC points AT the ecall instruction, so add 4 to skip it.
+    // Copy the parent's full GPR frame to the child's kernel stack.
+    // This ensures the child inherits all general-purpose registers (not just
+    // RIP/RSP/RAX), which musl's __clone needs for correct child-side execution.
+    const parent_frame_ptr = syscall_entry.getSavedKernelRsp();
+    if (parent_frame_ptr != 0) {
+        const arch = @import("builtin").cpu.arch;
+
+        // Frame sizes (in u64 slots) per architecture:
+        //   x86_64:  16 slots (128 bytes)  — R15..RSP
+        //   riscv64: 34 slots (272 bytes)  — x1..SSTATUS + padding
+        //   aarch64: 36 slots (288 bytes)  — x0..SPSR + padding
+        const FRAME_SLOTS: usize = switch (arch) {
+            .x86_64 => 16,
+            .riscv64 => 34,
+            .aarch64 => 36,
+            else => unreachable,
+        };
+        const FRAME_BYTES: usize = FRAME_SLOTS * 8;
+
+        // Place frame at top of child's kernel stack
+        const child_frame_base = child.kernel_stack_top - FRAME_BYTES;
+        const parent_frame: [*]const u64 = @ptrFromInt(parent_frame_ptr);
+        const child_frame: [*]u64 = @ptrFromInt(child_frame_base);
+
+        // Copy entire frame
+        for (0..FRAME_SLOTS) |i| {
+            child_frame[i] = parent_frame[i];
+        }
+
+        // Patch return value = 0 (child sees RAX/a0/x0 = 0)
+        const RET_SLOT: usize = switch (arch) {
+            .x86_64 => 12,
+            .riscv64 => 9,
+            .aarch64 => 0,
+            else => unreachable,
+        };
+        child_frame[RET_SLOT] = 0;
+
+        // Patch user stack pointer
+        const RSP_SLOT: usize = switch (arch) {
+            .x86_64 => 15,
+            .riscv64 => 1,  // x2 = sp
+            .aarch64 => 31, // SP_EL0
+            else => unreachable,
+        };
+        child_frame[RSP_SLOT] = stack_top;
+
+        // Patch user instruction pointer (skip ecall on riscv64)
+        const RIP_SLOT: usize = switch (arch) {
+            .x86_64 => 14,  // RCX = user RIP
+            .riscv64 => 31, // SEPC
+            .aarch64 => 32, // ELR_EL1
+            else => unreachable,
+        };
+        child_frame[RIP_SLOT] = parent_frame[RIP_SLOT] + switch (arch) {
+            .riscv64 => 4,
+            else => 0,
+        };
+
+        // Patch TLS register in frame for riscv64 (TP restored from frame[3])
+        if (arch == .riscv64 and tls != 0) {
+            child_frame[3] = tls; // x4 = tp (user TP)
+        }
+
+        // Use resume_from_kernel_frame path (not IRETQ first-run)
+        child.saved_kernel_rsp = child_frame_base;
+    } else {
+        // Fallback: no parent frame (shouldn't happen for clone from userspace)
+        child.saved_kernel_rsp = 0;
+    }
+
+    // Set fields used by switchTo (TLS MSR write, etc.)
     child.user_rip = parent.user_rip + switch (@import("builtin").cpu.arch) {
         .riscv64 => 4,
         else => 0,
     };
     child.user_rsp = stack_top;
     child.user_rflags = parent.user_rflags;
-    child.syscall_ret = 0; // child sees RAX=0
-    child.saved_kernel_rsp = 0; // first-run via IRETQ
-    child.fs_base = tls; // new thread's TLS (CLONE_SETTLS)
+    child.syscall_ret = 0;
+    child.fs_base = tls;
 
     // CLONE_CHILD_CLEARTID: store ctid_ptr for futex wake on exit
     if (ctid_ptr != 0) {
@@ -614,12 +687,28 @@ pub fn sysClone(stack_top: u64, tls: u64, ctid_ptr: u64, ptid_ptr: u64, flags: u
     klog.debugDec(child.pid);
     klog.debug(" stack=");
     klog.debugHex(stack_top);
-    klog.debug(" tls=");
-    klog.debugHex(tls);
     klog.debug("]\n");
 
-    // Thread is fully initialized — now safe for another core to schedule it.
-    process.markReady(child);
+    // Ensure all stores to child's Process struct and kernel stack frame
+    // are globally visible before another core can schedule the child.
+    switch (@import("builtin").cpu.arch) {
+        .x86_64 => asm volatile ("mfence" ::: .{ .memory = true }),
+        .aarch64 => asm volatile ("dsb sy" ::: .{ .memory = true }),
+        .riscv64 => asm volatile ("fence rw, rw" ::: .{ .memory = true }),
+        else => {},
+    }
+
+    if (parent.compat == 1) {
+        // Linux compat: defer waking the child by a couple of syscalls.
+        // This gives the parent time to return to userspace and run musl's
+        // pthread_create cleanup before the child starts on a remote core.
+        parent.pending_child_wake = child.pid;
+        parent.child_wake_countdown = 2;
+    } else {
+        // Native Fornax: wake immediately. Native processes don't have the
+        // same shared-state initialization race.
+        process.markReady(child);
+    }
 
     return child.pid;
 }

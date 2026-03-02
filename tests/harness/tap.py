@@ -347,67 +347,57 @@ class _DhcpServer(threading.Thread):
 
 
 class TapNetwork:
-    """Context manager: TAP bridged to host NIC for real network access.
+    """Context manager: TAP with NAT routing for guest network access.
 
-    Creates a bridge (br-fornax), adds the TAP and the host's default NIC
-    to it, and moves the host's IP onto the bridge.  The guest gets DHCP
-    from the real network (router).
+    Creates a TAP interface on a private subnet (192.168.30.0/24 by default)
+    with IP forwarding and iptables MASQUERADE.  The host NIC is NEVER touched.
+    A built-in DHCP server assigns the guest a fixed IP.
 
     Requires root (sudo).
     """
 
-    BRIDGE = "br-fornax"
+    # Private subnet for the TAP link — must NOT overlap host's real network
+    SUBNET = "10.55.0.0/24"
+    HOST_TAP_IP = "10.55.0.1"
+    GUEST_IP = "10.55.0.15"
+    NETMASK = "255.255.255.0"
 
     def __init__(self, iface="fornax0", host_nic=None):
         self.iface = iface
-        self.host_ip = None       # detected from host NIC
-        self._host_nic = host_nic # explicit NIC override (e.g. "eno1")
-        self._orig_ip = None      # e.g. "192.168.1.100"
-        self._orig_prefix = None  # e.g. "24"
-        self._orig_gw = None      # e.g. "192.168.1.1"
+        self.host_ip = self.HOST_TAP_IP
+        self._host_nic = host_nic  # auto-detected for MASQUERADE
+        self._reused = False
+        self._dhcp = None
+        self._fwd_was_on = False
 
     def __enter__(self):
         self._detect_host_nic()
-        self._setup_bridge()
+        self._setup_tap()
+        self._start_dhcp()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if not getattr(self, '_reused', False):
-            self._teardown_bridge()
+        self._stop_dhcp()
+        if not self._reused:
+            self._teardown_tap()
         return False
 
     # ── detection ──────────────────────────────────────────────────
 
     def _detect_host_nic(self):
-        """Find the default-route interface and its IP/gateway."""
+        """Find the default-route interface (for MASQUERADE out-iface)."""
+        if self._host_nic:
+            return
         out = subprocess.run(
             ["ip", "-4", "route", "show", "default"],
             capture_output=True, text=True, check=True,
         ).stdout.strip()
         if not out:
             raise RuntimeError("No default IPv4 route — can't detect host NIC")
-
         parts = out.split()
-        self._orig_gw = parts[parts.index("via") + 1]
         self._host_nic = parts[parts.index("dev") + 1]
 
-        # Get first IPv4 address on that interface
-        addr_out = subprocess.run(
-            ["ip", "-4", "-o", "addr", "show", "dev", self._host_nic],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-        # Format: "2: eth0    inet 192.168.1.100/24 brd ..."
-        for line in addr_out.splitlines():
-            tok = line.split()
-            inet_idx = tok.index("inet")
-            ip_prefix = tok[inet_idx + 1]          # "192.168.1.100/24"
-            self._orig_ip, self._orig_prefix = ip_prefix.split("/")
-            self.host_ip = self._orig_ip
-            break
-        else:
-            raise RuntimeError(f"No IPv4 address on {self._host_nic}")
-
-    # ── setup / teardown ───────────────────────────────────────────
+    # ── helpers ────────────────────────────────────────────────────
 
     def _run(self, *args, check=True):
         r = subprocess.run(list(args), capture_output=True)
@@ -418,91 +408,112 @@ class TapNetwork:
         return r
 
     def _iface_exists(self, name):
-        """Check if a network interface exists."""
         return os.path.isdir(f"/sys/class/net/{name}")
 
-    def _iface_master(self, name):
-        """Return the master (bridge) of an interface, or None."""
-        link = f"/sys/class/net/{name}/master"
-        if os.path.islink(link):
-            return os.path.basename(os.readlink(link))
-        return None
-
     def _iface_has_ip(self, name, ip):
-        """Check if interface has the given IPv4 address."""
         r = subprocess.run(
             ["ip", "-4", "-o", "addr", "show", "dev", name],
             capture_output=True, text=True,
         )
         return ip in r.stdout
 
-    def _setup_bridge(self):
-        """Create bridge, add TAP + host NIC, move IP to bridge.
+    # ── setup / teardown ───────────────────────────────────────────
 
-        Idempotent: if the bridge/TAP already exist and are configured
-        correctly, this is a no-op (avoids host network flapping).
+    def _setup_tap(self):
+        """Create TAP interface with host IP, enable forwarding + NAT.
+
+        Idempotent: if the TAP already exists and is configured, skip.
         """
-        # Check if everything is already set up
-        if (self._iface_exists(self.BRIDGE)
-                and self._iface_exists(self.iface)
-                and self._iface_master(self.iface) == self.BRIDGE
-                and self._iface_master(self._host_nic) == self.BRIDGE
-                and self._iface_has_ip(self.BRIDGE, self._orig_ip)):
+        if (self._iface_exists(self.iface)
+                and self._iface_has_ip(self.iface, self.HOST_TAP_IP)):
             self._reused = True
             return
 
         self._reused = False
         user = os.environ.get("SUDO_USER", os.environ.get("USER", "root"))
 
-        # Clean up stale state
-        self._run("ip", "link", "del", self.BRIDGE, check=False)
+        # Clean up stale TAP
         self._run("ip", "tuntap", "del", "dev", self.iface, "mode", "tap",
                   check=False)
 
-        # Ensure bridge module is loaded
-        r = self._run("modprobe", "bridge", check=False)
-        if r.returncode != 0:
-            raise RuntimeError(
-                "bridge kernel module not available. "
-                "Reboot if you updated your kernel, or run with --no-tap"
-            )
-
-        # Create bridge
-        self._run("ip", "link", "add", self.BRIDGE, "type", "bridge")
-        self._run("ip", "link", "set", self.BRIDGE, "up")
-
-        # Create TAP, add to bridge
+        # Create TAP
         self._run("ip", "tuntap", "add", "dev", self.iface,
                   "mode", "tap", "user", user)
+        self._run("ip", "addr", "add",
+                  f"{self.HOST_TAP_IP}/24", "dev", self.iface)
         self._run("ip", "link", "set", self.iface, "up")
-        self._run("ip", "link", "set", self.iface, "master", self.BRIDGE)
 
-        # Add host NIC to bridge (briefly drops host connectivity)
-        self._run("ip", "link", "set", self._host_nic, "master", self.BRIDGE)
+        # Enable IP forwarding (save old state)
+        try:
+            with open("/proc/sys/net/ipv4/ip_forward") as f:
+                self._fwd_was_on = f.read().strip() == "1"
+        except OSError:
+            self._fwd_was_on = False
+        if not self._fwd_was_on:
+            with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
+                f.write("1\n")
 
-        # Move IP from host NIC to bridge
-        self._run("ip", "addr", "flush", "dev", self._host_nic)
-        self._run("ip", "addr", "add",
-                  f"{self._orig_ip}/{self._orig_prefix}", "dev", self.BRIDGE)
-        self._run("ip", "route", "add", "default",
-                  "via", self._orig_gw, "dev", self.BRIDGE)
+        # Add MASQUERADE rule (idempotent via -C check)
+        r = self._run("iptables", "-t", "nat", "-C", "POSTROUTING",
+                       "-s", self.SUBNET, "-o", self._host_nic,
+                       "-j", "MASQUERADE", check=False)
+        if r.returncode != 0:
+            self._run("iptables", "-t", "nat", "-A", "POSTROUTING",
+                       "-s", self.SUBNET, "-o", self._host_nic,
+                       "-j", "MASQUERADE")
 
-        time.sleep(0.5)
+        # Allow forwarding for TAP traffic
+        r = self._run("iptables", "-C", "FORWARD",
+                       "-i", self.iface, "-j", "ACCEPT", check=False)
+        if r.returncode != 0:
+            self._run("iptables", "-A", "FORWARD",
+                       "-i", self.iface, "-j", "ACCEPT")
+        r = self._run("iptables", "-C", "FORWARD",
+                       "-o", self.iface, "-m", "state",
+                       "--state", "RELATED,ESTABLISHED",
+                       "-j", "ACCEPT", check=False)
+        if r.returncode != 0:
+            self._run("iptables", "-A", "FORWARD",
+                       "-o", self.iface, "-m", "state",
+                       "--state", "RELATED,ESTABLISHED",
+                       "-j", "ACCEPT")
 
-    def _teardown_bridge(self):
-        """Restore host NIC and remove bridge + TAP."""
-        # Remove host NIC from bridge
-        self._run("ip", "link", "set", self._host_nic, "nomaster",
-                  check=False)
+        time.sleep(0.3)
 
-        # Restore IP on host NIC
-        self._run("ip", "addr", "add",
-                  f"{self._orig_ip}/{self._orig_prefix}",
-                  "dev", self._host_nic, check=False)
-        self._run("ip", "route", "add", "default",
-                  "via", self._orig_gw, "dev", self._host_nic, check=False)
+    def _teardown_tap(self):
+        """Remove TAP, NAT rules, and optionally restore forwarding."""
+        # Remove iptables rules
+        self._run("iptables", "-t", "nat", "-D", "POSTROUTING",
+                   "-s", self.SUBNET, "-o", self._host_nic,
+                   "-j", "MASQUERADE", check=False)
+        self._run("iptables", "-D", "FORWARD",
+                   "-i", self.iface, "-j", "ACCEPT", check=False)
+        self._run("iptables", "-D", "FORWARD",
+                   "-o", self.iface, "-m", "state",
+                   "--state", "RELATED,ESTABLISHED",
+                   "-j", "ACCEPT", check=False)
 
-        # Delete bridge and TAP
-        self._run("ip", "link", "del", self.BRIDGE, check=False)
+        # Restore forwarding if we enabled it
+        if not self._fwd_was_on:
+            try:
+                with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
+                    f.write("0\n")
+            except OSError:
+                pass
+
+        # Delete TAP
         self._run("ip", "tuntap", "del", "dev", self.iface, "mode", "tap",
                   check=False)
+
+    def _start_dhcp(self):
+        """Start the built-in DHCP server on the TAP interface."""
+        self._dhcp = _DhcpServer(
+            self.iface, self.HOST_TAP_IP, self.GUEST_IP,
+            self.NETMASK, "1.1.1.1",
+        )
+        self._dhcp.start()
+        self._dhcp.wait_ready()
+
+    def _stop_dhcp(self):
+        if self._dhcp:
+            self._dhcp.stop()

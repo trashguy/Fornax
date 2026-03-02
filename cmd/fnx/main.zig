@@ -457,28 +457,27 @@ fn cmdRun(argc: u64, argv: []const [*:0]const u8) void {
     _ = fx.proc_clear_ns(pid);
     setupRootfsMount(pid, rootfs_path[0..rootfs_len]);
 
-    // Write argv and make runnable
+    // Write argv
     if (argv_block) |blk| {
         _ = fx.proc_set_argv(pid, blk);
     }
-    _ = fx.proc_ready(pid);
 
     // Notify cntrd about the init pid
     writeCtlDec(id, "started ", pid);
 
-    // 8. Spawn container netd if networking enabled
+    // 8. Share host networking with container (host network mode)
+    // Open a path under /net/ to get the host netd's channel, then mount
+    // that channel as /net/ in the container's namespace.
     if (enable_net) {
-        // Re-read ELF buf for netd (reuses elf_buf)
-        const netd_data = readFileBuf("/bin/netd", &elf_buf) orelse null;
-        if (netd_data) |nd| {
-            const netd_pid = spawnContainerNetd(id, nd, group_id, pid);
-            if (netd_pid != 0) {
-                out.puts("  netd pid=");
-                out.putDec(netd_pid);
-                out.puts("\n");
-            }
+        const net_fd = fx.open("/net/status");
+        if (net_fd >= 0) {
+            _ = fx.proc_mount(pid, "/net/", net_fd);
+            _ = fx.close(net_fd);
         }
     }
+
+    // 9. Now make init runnable — networking is available
+    _ = fx.proc_ready(pid);
 
     out.puts("Container ");
     out.puts(cntr_name);
@@ -488,7 +487,7 @@ fn cmdRun(argc: u64, argv: []const [*:0]const u8) void {
     out.putDec(pid);
     out.puts(")\n");
 
-    // 8. Wait or detach
+    // 10. Wait or detach
     if (!detach) {
         _ = fx.wait(@intCast(pid));
     }
@@ -1072,12 +1071,16 @@ fn spawnContainerProcess(elf_data: []const u8, group_id: u8, compat: u8) u32 {
 /// Spawn a container netd process. Returns netd PID or 0 on failure.
 fn spawnContainerNetd(cntr_id: u8, netd_elf: []const u8, group_id: u8, init_pid: u32) u32 {
     // Allocate ether client fd
-    const ether_fd = fx.open("/dev/ether");
-    if (ether_fd < 0) return 0;
+    const ether_fd = fx.open("/dev/ether0");
+    if (ether_fd < 0) {
+        stderr.puts("fnx: netd: open /dev/ether failed\n");
+        return 0;
+    }
 
     // Create IPC channel pair for /net/ mount
     const chan = fx.ipc_pair();
     if (chan.err < 0) {
+        stderr.puts("fnx: netd: ipc_pair failed\n");
         _ = fx.close(ether_fd);
         return 0;
     }
@@ -1086,6 +1089,7 @@ fn spawnContainerNetd(cntr_id: u8, netd_elf: []const u8, group_id: u8, init_pid:
     var fd_map: [0]fx.FdMapping = .{};
     const pid_i = fx.spawn_blocked(netd_elf, &fd_map);
     if (pid_i < 0) {
+        stderr.puts("fnx: netd: spawn_blocked failed\n");
         _ = fx.close(ether_fd);
         _ = fx.close(chan.server_fd);
         _ = fx.close(chan.client_fd);
@@ -1103,15 +1107,11 @@ fn spawnContainerNetd(cntr_id: u8, netd_elf: []const u8, group_id: u8, init_pid:
     // Clone namespace from container init
     _ = fx.proc_clone_ns(pid, init_pid);
 
-    // Mount /net/ in init's namespace too (via a mount on the blocked netd proc
-    // isn't right — we need it in init's namespace). Instead, mount using bind.
-    // Actually, we mount /net/ in the netd's namespace (cloned from init),
-    // but we also need it in init's namespace. The simplest approach:
-    // mount /net/ on the netd process (which has init's namespace clone),
-    // and the init process already has /net/ from a previous mount or
-    // we can use the bind syscall.
-    // For now, mount /net/ in the netd's own namespace.
+    // Mount /net/ in netd's namespace (cloned from init)
     _ = fx.proc_mount(pid, "/net/", chan.client_fd);
+
+    // Also mount /net/ in init's namespace so the container process can use networking
+    _ = fx.proc_mount(init_pid, "/net/", chan.client_fd);
 
     _ = fx.proc_ready(pid);
 
@@ -1171,9 +1171,14 @@ fn sliceEql(a: []const u8, b: []const u8) bool {
 }
 
 fn parseU8(s: []const u8) ?u8 {
-    if (s.len == 0) return null;
+    // Strip trailing whitespace/newlines
+    var end = s.len;
+    while (end > 0 and (s[end - 1] == '\n' or s[end - 1] == '\r' or s[end - 1] == ' ')) {
+        end -= 1;
+    }
+    if (end == 0) return null;
     var val: u16 = 0;
-    for (s) |c| {
+    for (s[0..end]) |c| {
         if (c < '0' or c > '9') return null;
         val = val * 10 + (c - '0');
         if (val > 255) return null;

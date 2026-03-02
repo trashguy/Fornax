@@ -10,6 +10,7 @@ const EIO = root.EIO;
 const ENOENT = root.ENOENT;
 const ENOMEM = root.ENOMEM;
 const EMFILE = root.EMFILE;
+const EAGAIN: u64 = @bitCast(@as(i64, -11));
 const readU32LE = root.readU32LE;
 const writeU32LE = root.writeU32LE;
 const sendToServer = root.sendToServer;
@@ -101,6 +102,21 @@ pub fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
     };
 
     const is_ok = reply_tag == @intFromEnum(ipc.Tag.r_ok);
+    const is_again = reply_tag == @intFromEnum(ipc.Tag.r_again);
+
+    // Debug: log all IPC replies for compat processes (skip r_again, it's normal)
+    if (client_proc.compat == 1 and !is_ok and !is_again) {
+        const klog2 = @import("../klog.zig");
+        klog2.err("[ipc] FAIL pid=");
+        klog2.errDec(client_proc.pid);
+        klog2.err(" op=");
+        klog2.errDec(@intFromEnum(client_proc.pending_op));
+        klog2.err(" fd=");
+        klog2.errDec(client_proc.pending_fd);
+        klog2.err(" tag=");
+        klog2.errDec(reply_tag);
+        klog2.err("\n");
+    }
 
     switch (client_proc.pending_op) {
         .open, .create => {
@@ -110,12 +126,50 @@ pub fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
                     fd_entry.server_handle = handle;
                 }
             } else {
+                if (client_proc.compat == 1) {
+                    const klog2 = @import("../klog.zig");
+                    klog2.err("[ipc] async open FAIL pid=");
+                    klog2.errDec(client_proc.pid);
+                    klog2.err(" fd=");
+                    klog2.errDec(client_proc.pending_fd);
+                    klog2.err("\n");
+                }
                 client_proc.closeFd(client_proc.pending_fd);
                 client_proc.syscall_ret = ENOENT;
             }
         },
         .read => {
-            if (is_ok) {
+            if (is_again) {
+                // Server says "no data yet, try again".
+                // Always retry — blocking reads must wait for data.
+                // The data thread handles timing independently;
+                // when it finishes, the server sends a response on
+                // the control socket, breaking the R_AGAIN loop.
+                const client_entry = client_proc.getFdEntry(client_proc.pending_fd);
+                if (client_entry) |ce| {
+                    if (ipc.getChannel(ce.channel_id)) |chan| {
+                        // Rebuild T_READ message with same parameters
+                        const read_count: u32 = @intCast(@min(
+                            if (client_proc.ipc_msg.data_len >= 12)
+                                readU32LE(client_proc.ipc_msg.data_buf[8..12])
+                            else
+                                ipc.effective_max_data,
+                            ipc.effective_max_data,
+                        ));
+                        client_proc.ipc_msg.reset(.t_read);
+                        writeU32LE(client_proc.ipc_msg.data_buf[0..4], ce.server_handle);
+                        writeU32LE(client_proc.ipc_msg.data_buf[4..8], ce.read_offset);
+                        writeU32LE(client_proc.ipc_msg.data_buf[8..12], read_count);
+                        client_proc.ipc_msg.data_len = 12;
+                        sendToServer(chan, client_proc);
+                        proc.ipc_serving_client = 0;
+                        return 0; // Don't markReady — still blocked
+                    }
+                }
+                // Can't retry (fd/channel gone) — return 0 (EOF)
+                client_proc.syscall_ret = 0;
+                client_proc.ipc_recv_buf_ptr = 0;
+            } else if (is_ok) {
                 if (reply_data_len > 0 and client_proc.ipc_recv_buf_ptr != 0) {
                     client_proc.ipc_msg.reset(.r_ok);
                     client_proc.ipc_msg.data_len = reply_data_len;

@@ -114,6 +114,8 @@ const LNX_PPOLL: u64 = if (is_x86_64) 271 else 73;
 const LNX_PSELECT6: u64 = if (is_x86_64) 270 else 72;
 const LNX_NANOSLEEP: u64 = if (is_x86_64) 35 else 101;
 const LNX_GETRUSAGE: u64 = if (is_x86_64) 98 else 165;
+const LNX_TKILL: u64 = if (is_x86_64) 200 else 0x8000_0013;
+const LNX_TGKILL: u64 = if (is_x86_64) 234 else 131;
 
 // Linux constants
 const AT_FDCWD: u64 = @bitCast(@as(i64, -100));
@@ -170,7 +172,7 @@ pub fn linuxDispatch(nr: u64, a: u64, b: u64, c: u64, d: u64, e: u64) u64 {
         LNX_NEWFSTATAT => linuxNewfstatat(a, b, c, d),
 
         // ── Memory management ─────────────────────────────────────
-        LNX_MMAP => syscall.sysMmap(a, b, c, d),
+        LNX_MMAP => linuxMmap(a, b, c, d),
         LNX_MUNMAP => syscall.sysMunmap(a, b),
         LNX_MPROTECT => 0, // no-op
         LNX_MADVISE => 0, // no-op
@@ -199,12 +201,8 @@ pub fn linuxDispatch(nr: u64, a: u64, b: u64, c: u64, d: u64, e: u64) u64 {
         LNX_FCHMOD => 0, // no-op for now
 
         // ── Process ───────────────────────────────────────────────
-        LNX_EXIT => {
-            syscall.sysThreadExit(a);
-        },
-        LNX_EXIT_GROUP => {
-            syscall.sysExit(a);
-        },
+        LNX_EXIT => syscall.sysThreadExit(a),
+        LNX_EXIT_GROUP => syscall.sysExit(a),
         LNX_GETPID, LNX_GETTID => syscall.sysGetpid(0),
         LNX_GETPPID => syscall.sysGetpid(1),
         LNX_FORK, LNX_VFORK => syscall.sysRfork(RFPROC | RFFDG),
@@ -221,6 +219,7 @@ pub fn linuxDispatch(nr: u64, a: u64, b: u64, c: u64, d: u64, e: u64) u64 {
 
         // ── Signals (stubs) ───────────────────────────────────────
         LNX_RT_SIGACTION, LNX_RT_SIGPROCMASK => 0,
+        LNX_TKILL, LNX_TGKILL => 0, // no-op (no Unix signals)
 
         // ── Terminal / ioctl ──────────────────────────────────────
         LNX_IOCTL => linuxIoctl(a, b, c),
@@ -516,6 +515,7 @@ fn linuxClockGettime(clk_id: u64, tp_ptr: u64) u64 {
     const nsec_ptr: *align(1) u64 = @ptrFromInt(tp_ptr + 8);
     sec_ptr.* = uptime_secs;
     nsec_ptr.* = nsec;
+
     return 0;
 }
 
@@ -574,6 +574,16 @@ fn linuxGetrandom(buf_ptr: u64, len: u64) u64 {
     const devfiles_mod = @import("devfiles.zig");
     devfiles_mod.devRandomFill(dest[0..n]);
     return n;
+}
+
+fn linuxMmap(addr: u64, length: u64, prot: u64, flags: u64) u64 {
+    // Fornax mmap only supports MAP_ANONYMOUS. For file-backed mmap
+    // (MAP_SHARED/MAP_PRIVATE without MAP_ANONYMOUS), treat as anonymous.
+    // This gives iperf3 and similar programs their memory buffers without
+    // requiring a page cache implementation.
+    const MAP_ANONYMOUS: u64 = 0x20;
+    const forced_flags = flags | MAP_ANONYMOUS;
+    return syscall.sysMmap(addr, length, prot, forced_flags);
 }
 
 // ── Stat translation ──────────────────────────────────────────────────────

@@ -258,44 +258,30 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
 
     @import("../trace.zig").trace(.syscall_enter, @truncate(nr));
 
+    // Wake deferred child thread from clone(). The parent must make several
+    // syscalls (exchanging control messages, setting test state) before the
+    // child thread's shared state is initialized.
+    {
+        const cur = process.getCurrent() orelse return ENOSYS;
+        if (cur.pending_child_wake != 0) {
+            if (cur.child_wake_countdown > 1) {
+                cur.child_wake_countdown -= 1;
+            } else {
+                if (process.getByPid(cur.pending_child_wake)) |child| {
+                    process.markReady(child);
+                }
+                cur.pending_child_wake = 0;
+                cur.child_wake_countdown = 0;
+            }
+        }
+    }
+
     // Linux compat: if process has compat=1, route to Linux syscall translation
     {
         const cur_proc = process.getCurrent() orelse return ENOSYS;
         if (cur_proc.compat == 1) {
             const linux_compat = @import("../linux_compat.zig");
-            const ret = linux_compat.linuxDispatch(nr, arg0, arg1, arg2, arg3, arg4);
-            // Temporary: trace all container syscalls to serial (with PID)
-            klog.info("[lnx p");
-            klog.infoDec(cur_proc.pid);
-            klog.info(" ");
-            klog.infoDec(nr);
-            // For write/close/read: show fd argument
-            if (nr == 0 or nr == 1 or nr == 3 or nr == 20) {
-                klog.info("(fd=");
-                klog.infoDec(arg0);
-                klog.info(")");
-            }
-            // For brk: show requested address
-            if (nr == 12) {
-                klog.info("(a=");
-                klog.infoHex(arg0);
-                klog.info(")");
-            }
-            // For mmap: show length
-            if (nr == 9) {
-                klog.info("(len=");
-                klog.infoDec(arg1);
-                klog.info(")");
-            }
-            if (ret >= @as(u64, @bitCast(@as(i64, -4096)))) {
-                klog.info(" E-");
-                klog.infoDec(0 -% ret);
-            } else {
-                klog.info(" =");
-                klog.infoDec(ret);
-            }
-            klog.info("]\n");
-            return ret;
+            return linux_compat.linuxDispatch(nr, arg0, arg1, arg2, arg3, arg4);
         }
     }
 

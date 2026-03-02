@@ -40,6 +40,7 @@ pub const Tag = enum(u32) {
     t_wstat = 11,
     r_ok = 128,
     r_error = 129,
+    r_again = 130,
 };
 
 /// A message passed over a channel.

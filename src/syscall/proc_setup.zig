@@ -174,10 +174,92 @@ fn opSetArgv(target: *process.Process, argv_ptr: u64, argv_len: u64) u64 {
     if (target.compat == 0) {
         proc_handlers.setupArgv(target_pml4, argv_ptr, target);
     } else {
-        // For Linux compat, write argv directly to ARGV_BASE and
-        // let the caller handle the System V ABI layout.
-        // Just copy raw bytes to ARGV page.
-        _ = proc_handlers.writeToChildMem(target_pml4, mem.ARGV_BASE, src[0..@intCast(argv_len)]);
+        // Linux compat: build System V ABI stack layout.
+        // Wire format: [argc: u32][total_str_len: u32][str0\0str1\0...]
+        // Target layout at ARGV_BASE (pointed to by RSP):
+        //   [argc: u64]
+        //   [argv[0]: u64] ... [argv[N-1]: u64]
+        //   [NULL: u64]           <- end of argv
+        //   [NULL: u64]           <- end of envp (empty)
+        //   [auxv entries: u64 pairs]
+        //   [AT_NULL, 0]
+        //   [string data]
+
+        const wire_argc = @as(u32, src[0]) |
+            (@as(u32, src[1]) << 8) |
+            (@as(u32, src[2]) << 16) |
+            (@as(u32, src[3]) << 24);
+        const wire_total = @as(u32, src[4]) |
+            (@as(u32, src[5]) << 8) |
+            (@as(u32, src[6]) << 16) |
+            (@as(u32, src[7]) << 24);
+
+        if (wire_argc == 0 or wire_argc > 64 or wire_total == 0 or wire_total > 3000) return EINVAL;
+
+        // Read auxv from target's AUXV_BASE page (written by sysSpawn)
+        var auxv_data: [96]u8 = .{0} ** 96;
+        const auxv_phys = paging.translateVaddr(target_pml4, mem.AUXV_BASE);
+        if (auxv_phys) |phys| {
+            const auxv_src: [*]const u8 = paging.physPtr(phys & ~@as(u64, 0xFFF));
+            const page_off: usize = @intCast(mem.AUXV_BASE & 0xFFF);
+            @memcpy(&auxv_data, auxv_src[page_off..][0..96]);
+        } else {
+            // No auxv page — write minimal: AT_PAGESZ + AT_NULL
+            const buf = &auxv_data;
+            root.writeU64LE(buf[0..8], 6); // AT_PAGESZ
+            root.writeU64LE(buf[8..16], mem.PAGE_SIZE);
+            root.writeU64LE(buf[16..24], 0); // AT_NULL
+            root.writeU64LE(buf[24..32], 0);
+        }
+
+        // Layout:
+        //   8 bytes: argc
+        //   wire_argc * 8 bytes: argv pointers
+        //   8 bytes: NULL (argv terminator)
+        //   8 bytes: NULL (envp terminator)
+        //   96 bytes: auxv
+        //   wire_total bytes: string data
+        const header_size: usize = 8 + @as(usize, wire_argc) * 8 + 8 + 8;
+        const strings_start: usize = header_size + 96;
+        const total_size = strings_start + wire_total;
+
+        if (total_size > proc_handlers.argv_layout_buf.len) return EINVAL;
+
+        @memset(proc_handlers.argv_layout_buf[0..total_size], 0);
+
+        // Write argc
+        root.writeU64LE(proc_handlers.argv_layout_buf[0..8], wire_argc);
+
+        // Copy string data
+        @memcpy(proc_handlers.argv_layout_buf[strings_start..][0..wire_total], src[8..][0..wire_total]);
+
+        // Build argv pointer array
+        var str_offset: usize = 0;
+        var arg_i: usize = 0;
+        while (arg_i < wire_argc and str_offset < wire_total) {
+            const str_vaddr: u64 = mem.ARGV_BASE + strings_start + str_offset;
+            const ptr_offset = 8 + arg_i * 8;
+            root.writeU64LE(proc_handlers.argv_layout_buf[ptr_offset..][0..8], str_vaddr);
+
+            // Skip to next null terminator
+            while (str_offset < wire_total and proc_handlers.argv_layout_buf[strings_start + str_offset] != 0) {
+                str_offset += 1;
+            }
+            str_offset += 1; // skip the null
+            arg_i += 1;
+        }
+
+        // argv NULL terminator already zero from memset
+        // envp NULL terminator already zero from memset
+
+        // Copy auxv data after envp NULL
+        const auxv_offset = header_size;
+        @memcpy(proc_handlers.argv_layout_buf[auxv_offset..][0..96], &auxv_data);
+
+        // Write to target's ARGV_BASE
+        _ = proc_handlers.writeToChildMem(target_pml4, mem.ARGV_BASE, proc_handlers.argv_layout_buf[0..total_size]);
+
+        // Linux ABI: RSP points to argc at entry
         target.user_rsp = mem.ARGV_BASE;
     }
     return 0;

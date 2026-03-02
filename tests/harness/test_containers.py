@@ -151,8 +151,8 @@ def test_container_pull(qemu):
     the extracted rootfs contains the expected file.
     """
     try:
-        # Pull the test image (10.0.2.2:5000 is QEMU host gateway)
-        qemu.send_line("fnx pull testimg; echo __PULL1__")
+        # Pull the test image (host_ip:5000 is mock OCI registry on TAP host)
+        qemu.send_line(f"fnx pull {qemu.host_ip}:5000/testimg; echo __PULL1__")
         qemu.expect(r"Successfully pulled", timeout=60)
         qemu.expect(r"__PULL1__", timeout=10)
 
@@ -187,7 +187,7 @@ def test_container_pull_real(qemu):
     """
     try:
         # Pull alpine with explicit registry:port (5001 = real Docker registry)
-        qemu.send_line("fnx pull 10.0.2.2:5001/alpine; echo __RPULL1__")
+        qemu.send_line(f"fnx pull {qemu.host_ip}:5001/alpine; echo __RPULL1__")
         qemu.expect(r"Successfully pulled", timeout=120)
         qemu.expect(r"__RPULL1__", timeout=10)
 
@@ -216,7 +216,7 @@ def test_container_pull_real(qemu):
 def test_container_pull_dockerhub(qemu):
     """Test fnx pull alpine directly from Docker Hub over TLS.
 
-    Requires internet access (QEMU SLIRP provides NAT). TLS is always
+    Requires internet access (TAP+MASQUERADE provides NAT). TLS is always
     enabled on x86_64. Tests the full Docker Hub auth flow:
     401 → WWW-Authenticate → anonymous Bearer token → authenticated pull.
     Verifies alpine's /etc/alpine-release exists after extraction.

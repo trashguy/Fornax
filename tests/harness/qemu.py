@@ -23,7 +23,8 @@ class QemuDriver:
         self.arch = arch
         self.kernel = kernel      # riscv64: path to kernel ELF
         self.initrd = initrd      # riscv64: path to initrd
-        self.tap_iface = tap_iface  # TAP interface name (None = SLiRP)
+        self.tap_iface = tap_iface  # TAP interface name (required)
+        self.host_ip = None        # Set by caller (TapNetwork.host_ip)
         self.proc = None
         self.buf = b""
         self.full_log = b""
@@ -37,11 +38,9 @@ class QemuDriver:
             return False
 
     def start(self):
-        # Build netdev argument: TAP or SLiRP
-        if self.tap_iface:
-            netdev_arg = f"tap,id=net0,ifname={self.tap_iface},script=no,downscript=no"
-        else:
-            netdev_arg = "user,id=net0"
+        if not self.tap_iface:
+            raise ValueError("tap_iface is required (SLiRP no longer supported)")
+        netdev_arg = f"tap,id=net0,ifname={self.tap_iface},script=no,downscript=no"
 
         if self.arch == "aarch64":
             cmd = [
@@ -220,6 +219,9 @@ class QemuDriver:
             self.proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             self.proc.kill()
+            self.proc.wait()
+        except OSError:
+            # Process already exited
             self.proc.wait()
         self.proc = None
 

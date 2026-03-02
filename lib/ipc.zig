@@ -41,6 +41,7 @@ pub const T_TRUNCATE: u32 = 10;
 pub const T_WSTAT: u32 = 11;
 pub const R_OK: u32 = 128;
 pub const R_ERROR: u32 = 129;
+pub const R_AGAIN: u32 = 130;
 
 /// Directory entry returned by reading a directory handle.
 pub const DirEntry = extern struct {

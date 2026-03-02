@@ -13,6 +13,7 @@ from .qemu import QemuDriver
 from .disk import (create_test_disk, prepare_rootfs, create_linux_hello_elf,
                     create_linux_hello_elf_riscv64, create_linux_hello_elf_aarch64)
 from .packages import build_xxd_package, generate_repo_json, start_http_server
+from .tap import TapNetwork
 
 from .test_boot import test_boot_login, test_shutdown
 from .test_core import test_basic_commands, test_time_subsystem
@@ -116,42 +117,59 @@ def run_test_session(session_name, ovmf, build_flags, tests, tmpdir,
         if pre_disk_hook:
             pre_disk_hook(rootfs_dir)
 
+        # Install static net.conf matching the TAP subnet
+        etc_dir = os.path.join(rootfs_dir, "etc")
+        os.makedirs(etc_dir, exist_ok=True)
+        net_conf_path = os.path.join(etc_dir, "net.conf")
+        with open(net_conf_path, "w") as f:
+            f.write(f"add {TapNetwork.GUEST_IP} {TapNetwork.NETMASK} {TapNetwork.HOST_TAP_IP}\n")
+            f.write("dns 1.1.1.1\n")
+        log("NET", f"net.conf → static {TapNetwork.GUEST_IP} gw {TapNetwork.HOST_TAP_IP}")
+
         disk_subdir = os.path.join(tmpdir, f"disk-{session_name}")
         os.makedirs(disk_subdir, exist_ok=True)
         disk_img = create_test_disk(disk_subdir, rootfs_dir)
         log("DISK", "OK")
 
-        # Boot QEMU
+        # Boot QEMU inside TAP network context
         esp_suffix = {"aarch64": "-aarch64"}.get(arch, "")
         esp_dir = os.path.join(PROJECT_DIR, "zig-out", f"esp{esp_suffix}")
         extra_kw = {}
         if arch == "riscv64":
             extra_kw["kernel"] = os.path.join(PROJECT_DIR, "zig-out", "esp-riscv64", "fornax-riscv64")
             extra_kw["initrd"] = os.path.join(PROJECT_DIR, "zig-out", "esp-riscv64", "INITRD")
-        qemu = QemuDriver(ovmf, esp_dir, disk_img, smp=smp, memory=memory, arch=arch, **extra_kw)
-        qemu.start()
-        log("QEMU", f"Starting Fornax ({session_name}, {smp} cores, {memory} RAM, {qemu._accel})...")
 
-        if pre_test_hook:
-            pre_test_hook(qemu)
+        with TapNetwork("fornax0") as tap_ctx:
+            qemu = QemuDriver(ovmf, esp_dir, disk_img, smp=smp, memory=memory, arch=arch,
+                              tap_iface="fornax0", **extra_kw)
+            qemu.host_ip = tap_ctx.host_ip
+            try:
+                qemu.start()
+                log("QEMU", f"Starting Fornax ({session_name}, {smp} cores, {memory} RAM, {qemu._accel})...")
 
-        # Run tests sequentially, stop on first failure
-        for i, test_fn in enumerate(tests):
-            if failed > 0:
-                # Skip remaining tests in this session
-                remaining = len(tests) - i
-                progress_skip(remaining)
-                break
-            test_name = test_fn.__name__.replace("test_", "")
-            progress_set_test(session_name, test_name)
-            if test_fn(qemu):
-                passed += 1
-                progress_advance(True)
-            else:
-                failed += 1
-                progress_advance(False)
+                if pre_test_hook:
+                    pre_test_hook(qemu)
 
-        full_log = qemu.full_log
+                # Run tests sequentially, stop on first failure
+                for i, test_fn in enumerate(tests):
+                    if failed > 0:
+                        # Skip remaining tests in this session
+                        remaining = len(tests) - i
+                        progress_skip(remaining)
+                        break
+                    test_name = test_fn.__name__.replace("test_", "")
+                    progress_set_test(session_name, test_name)
+                    if test_fn(qemu):
+                        passed += 1
+                        progress_advance(True)
+                    else:
+                        failed += 1
+                        progress_advance(False)
+
+                full_log = qemu.full_log
+            finally:
+                qemu.stop()
+                qemu = None
 
     except KeyboardInterrupt:
         raise  # propagate to main
@@ -159,8 +177,6 @@ def run_test_session(session_name, ovmf, build_flags, tests, tmpdir,
         print(f"{RED}Session {session_name} error: {e}{RESET}", file=sys.stderr)
         failed += 1
     finally:
-        if qemu:
-            qemu.stop()
         # Clean up disk image to free space for subsequent sessions
         import shutil
         if disk_subdir and os.path.isdir(disk_subdir):
@@ -240,6 +256,12 @@ def main():
         for name in ALL_TESTS:
             print(f"  {name:20s}  {ALL_TESTS[name].__doc__.split(chr(10))[0]}")
         return 0
+
+    # TAP networking requires root (ip tuntap, iptables, AF_PACKET)
+    if os.geteuid() != 0:
+        print(f"{RED}Error: Integration tests require root for TAP networking.{RESET}", file=sys.stderr)
+        print("Run: sudo make integration-test", file=sys.stderr)
+        return 1
 
     total_passed = 0
     total_failed = 0

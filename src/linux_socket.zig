@@ -9,6 +9,7 @@ const timer = @import("timer.zig");
 const ipc = @import("ipc.zig");
 const namespace = @import("namespace.zig");
 const serial = @import("serial.zig");
+const klog = @import("klog.zig");
 
 const syscall_root = @import("syscall/root.zig");
 const sendToServer = syscall_root.sendToServer;
@@ -659,20 +660,22 @@ pub fn linuxSelect(nfds: u64, readfds_ptr: u64, writefds_ptr: u64, _: u64, timeo
 
     // Calculate deadline
     const now = timer.getTicks();
-    const deadline: u32 = if (timeout_ms < 0)
-        now +% (30 * timer.TICKS_PER_SEC) // 30s for "infinite"
+    const is_infinite = timeout_ms < 0;
+    const deadline: u32 = if (is_infinite)
+        now +% (1 * timer.TICKS_PER_SEC) // 1s cap for "infinite" — enables IPC handshake
     else blk: {
         const ms: u64 = @intCast(timeout_ms);
         const t: u32 = @intCast(@min(ms * timer.TICKS_PER_SEC / 1000, 0x7FFF_FFFF));
         break :blk now +% @max(1, t);
     };
 
-    // Stash state for resume handler: discriminator 1 = select
+    // Stash state for resume handler
+    // linux_stat_fd discriminator: 0=poll, 1=select(finite), 2=select(infinite/capped)
     proc.ipc_recv_buf_ptr = readfds_ptr;
     proc.syscall_ret = writefds_ptr;
     proc.pending_fd = @intCast(max_fd);
     proc.linux_stat_buf = deadline;
-    proc.linux_stat_fd = 1;
+    proc.linux_stat_fd = if (is_infinite) 2 else 1;
     proc.sleep_until = now +% 1; // wake on next tick
     proc.pending_op = .poll_wait;
     proc.state = .blocked;
@@ -684,6 +687,7 @@ pub fn linuxSelect(nfds: u64, readfds_ptr: u64, writefds_ptr: u64, _: u64, timeo
 /// Scan pollfds and write revents. Returns count of ready fds.
 /// For IPC-backed socket fds, optimistically report POLLIN|POLLOUT.
 fn pollScan(proc: *process.Process, fds_ptr: u64, n: usize) u64 {
+    const pipe_mod = @import("pipe.zig");
     const fds: [*]u8 = @ptrFromInt(fds_ptr);
     const POLLFD_SIZE: usize = 8;
     var ready_count: u64 = 0;
@@ -703,10 +707,22 @@ fn pollScan(proc: *process.Process, fds_ptr: u64, n: usize) u64 {
 
         const entry = proc.getFdEntry(poll_fd);
         if (entry == null) {
-            revents = POLLNVAL;
+            if (poll_fd <= 2) {
+                // Console fds (stdin/stdout/stderr): writable, not readable
+                if (poll_fd >= 1 and events & POLLOUT != 0) revents |= POLLOUT;
+            } else {
+                revents = POLLNVAL;
+            }
         } else {
-            // For IPC-backed fds (including sockets), report optimistically
-            if (events & POLLIN != 0) revents |= POLLIN;
+            const e = entry.?;
+            if (events & POLLIN != 0) {
+                const readable = switch (e.fd_type) {
+                    .pipe => pipe_mod.hasDataOrEof(e.pipe_id),
+                    .ipc => true, // Optimistic: read() handles blocking via R_AGAIN
+                    else => true, // dev_* fds are always readable
+                };
+                if (readable) revents |= POLLIN;
+            }
             if (events & POLLOUT != 0) revents |= POLLOUT;
         }
 
@@ -722,6 +738,7 @@ fn pollScan(proc: *process.Process, fds_ptr: u64, n: usize) u64 {
 
 /// Read-only check: count ready fds in fd_sets without modifying them.
 fn selectCheck(proc: *process.Process, max_fd: usize, readfds_ptr: u64, writefds_ptr: u64) u64 {
+    const pipe_mod = @import("pipe.zig");
     var ready_count: u64 = 0;
     for (0..max_fd) |fd_i| {
         const fd: u32 = @intCast(fd_i);
@@ -733,17 +750,90 @@ fn selectCheck(proc: *process.Process, max_fd: usize, readfds_ptr: u64, writefds
         const in_write = if (writefds_ptr != 0) fdSetTest(writefds_ptr, word_idx, bit_mask) else false;
         if (!in_read and !in_write) continue;
 
-        const entry = proc.getFdEntry(fd) orelse continue;
-        _ = entry;
+        const entry = proc.getFdEntry(fd) orelse {
+            // Console fds (0-2): stdout/stderr are writable
+            if (fd <= 2 and fd >= 1 and in_write) {
+                ready_count += 1;
+            }
+            continue;
+        };
 
-        // All fds (including IPC-backed sockets) are optimistically ready
-        ready_count += 1;
+        var fd_ready = false;
+        if (in_read) {
+            fd_ready = fd_ready or switch (entry.fd_type) {
+                .pipe => pipe_mod.hasDataOrEof(entry.pipe_id),
+                .ipc => true, // Optimistic: read() handles blocking via R_AGAIN
+                else => true, // dev_* fds are always readable
+            };
+        }
+        if (in_write) {
+            // Writes are always considered ready
+            fd_ready = true;
+        }
+        if (fd_ready) ready_count += 1;
     }
     return ready_count;
 }
 
 /// Scan fd_sets, clear bits for non-ready fds, return count of ready fds.
 fn selectScan(proc: *process.Process, max_fd: usize, readfds_ptr: u64, writefds_ptr: u64) u64 {
+    const pipe_mod = @import("pipe.zig");
+    var ready_count: u64 = 0;
+    for (0..max_fd) |fd_i| {
+        const fd: u32 = @intCast(fd_i);
+        const word_idx = fd_i / 64;
+        const bit_idx: u6 = @intCast(fd_i % 64);
+        const bit_mask: u64 = @as(u64, 1) << bit_idx;
+
+        const in_read = if (readfds_ptr != 0) fdSetTest(readfds_ptr, word_idx, bit_mask) else false;
+        const in_write = if (writefds_ptr != 0) fdSetTest(writefds_ptr, word_idx, bit_mask) else false;
+        if (!in_read and !in_write) continue;
+
+        const entry = proc.getFdEntry(fd) orelse {
+            // Console fds (0-2): stdout/stderr are writable, stdin not readable
+            if (fd <= 2) {
+                if (in_read) fdSetClear(readfds_ptr, word_idx, bit_mask);
+                if (fd >= 1 and in_write) {
+                    ready_count += 1;
+                } else {
+                    if (in_write) fdSetClear(writefds_ptr, word_idx, bit_mask);
+                }
+            } else {
+                if (in_read) fdSetClear(readfds_ptr, word_idx, bit_mask);
+                if (in_write) fdSetClear(writefds_ptr, word_idx, bit_mask);
+            }
+            continue;
+        };
+
+        var read_ready = false;
+        var write_ready = false;
+
+        if (in_read) {
+            read_ready = switch (entry.fd_type) {
+                .pipe => pipe_mod.hasDataOrEof(entry.pipe_id),
+                .ipc => true, // Optimistic: read() handles blocking via R_AGAIN
+                else => true, // dev_* fds are always readable
+            };
+            if (!read_ready) fdSetClear(readfds_ptr, word_idx, bit_mask);
+        }
+        if (in_write) {
+            write_ready = true;
+        }
+
+        if (read_ready or write_ready) {
+            ready_count += 1;
+        } else {
+            // Neither read nor write ready — clear both bits
+            if (in_read) fdSetClear(readfds_ptr, word_idx, bit_mask);
+            if (in_write) fdSetClear(writefds_ptr, word_idx, bit_mask);
+        }
+    }
+    return ready_count;
+}
+
+/// Like selectScan but treats ALL fds as optimistically ready (including IPC reads).
+/// Used when infinite-timeout select expires — enables handshake/result reads.
+fn selectScanOptimistic(proc: *process.Process, max_fd: usize, readfds_ptr: u64, writefds_ptr: u64) u64 {
     var ready_count: u64 = 0;
     for (0..max_fd) |fd_i| {
         const fd: u32 = @intCast(fd_i);
@@ -756,8 +846,14 @@ fn selectScan(proc: *process.Process, max_fd: usize, readfds_ptr: u64, writefds_
         if (!in_read and !in_write) continue;
 
         _ = proc.getFdEntry(fd) orelse {
-            if (in_read) fdSetClear(readfds_ptr, word_idx, bit_mask);
-            if (in_write) fdSetClear(writefds_ptr, word_idx, bit_mask);
+            // Console fds (0-2): stdout/stderr are writable
+            if (fd <= 2 and fd >= 1 and in_write) {
+                if (in_read) fdSetClear(readfds_ptr, word_idx, bit_mask);
+                ready_count += 1;
+            } else {
+                if (in_read) fdSetClear(readfds_ptr, word_idx, bit_mask);
+                if (in_write) fdSetClear(writefds_ptr, word_idx, bit_mask);
+            }
             continue;
         };
 
@@ -795,7 +891,18 @@ pub fn handlePollResume(proc: *process.Process) bool {
 
     // Check if deadline has passed (wrapping comparison)
     if ((now -% deadline) < 0x8000_0000) {
-        // Deadline expired — return 0 (timeout)
+        if (proc.linux_stat_fd == 2) {
+            // Infinite-timeout select: deadline passed → report IPC reads as
+            // optimistically ready. This enables handshake reads where data
+            // is already available but can't be detected via IPC peek.
+            const readfds = proc.ipc_recv_buf_ptr;
+            const writefds = proc.syscall_ret;
+            const nfds: usize = proc.pending_fd;
+            // Do a scan that treats ALL fds as ready (original optimistic behavior)
+            proc.syscall_ret = selectScanOptimistic(proc, nfds, readfds, writefds);
+            return true;
+        }
+        // Finite-timeout select or poll: return 0 (timeout) — lets timers fire
         if (proc.linux_stat_fd == 1) {
             // Select: clear all fd_set bits (nothing ready)
             _ = selectScan(proc, proc.pending_fd, proc.ipc_recv_buf_ptr, proc.syscall_ret);
@@ -991,6 +1098,11 @@ fn resumeConnect(
 }
 
 fn failConnect(proc: *process.Process) void {
+    klog.err("[sock] connect FAIL for pid=");
+    klog.errDec(proc.pid);
+    klog.err(" step=");
+    klog.errDec(stashStep(proc));
+    klog.err("\n");
     proc.syscall_ret = ECONNREFUSED;
     proc.pending_op = .none;
 }
