@@ -1,7 +1,7 @@
 /// Fornax Plan 9-inspired syscall interface.
 ///
 /// This file re-exports the syscall submodules. The implementation lives in
-/// src/syscall/ (fs.zig, proc.zig, ipc_handlers.zig, mem.zig, ns.zig, container.zig).
+/// src/syscall/ (fs.zig, proc.zig, ipc_handlers.zig, mem.zig, ns.zig).
 const root = @import("syscall/root.zig");
 
 // --- Public submodules ---
@@ -10,7 +10,6 @@ pub const proc = root.proc;
 pub const ipc_handlers = root.ipc_handlers;
 pub const mem_handlers = root.mem_handlers;
 pub const ns = root.ns;
-pub const container = root.container;
 
 // --- Public types ---
 pub const SYS = root.SYS;
@@ -62,4 +61,3 @@ pub const sysKlog = root.sysKlog;
 pub const sysSysinfo = root.sysSysinfo;
 pub const sysSleep = root.sysSleep;
 pub const sysShutdown = root.sysShutdown;
-pub const sysCntrOp = root.sysCntrOp;

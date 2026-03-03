@@ -258,7 +258,10 @@ pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize, rsdp: ?[*]const
     initrd.mountFiles();
     spawnPartfs();
     spawnFxfs();
-    spawnCntrd();
+    if (comptime @import("build_options").containers) {
+        spawnCntrd();
+        spawnLinuxd();
+    }
     spawnInit();
 
     klog.info("Kernel initialized.\n");
@@ -509,70 +512,55 @@ fn spawnFxfs() void {
     klog.info(")\n");
 }
 
-/// Spawn cntrd — container management IPC server at /cntr/.
+/// Spawn cntrd — container management IPC server at /cntr/ (supervised).
 fn spawnCntrd() void {
     const cntrd_elf = initrd.findFile("cntrd") orelse {
         klog.warn("No cntrd in initrd — containers disabled.\n");
         return;
     };
 
-    const proc = process.create() orelse {
-        klog.err("Failed to create cntrd process!\n");
+    if (supervisor.spawnService("cntrd", cntrd_elf, "/cntr/")) |_| {
+        klog.info("cntrd: supervised at /cntr/\n");
+    } else {
+        klog.err("cntrd: failed to spawn under supervisor\n");
+    }
+}
+
+/// Spawn linuxd — Linux execve IPC server (supervised at /linux/).
+/// linuxd gets fd 3 = IPC server channel, fd 4 = /fs client (fxfs).
+fn spawnLinuxd() void {
+    const linuxd_elf = initrd.findFile("linuxd") orelse {
+        klog.warn("No linuxd in initrd — Linux execve disabled.\n");
         return;
     };
 
-    const load_result = elf.load(proc.pml4.?, cntrd_elf) catch {
-        klog.err("Failed to load cntrd ELF!\n");
-        proc.state = .dead;
+    const svc = supervisor.spawnService("linuxd", linuxd_elf, "/linux/") orelse {
+        klog.err("linuxd: failed to spawn under supervisor\n");
         return;
     };
 
-    proc.user_rip = load_result.entry_point;
-    proc.brk = load_result.brk;
-
-    for (0..process.USER_STACK_PAGES) |i| {
-        const page = pmm.allocPage() orelse {
-            klog.err("Failed to allocate cntrd stack!\n");
-            proc.state = .dead;
-            return;
-        };
-        const ptr: [*]u8 = paging.physPtr(page);
-        @memset(ptr[0..mem.PAGE_SIZE], 0);
-        const vaddr = mem.USER_STACK_TOP - (process.USER_STACK_PAGES - i) * mem.PAGE_SIZE;
-        paging.mapPage(proc.pml4.?, vaddr, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
-            klog.err("Failed to map cntrd stack!\n");
-            proc.state = .dead;
-            return;
+    // linuxd needs fd 4 = /fs channel (fxfs) for reading ELF files
+    const root_ns = namespace.getRootNamespace();
+    if (root_ns.resolve("/")) |res| {
+        svc.extra_fd = .{
+            .fd_num = 4,
+            .entry = .{
+                .fd_type = .ipc,
+                .channel_id = res.channel_id,
+                .is_server = false,
+                .read_offset = 0,
+                .server_handle = 0,
+            },
         };
     }
-    proc.user_rsp = mem.USER_STACK_INIT;
 
-    // Create IPC channel for /cntr/
-    const chan = ipc.channelCreate() catch {
-        klog.err("Failed to create cntrd channel!\n");
-        proc.state = .dead;
-        return;
-    };
+    // Dependency: linuxd needs fxfs running
+    if (supervisor.findByName("fxfs")) |fxfs_svc| {
+        svc.depends_on[0] = supervisor.serviceIndex(fxfs_svc);
+        svc.depends_on_len = 1;
+    }
 
-    // Server end as fd 3
-    proc.setFd(3, chan.server, true);
-
-    // Mount client end at "/cntr/" in root namespace
-    const root_ns = namespace.getRootNamespace();
-    root_ns.mount("/cntr/", chan.client, .{}) catch {
-        klog.err("Failed to mount cntrd at /cntr/!\n");
-        proc.state = .dead;
-        return;
-    };
-
-    proc.parent_pid = null;
-    root_ns.cloneInto(&proc.ns);
-
-    process.markReady(proc);
-
-    klog.info("Spawned cntrd (PID ");
-    klog.infoDec(proc.pid);
-    klog.info(")\n");
+    klog.info("linuxd: supervised at /linux/\n");
 }
 
 /// Spawn init (PID 1) from the initrd. Init inherits the root namespace

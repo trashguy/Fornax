@@ -243,6 +243,26 @@ fn spawnCrond() void {
     _ = fx.close(pair.client_fd);
 }
 
+/// Discover and register optional supervised services from /bin/.
+/// Called after filesystem is mounted. Services installed via `fay install`
+/// (e.g. fornax-sys) are picked up here without needing a rebuild.
+fn startOptionalServices() void {
+    // Container runtime: cntrd serves /cntr/
+    if (loadBin("cntrd")) |cntrd_elf| {
+        const rc = fx.svc_register("cntrd", "/cntr/", cntrd_elf);
+        if (rc == 0) {
+            out.puts("init: registered cntrd at /cntr/\n");
+        }
+    }
+    // Linux compat layer: linuxd serves /linux/
+    if (loadBin("linuxd")) |linuxd_elf| {
+        const rc = fx.svc_register("linuxd", "/linux/", linuxd_elf);
+        if (rc == 0) {
+            out.puts("init: registered linuxd at /linux/\n");
+        }
+    }
+}
+
 export fn _start() noreturn {
     out.puts("init: started\n");
 
@@ -261,6 +281,9 @@ export fn _start() noreturn {
 
     // Spawn bridge (optional, for container networking)
     spawnBridge();
+
+    // Register optional services discovered on disk (e.g. after fay install)
+    startOptionalServices();
 
     // Spawn netd (userspace network server)
     spawnNetd();

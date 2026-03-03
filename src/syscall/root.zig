@@ -280,8 +280,12 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
     {
         const cur_proc = process.getCurrent() orelse return ENOSYS;
         if (cur_proc.compat == 1) {
-            const linux_compat = @import("../linux_compat.zig");
-            return linux_compat.linuxDispatch(nr, arg0, arg1, arg2, arg3, arg4);
+            const has_containers = @import("build_options").containers;
+            if (comptime has_containers) {
+                const linux_compat = @import("../linux_compat.zig");
+                return linux_compat.linuxDispatch(nr, arg0, arg1, arg2, arg3, arg4);
+            }
+            return ENOSYS;
         }
     }
 

@@ -227,22 +227,19 @@ pub fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
                 if (client_proc.getFdEntryPtr(client_proc.pending_fd)) |fd_entry| {
                     fd_entry.server_handle = handle;
                 }
-                // Phase 1 done. Send T_STAT to same server.
                 client_proc.ipc_msg.reset(.t_stat);
                 writeU32LE(client_proc.ipc_msg.data_buf[0..4], handle);
                 client_proc.ipc_msg.data_len = 4;
                 client_proc.pending_op = .linux_stat_done;
                 client_proc.ipc_recv_buf_ptr = client_proc.linux_stat_buf;
                 client_proc.linux_stat_fd = client_proc.pending_fd;
-                // Get channel and enqueue T_STAT
                 if (client_proc.getFdEntry(client_proc.pending_fd)) |fd_entry| {
                     if (ipc.getChannel(fd_entry.channel_id)) |stat_chan| {
                         sendToServer(stat_chan, client_proc);
                         proc.ipc_serving_client = 0;
-                        return 0; // Don't markReady — still blocked
+                        return 0;
                     }
                 }
-                // Fallback: can't stat, return error
                 client_proc.closeFd(client_proc.pending_fd);
                 client_proc.linux_stat_buf = 0;
                 client_proc.linux_stat_fd = 0;
@@ -276,13 +273,23 @@ pub fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
             client_proc.linux_stat_buf = 0;
         },
         .linux_sock_step => {
-            const linux_socket = @import("../linux_socket.zig");
-            const still_blocked = linux_socket.handleResume(client_proc, is_ok, reply_data_ptr, reply_data_len);
-            if (still_blocked) {
-                proc.ipc_serving_client = 0;
-                return 0; // Don't markReady — still blocked
+            if (comptime @import("build_options").containers) {
+                const linux_socket = @import("../linux_socket.zig");
+                const still_blocked = linux_socket.handleResume(client_proc, is_ok, reply_data_ptr, reply_data_len);
+                if (still_blocked) {
+                    proc.ipc_serving_client = 0;
+                    return 0; // Don't markReady — still blocked
+                }
             }
             // Fall through to markReady
+        },
+        .linux_exec_wait => {
+            // linuxd replied — it already replaced image via OP_EXEC + OP_SETARGV.
+            client_proc.closeFd(client_proc.pending_fd);
+            if (!is_ok) {
+                client_proc.syscall_ret = ENOENT;
+            }
+            // syscall_ret and saved_kernel_rsp already set by OP_EXEC
         },
         .console_read, .pipe_read, .pipe_write, .sleep, .ether_read, .poll_wait => {},
         .none => {

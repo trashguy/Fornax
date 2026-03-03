@@ -93,7 +93,7 @@ The server:
 
 ### fnx → fay package
 
-Move `cmd/fnx/` to `../fornax-core/fnx/` as a fay package. The build system installs it
+Move `cmd/fnx/` to `../fornax-sys/fnx/` as a fay package. The build system installs it
 like any other fay package. Remove the `-Dcontainers` build gate — fnx is always available
 as an optional userspace tool.
 
@@ -152,7 +152,7 @@ Remove `FdType.cntr`, `CntrFdKind`, `allocCntrFd()`, `cntrRead()`, `cntrWrite()`
 
 ### 6. Move fnx to fay Package
 
-Move `cmd/fnx/` to `../fornax-core/fnx/`. Update build.zig. Remove `-Dcontainers` gate.
+Move `cmd/fnx/` to `../fornax-sys/fnx/`. Update build.zig. Remove `-Dcontainers` gate.
 
 ## Container Lifecycle (After)
 

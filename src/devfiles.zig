@@ -1,4 +1,4 @@
-/// Virtual file handlers for /dev/*, /proc/*, and /cntr/* paths.
+/// Virtual file handlers for /dev/* and /proc/* paths.
 ///
 /// These functions generate text content for kernel-intercepted virtual files
 /// and handle ctl writes. Extracted from syscall.zig to separate content

@@ -1093,19 +1093,9 @@ const touch_bin = b.addExecutable(.{
     });
     crond_bin.image_base = user_image_base;
 
-    const cntrd_bin = b.addExecutable(.{
-        .name = "cntrd",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("srv/cntrd/main.zig"),
-            .target = x86_64_freestanding,
-            .optimize = user_optimize,
-            .strip = if (user_strip) true else null,
-            .imports = &.{
-                .{ .name = "fornax", .module = fornax_module },
-            },
-        }),
-    });
-    cntrd_bin.image_base = user_image_base;
+    // cntrd, linuxd, fnx, bridge: now in fornax-sys/fnx external package.
+    // Build with -Dcontainers=true only affects kernel comptime gating.
+    // Install container binaries via: fay install fornax-sys
 
     const crontab_bin = b.addExecutable(.{
         .name = "crontab",
@@ -1180,7 +1170,7 @@ const touch_bin = b.addExecutable(.{
     const iperf_bin = b.addExecutable(.{
         .name = "iperf",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("../fornax-extra/iperf/main.zig"),
+            .root_source_file = b.path("../fornax-tools/iperf/main.zig"),
             .target = x86_64_freestanding,
             .optimize = user_optimize,
             .strip = if (user_strip) true else null,
@@ -1304,55 +1294,8 @@ const touch_bin = b.addExecutable(.{
         if (bearssl_lib) |bssl| curl_bin.root_module.linkLibrary(bssl);
     }
 
-    // ── Container support (gated behind -Dcontainers=true) ──────────
-    var fnx_bin: ?*std.Build.Step.Compile = null;
-    var bridge_bin: ?*std.Build.Step.Compile = null;
-    if (containers) {
-        // Build options for fnx (compile-time feature flags)
-        const fnx_options = b.addOptions();
-        fnx_options.addOption(bool, "has_tls", tls_module != null);
-
-        var fnx_imports: [4]std.Build.Module.Import = .{
-            .{ .name = "fornax", .module = fornax_module },
-            .{ .name = "fnx_options", .module = fnx_options.createModule() },
-            undefined,
-            undefined,
-        };
-        var fnx_import_count: usize = 2;
-        if (tls_module) |tmod| {
-            fnx_imports[fnx_import_count] = .{ .name = "tls", .module = tmod };
-            fnx_import_count += 1;
-        }
-
-        const fnx_exe = b.addExecutable(.{
-            .name = "fnx",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("cmd/fnx/main.zig"),
-                .target = x86_64_freestanding,
-                .optimize = user_optimize,
-                .strip = if (user_strip) true else null,
-                .imports = fnx_imports[0..fnx_import_count],
-            }),
-        });
-        fnx_exe.image_base = user_image_base;
-        if (bearssl_lib) |bssl| fnx_exe.root_module.linkLibrary(bssl);
-        fnx_bin = fnx_exe;
-
-        const bridge_exe = b.addExecutable(.{
-            .name = "bridge",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("srv/bridge/main.zig"),
-                .target = x86_64_freestanding,
-                .optimize = user_optimize,
-                .strip = if (user_strip) true else null,
-                .imports = &.{
-                    .{ .name = "fornax", .module = fornax_module },
-                },
-            }),
-        });
-        bridge_exe.image_base = user_image_base;
-        bridge_bin = bridge_exe;
-    }
+    // Container programs (fnx, cntrd, linuxd, bridge) now live in
+    // fornax-sys/fnx external package. Install via: fay install fornax-sys
 
     // ── POSIX realm support (gated behind -Dposix=true) ─────────────
     // POSIX realm isolation is handled by lib/posix/crt0.S (rfork(RFNAMEG))
@@ -1631,7 +1574,8 @@ const touch_bin = b.addExecutable(.{
     });
 
     // ── Initrd: boot-critical servers only ───────────────────────────
-    const x86_initrd = addInitrdStep(b, mkinitrd, "esp/EFI/BOOT", &.{ init_bin, partfs_bin, fxfs_bin, cntrd_bin });
+    // Container servers (cntrd, linuxd) are now in fornax-sys/fnx external package.
+    const x86_initrd = addInitrdStep(b, mkinitrd, "esp/EFI/BOOT", &.{ init_bin, partfs_bin, fxfs_bin });
     x86_initrd.step.dependOn(&x86_install.step); // ensure ESP dir exists
 
     // ── Rootfs: install disk-bound programs to zig-out/rootfs/bin/ ──
@@ -1652,7 +1596,6 @@ const touch_bin = b.addExecutable(.{
         curl_bin,
         netd_bin,
         crond_bin,
-        cntrd_bin,
         crontab_bin,
         date_bin,
         uptime_bin,
@@ -1719,20 +1662,6 @@ const touch_bin = b.addExecutable(.{
         x86_initrd.step.dependOn(&tcc_lic.step);
         const musl_lic = b.addInstallFile(b.path("LICENSES/musl"), "rootfs/lib/legal/musl/COPYING");
         x86_initrd.step.dependOn(&musl_lic.step);
-    }
-
-    // Install container programs to rootfs (if enabled)
-    if (fnx_bin) |fnx_exe| {
-        const fnx_install = b.addInstallArtifact(fnx_exe, .{
-            .dest_dir = .{ .override = .{ .custom = "rootfs/bin" } },
-        });
-        x86_initrd.step.dependOn(&fnx_install.step);
-    }
-    if (bridge_bin) |bridge_exe| {
-        const bridge_install = b.addInstallArtifact(bridge_exe, .{
-            .dest_dir = .{ .override = .{ .custom = "rootfs/bin" } },
-        });
-        x86_initrd.step.dependOn(&bridge_install.step);
     }
 
     // Install /etc/net.conf to rootfs
@@ -1841,14 +1770,13 @@ const touch_bin = b.addExecutable(.{
         .{ "smp-test", "cmd/smp-test/main.zig" },
         .{ "netd", "srv/netd/main.zig" },
         .{ "crond", "srv/crond/main.zig" },
-        .{ "cntrd", "srv/cntrd/main.zig" },
         .{ "crontab", "cmd/crontab/main.zig" },
         .{ "date", "cmd/date/main.zig" },
         .{ "uptime", "cmd/uptime/main.zig" },
-        .{ "iperf", "../fornax-extra/iperf/main.zig" },
+        .{ "iperf", "../fornax-tools/iperf/main.zig" },
     };
 
-    var aa64_initrd_bins: [4]*std.Build.Step.Compile = undefined;
+    var aa64_initrd_bins: [3]*std.Build.Step.Compile = undefined;
     var aa64_disk_bin_buf: [64]*std.Build.Step.Compile = undefined;
     var aa64_disk_bin_count: usize = 0;
 
@@ -1874,8 +1802,6 @@ const touch_bin = b.addExecutable(.{
             aa64_initrd_bins[1] = aa64_prog;
         } else if (std.mem.eql(u8, name, "fxfs")) {
             aa64_initrd_bins[2] = aa64_prog;
-        } else if (std.mem.eql(u8, name, "cntrd")) {
-            aa64_initrd_bins[3] = aa64_prog;
         } else {
             aa64_disk_bin_buf[aa64_disk_bin_count] = aa64_prog;
             aa64_disk_bin_count += 1;
@@ -1968,48 +1894,7 @@ const touch_bin = b.addExecutable(.{
         }
     }
 
-    // aarch64 container programs (gated behind -Dcontainers=true)
-    if (containers) {
-        const aa64_bridge = b.addExecutable(.{
-            .name = "bridge",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("srv/bridge/main.zig"),
-                .target = aarch64_freestanding,
-                .optimize = user_optimize,
-                .strip = if (user_strip) true else null,
-                .imports = &.{
-                    .{ .name = "fornax", .module = aa64_fornax_module },
-                },
-            }),
-        });
-        aa64_bridge.image_base = user_image_base;
-        const aa64_bridge_install = b.addInstallArtifact(aa64_bridge, .{
-            .dest_dir = .{ .override = .{ .custom = "rootfs-aarch64/bin" } },
-        });
-        aarch64_initrd.step.dependOn(&aa64_bridge_install.step);
-
-        const aa64_fnx_options = b.addOptions();
-        aa64_fnx_options.addOption(bool, "has_tls", false); // TLS not yet on aarch64
-
-        const aa64_fnx = b.addExecutable(.{
-            .name = "fnx",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("cmd/fnx/main.zig"),
-                .target = aarch64_freestanding,
-                .optimize = user_optimize,
-                .strip = if (user_strip) true else null,
-                .imports = &.{
-                    .{ .name = "fornax", .module = aa64_fornax_module },
-                    .{ .name = "fnx_options", .module = aa64_fnx_options.createModule() },
-                },
-            }),
-        });
-        aa64_fnx.image_base = user_image_base;
-        const aa64_fnx_install = b.addInstallArtifact(aa64_fnx, .{
-            .dest_dir = .{ .override = .{ .custom = "rootfs-aarch64/bin" } },
-        });
-        aarch64_initrd.step.dependOn(&aa64_fnx_install.step);
-    }
+    // Container programs (fnx, cntrd, linuxd, bridge) now in fornax-sys/fnx external package.
 
     // Install /etc/net.conf to aarch64 rootfs
     const aa64_net_conf = b.addInstallFile(b.path("etc/net.conf"), "rootfs-aarch64/etc/net.conf");
@@ -2107,15 +1992,14 @@ const touch_bin = b.addExecutable(.{
         .{ "smp-test", "cmd/smp-test/main.zig" },
         .{ "netd", "srv/netd/main.zig" },
         .{ "crond", "srv/crond/main.zig" },
-        .{ "cntrd", "srv/cntrd/main.zig" },
         .{ "crontab", "cmd/crontab/main.zig" },
         .{ "date", "cmd/date/main.zig" },
         .{ "uptime", "cmd/uptime/main.zig" },
-        .{ "iperf", "../fornax-extra/iperf/main.zig" },
+        .{ "iperf", "../fornax-tools/iperf/main.zig" },
     };
 
-    // Build riscv64 initrd programs (init, partfs, fxfs, cntrd)
-    var rv_initrd_bins: [4]*std.Build.Step.Compile = undefined;
+    // Build riscv64 initrd programs (init, partfs, fxfs)
+    var rv_initrd_bins: [3]*std.Build.Step.Compile = undefined;
     var rv_disk_bin_buf: [64]*std.Build.Step.Compile = undefined;
     var rv_disk_bin_count: usize = 0;
 
@@ -2141,8 +2025,6 @@ const touch_bin = b.addExecutable(.{
             rv_initrd_bins[1] = rv_prog;
         } else if (std.mem.eql(u8, name, "fxfs")) {
             rv_initrd_bins[2] = rv_prog;
-        } else if (std.mem.eql(u8, name, "cntrd")) {
-            rv_initrd_bins[3] = rv_prog;
         } else {
             rv_disk_bin_buf[rv_disk_bin_count] = rv_prog;
             rv_disk_bin_count += 1;
@@ -2235,48 +2117,7 @@ const touch_bin = b.addExecutable(.{
         }
     }
 
-    // riscv64 container programs (gated behind -Dcontainers=true)
-    if (containers) {
-        const rv_bridge = b.addExecutable(.{
-            .name = "bridge",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("srv/bridge/main.zig"),
-                .target = riscv64_freestanding,
-                .optimize = user_optimize,
-                .strip = if (user_strip) true else null,
-                .imports = &.{
-                    .{ .name = "fornax", .module = rv_fornax_module },
-                },
-            }),
-        });
-        rv_bridge.image_base = user_image_base;
-        const rv_bridge_install = b.addInstallArtifact(rv_bridge, .{
-            .dest_dir = .{ .override = .{ .custom = "rootfs-riscv64/bin" } },
-        });
-        rv_initrd.step.dependOn(&rv_bridge_install.step);
-
-        const rv_fnx_options = b.addOptions();
-        rv_fnx_options.addOption(bool, "has_tls", false); // TLS not yet on riscv64
-
-        const rv_fnx = b.addExecutable(.{
-            .name = "fnx",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("cmd/fnx/main.zig"),
-                .target = riscv64_freestanding,
-                .optimize = user_optimize,
-                .strip = if (user_strip) true else null,
-                .imports = &.{
-                    .{ .name = "fornax", .module = rv_fornax_module },
-                    .{ .name = "fnx_options", .module = rv_fnx_options.createModule() },
-                },
-            }),
-        });
-        rv_fnx.image_base = user_image_base;
-        const rv_fnx_install = b.addInstallArtifact(rv_fnx, .{
-            .dest_dir = .{ .override = .{ .custom = "rootfs-riscv64/bin" } },
-        });
-        rv_initrd.step.dependOn(&rv_fnx_install.step);
-    }
+    // Container programs (fnx, cntrd, linuxd, bridge) now in fornax-sys/fnx external package.
 
     // Install /etc/net.conf to riscv64 rootfs
     const rv_net_conf = b.addInstallFile(b.path("etc/net.conf"), "rootfs-riscv64/etc/net.conf");

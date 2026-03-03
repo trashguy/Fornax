@@ -98,9 +98,9 @@ pub const ResourceQuotas = struct {
     cpu_priority: u8 = 128, // 0=lowest, 255=highest
 };
 
-pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, remove, rename, truncate, wstat, console_read, pipe_read, pipe_write, sleep, ether_read, linux_stat_open, linux_stat_done, poll_wait, linux_sock_step };
+pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, remove, rename, truncate, wstat, console_read, pipe_read, pipe_write, sleep, ether_read, linux_stat_open, linux_stat_done, poll_wait, linux_sock_step, linux_exec_wait };
 
-pub const FdType = enum(u8) { ipc, pipe, blk, proc, dev_null, dev_zero, dev_random, dev_pci, dev_usb, dev_mouse, dev_cpu, dev_ether, dev_sysname, dev_osversion, dev_time, dev_kmesg, dev_reboot, dev_drivers, dev_pid, dev_user, dev_consctl, dev_sysstat, dev_trace, dev_ipcctl };
+pub const FdType = enum(u8) { ipc, pipe, blk, proc, dev_null, dev_zero, dev_random, dev_pci, dev_usb, dev_mouse, dev_cpu, dev_ether, dev_sysname, dev_osversion, dev_time, dev_kmesg, dev_reboot, dev_drivers, dev_pid, dev_user, dev_consctl, dev_sysstat, dev_trace, dev_ipcctl, dev_epoll, dev_eventfd, dev_timerfd, net };
 
 pub const ProcFdKind = enum(u8) {
     dir,
@@ -1277,20 +1277,22 @@ fn switchTo(proc: *Process) noreturn {
 
     // Poll/select wait — woken by timer tick, re-check fd readiness
     if (proc.pending_op == .poll_wait) {
-        const linux_socket = @import("linux_socket.zig");
-        if (linux_socket.handlePollResume(proc)) {
-            // Done — clean up stashed state
-            proc.pending_op = .none;
-            proc.sleep_until = 0;
-            proc.ipc_recv_buf_ptr = 0;
-            proc.pending_fd = 0;
-            proc.linux_stat_buf = 0;
-            proc.linux_stat_fd = 0;
-        } else {
-            // Re-block for another check (sleep_until already set by handler)
-            proc.state = .blocked;
-            setCurrentInternal(null);
-            scheduleNext();
+        if (comptime @import("build_options").containers) {
+            const linux_socket = @import("linux_socket.zig");
+            if (linux_socket.handlePollResume(proc)) {
+                // Done — clean up stashed state
+                proc.pending_op = .none;
+                proc.sleep_until = 0;
+                proc.ipc_recv_buf_ptr = 0;
+                proc.pending_fd = 0;
+                proc.linux_stat_buf = 0;
+                proc.linux_stat_fd = 0;
+            } else {
+                // Re-block for another check (sleep_until already set by handler)
+                proc.state = .blocked;
+                setCurrentInternal(null);
+                scheduleNext();
+            }
         }
     }
 
@@ -1480,8 +1482,10 @@ fn switchTo(proc: *Process) noreturn {
                 deliverRawData(msg, proc.ipc_recv_buf_ptr);
                 // Linux compat: translate Fornax stat → Linux stat in-place
                 if (proc.pending_op == .stat and proc.compat == 1) {
-                    const linux_compat = @import("linux_compat.zig");
-                    linux_compat.translateStatInPlace(proc.ipc_recv_buf_ptr);
+                    if (comptime @import("build_options").containers) {
+                        const linux_compat = @import("linux_compat.zig");
+                        linux_compat.translateStatInPlace(proc.ipc_recv_buf_ptr);
+                    }
                 }
             } else {
                 deliverIpcMessage(msg, proc.ipc_recv_buf_ptr);

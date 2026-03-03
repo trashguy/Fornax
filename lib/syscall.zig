@@ -201,6 +201,8 @@ pub const PROC_SETUP_ALLOCGROUP = 10;
 pub const PROC_SETUP_GROUPKILL = 11;
 pub const PROC_SETUP_FREEGROUP = 12;
 pub const PROC_SETUP_SETQUOTA_GROUP = 13;
+pub const PROC_SETUP_EXEC = 14;
+pub const PROC_SETUP_SVC_REGISTER = 15;
 
 /// Raw proc_setup syscall.
 pub fn proc_setup(op: u64, target_pid: u32, a0: u64, a1: u64, a2: u64) i32 {
@@ -280,6 +282,31 @@ pub fn proc_set_quota(target_pid: u32, field: u32, value: u32) i32 {
 /// Write argv to a blocked process.
 pub fn proc_set_argv(target_pid: u32, argv_block: []const u8) i32 {
     return proc_setup(PROC_SETUP_SETARGV, target_pid, @intFromPtr(argv_block.ptr), argv_block.len, 0);
+}
+
+/// Replace a blocked process's image with an ELF binary from caller's memory.
+pub fn proc_exec(target_pid: u32, elf_data: []const u8) i32 {
+    return proc_setup(PROC_SETUP_EXEC, target_pid, @intFromPtr(elf_data.ptr), elf_data.len, 0);
+}
+
+/// Register and spawn a supervised service at runtime.
+/// The kernel copies the ELF data to its heap, so the caller may free it after return.
+pub fn svc_register(name: []const u8, mount_path: []const u8, elf: []const u8) i32 {
+    const SvcRegSpec = extern struct {
+        name_buf: [32]u8,
+        mount_path_buf: [64]u8,
+        name_len: u8,
+        mount_path_len: u8,
+    };
+    var spec: SvcRegSpec = .{
+        .name_buf = @splat(0),
+        .mount_path_buf = @splat(0),
+        .name_len = @intCast(name.len),
+        .mount_path_len = @intCast(mount_path.len),
+    };
+    @memcpy(spec.name_buf[0..name.len], name);
+    @memcpy(spec.mount_path_buf[0..mount_path.len], mount_path);
+    return proc_setup(PROC_SETUP_SVC_REGISTER, 0, @intFromPtr(&spec), @intFromPtr(elf.ptr), elf.len);
 }
 
 pub fn brk(new_brk: u64) u64 {

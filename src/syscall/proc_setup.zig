@@ -48,6 +48,8 @@ pub const OP_ALLOCGROUP = 10;
 pub const OP_GROUPKILL = 11;
 pub const OP_FREEGROUP = 12;
 pub const OP_SETQUOTA_GROUP = 13;
+pub const OP_EXEC = 14;
+pub const OP_SVC_REGISTER = 15;
 
 /// proc_setup(op, target_pid, arg0, arg1, arg2) -> result
 pub fn sysProcSetup(op: u64, target_pid: u64, a0: u64, a1: u64, a2: u64) u64 {
@@ -62,6 +64,7 @@ pub fn sysProcSetup(op: u64, target_pid: u64, a0: u64, a1: u64, a2: u64) u64 {
         OP_GROUPKILL => return opGroupKill(@intCast(target_pid)),
         OP_FREEGROUP => return opFreeGroup(@intCast(target_pid)),
         OP_SETQUOTA_GROUP => return opSetQuotaGroup(@intCast(target_pid), a0, a1),
+        OP_SVC_REGISTER => return opSvcRegister(caller, a0, a1, a2),
         else => {},
     }
 
@@ -93,6 +96,7 @@ pub fn sysProcSetup(op: u64, target_pid: u64, a0: u64, a1: u64, a2: u64) u64 {
         OP_CLEARNM => return opClearNm(target),
         OP_MOUNTPFX => return opMountPfx(caller, target, a0, a1, a2),
         OP_CLONENM => return opCloneNm(target, a0),
+        OP_EXEC => return opExec(caller, target, a0, a1),
         else => return EINVAL,
     }
 }
@@ -358,4 +362,167 @@ fn opSetQuotaGroup(group_id: u8, field: u64, value: u64) u64 {
         else => return EINVAL,
     }
     return 0;
+}
+
+/// OP_EXEC: Replace a blocked target's image with an ELF binary.
+/// The ELF data lives in the caller's address space (e.g. linuxd's memory).
+/// Creates a new address space, loads the ELF, allocates stack+auxv,
+/// frees the target's old address space, and updates the target's registers.
+/// Target stays blocked — caller is responsible for OP_SETARGV + OP_READY.
+fn opExec(caller: *process.Process, target: *process.Process, elf_ptr: u64, elf_len: u64) u64 {
+    const elf = @import("../elf.zig");
+    const pmm = @import("../pmm.zig");
+
+    // Validate ELF pointer in caller's address space
+    if (elf_ptr == 0 or elf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+    if (elf_len == 0 or elf_len > 4 * 1024 * 1024) return EINVAL;
+
+    _ = caller; // Caller CR3 is active — elf_ptr is directly readable
+
+    // Read ELF from caller's user memory
+    const elf_data: []const u8 = @as([*]const u8, @ptrFromInt(elf_ptr))[0..@intCast(elf_len)];
+
+    // Create fresh address space
+    const new_pml4 = paging.createAddressSpace() orelse return ENOMEM;
+
+    // Load ELF into new address space (reads from caller's CR3)
+    const load_result = elf.load(new_pml4, elf_data) catch {
+        paging.freeAddressSpace(new_pml4);
+        return EINVAL;
+    };
+
+    // Allocate user stack in new address space
+    const stack_top = mem.USER_STACK_TOP;
+    for (0..process.USER_STACK_PAGES) |i| {
+        const page = pmm.allocPage() orelse {
+            paging.freeAddressSpace(new_pml4);
+            return ENOMEM;
+        };
+        const page_ptr: [*]u8 = paging.physPtr(page);
+        @memset(page_ptr[0..mem.PAGE_SIZE], 0);
+        const vaddr = stack_top - (process.USER_STACK_PAGES - i) * mem.PAGE_SIZE;
+        paging.mapPage(new_pml4, vaddr, page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
+            paging.freeAddressSpace(new_pml4);
+            return ENOMEM;
+        };
+    }
+
+    // Write auxv for POSIX/musl programs
+    {
+        const AUXV_BASE: u64 = mem.ARGV_BASE - mem.PAGE_SIZE;
+        const auxv_page = pmm.allocPage() orelse {
+            paging.freeAddressSpace(new_pml4);
+            return ENOMEM;
+        };
+        const auxv_phys_ptr: [*]u8 = paging.physPtr(auxv_page);
+        @memset(auxv_phys_ptr[0..mem.PAGE_SIZE], 0);
+        paging.mapPage(new_pml4, AUXV_BASE, auxv_page, paging.Flags.WRITABLE | paging.Flags.USER) orelse {
+            paging.freeAddressSpace(new_pml4);
+            return ENOMEM;
+        };
+
+        var auxv_buf: [96]u8 = @splat(0);
+        var off: usize = 0;
+        root.writeU64LE(auxv_buf[off..][0..8], 3); off += 8; // AT_PHDR
+        root.writeU64LE(auxv_buf[off..][0..8], load_result.phdr_vaddr); off += 8;
+        root.writeU64LE(auxv_buf[off..][0..8], 5); off += 8; // AT_PHNUM
+        root.writeU64LE(auxv_buf[off..][0..8], load_result.phnum); off += 8;
+        root.writeU64LE(auxv_buf[off..][0..8], 4); off += 8; // AT_PHENT
+        root.writeU64LE(auxv_buf[off..][0..8], load_result.phentsize); off += 8;
+        root.writeU64LE(auxv_buf[off..][0..8], 9); off += 8; // AT_ENTRY
+        root.writeU64LE(auxv_buf[off..][0..8], load_result.entry_point); off += 8;
+        root.writeU64LE(auxv_buf[off..][0..8], 6); off += 8; // AT_PAGESZ
+        root.writeU64LE(auxv_buf[off..][0..8], mem.PAGE_SIZE); off += 8;
+        root.writeU64LE(auxv_buf[off..][0..8], 0); off += 8; // AT_NULL
+        root.writeU64LE(auxv_buf[off..][0..8], 0); off += 8;
+        _ = proc_handlers.writeToChildMem(new_pml4, AUXV_BASE, auxv_buf[0..off]);
+    }
+
+    // === Point of no return: swap to new address space ===
+    if (target.pml4) |old_pml4| {
+        paging.freeAddressSpace(old_pml4);
+    }
+    target.pml4 = new_pml4;
+    target.user_rip = load_result.entry_point;
+    target.user_rsp = mem.ARGV_BASE - 8;
+    target.user_rflags = switch (@import("builtin").cpu.arch) {
+        .riscv64 => @import("../arch/riscv64/cpu.zig").SSTATUS_SPIE | @import("../arch/riscv64/cpu.zig").SSTATUS_SUM,
+        .aarch64 => 0x0,
+        else => 0x202, // IF=1
+    };
+    target.brk = load_result.brk;
+    target.pages_used = 0;
+    target.saved_kernel_rsp = 0; // Force IRETQ path in switchTo
+    target.syscall_ret = 0;
+    target.mmap_next = 0x0000_4000_0000_0000;
+
+    // Clear IPC state (old user buffers are gone)
+    target.ipc_pending_msg = null;
+    target.ipc_recv_buf_ptr = 0;
+
+    // FDs and namespace inherited (Plan 9 semantics)
+    // compat flag preserved — new binary is still Linux
+
+    klog.debug("[op_exec: target=");
+    klog.debugDec(target.pid);
+    klog.debug(" entry=");
+    klog.debugHex(load_result.entry_point);
+    klog.debug("]\n");
+
+    return 0; // Target stays blocked
+}
+
+/// OP_SVC_REGISTER: Register and spawn a supervised service at runtime.
+/// Args: a0=spec_ptr (userspace pointer to SvcRegSpec), a1=elf_ptr, a2=elf_len
+/// Allows init (or other root processes) to register services discovered at runtime
+/// (e.g. after `fay install fornax-sys`).
+const SvcRegSpec = extern struct {
+    name: [32]u8,
+    mount_path: [64]u8,
+    name_len: u8,
+    mount_path_len: u8,
+};
+
+fn opSvcRegister(caller: *process.Process, spec_ptr: u64, elf_ptr: u64, elf_len: u64) u64 {
+    _ = caller;
+    const supervisor = @import("../supervisor.zig");
+    const heap = @import("../heap.zig");
+
+    // Validate spec pointer
+    if (spec_ptr == 0 or spec_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+    if (elf_ptr == 0 or elf_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+    if (elf_len == 0 or elf_len > 4 * 1024 * 1024) return EINVAL;
+
+    // Read spec from userspace
+    const spec: *const SvcRegSpec = @ptrFromInt(spec_ptr);
+    const name_len = spec.name_len;
+    const mount_path_len = spec.mount_path_len;
+
+    if (name_len == 0 or name_len > 32) return EINVAL;
+    if (mount_path_len == 0 or mount_path_len > 64) return EINVAL;
+
+    // Copy ELF data to kernel heap (userspace memory may be reclaimed)
+    const elf_size: usize = @intCast(elf_len);
+    const heap_elf = heap.alloc(elf_size) orelse return ENOMEM;
+    const src: [*]const u8 = @ptrFromInt(elf_ptr);
+    @memcpy(heap_elf[0..elf_size], src[0..elf_size]);
+
+    // Spawn via supervisor
+    if (supervisor.spawnService(
+        spec.name[0..name_len],
+        heap_elf[0..elf_size],
+        spec.mount_path[0..mount_path_len],
+    )) |_| {
+        klog.info("[svc_register] spawned '");
+        klog.info(spec.name[0..name_len]);
+        klog.info("' at ");
+        klog.info(spec.mount_path[0..mount_path_len]);
+        klog.info("\n");
+        return 0;
+    } else {
+        klog.err("[svc_register] failed to spawn '");
+        klog.err(spec.name[0..name_len]);
+        klog.err("'\n");
+        return ENOMEM;
+    }
 }

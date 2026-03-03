@@ -1358,3 +1358,18 @@ fn readLeU64(buf: *const [8]u8) u64 {
         (@as(u64, buf[6]) << 48) |
         (@as(u64, buf[7]) << 56);
 }
+
+// ── socketpair via Fornax ipc_pair ──────────────────────────────────────
+
+const AF_UNIX: u64 = 1;
+
+pub fn linuxSocketpair(domain: u64, sock_type: u64, _: u64, sv_ptr: u64) u64 {
+    _ = sock_type;
+    if (domain != AF_UNIX and domain != AF_INET) return EAFNOSUPPORT;
+    if (sv_ptr == 0 or sv_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+
+    // Use Fornax pipe to create a bidirectional pair
+    // sysPipe writes two fds to user memory at sv_ptr (same as int sv[2])
+    const result = syscall.sysPipe(sv_ptr);
+    return result;
+}
