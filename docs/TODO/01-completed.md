@@ -28,6 +28,7 @@
 | 150 | Login / getty, users, groups, /etc/passwd, su, adduser |
 | 200 | Kernel `/proc` file tree (status, ctl, meminfo, supervisor) |
 | 201 | `seek` + `getpid` syscalls |
+| 202 | File management (cp, mv, touch) |
 | 203 | Text processing (grep, sed, awk, less) |
 | 204 | Process & system management (ps, kill, du, top) |
 | 205 | Shell enhancements (if/while/for, `&&`/`||`, test, `#` comments) |
@@ -43,6 +44,7 @@
 | H-K | Kernel threads (clone, futex, thread groups, POSIX pthread support) |
 | 1000 | C/POSIX realms (native C via fornax.h, musl libc + syscall shim) |
 | 1001a-d,l | Foundation libraries (crc32, sha256, deflate, tar, json, http) |
+| 1001e-k | fay package manager (sync, install, remove, search, upgrade, deps) |
 | 1001i | TCC cross-compiled as POSIX program |
 | 1002 | Container system (fnx CLI, Containerfile, Linux compat, bridge + NAT) |
 | 1010 | Socket shim — linux_socket.zig rewritten to use Plan 9 /net/ file ops via IPC to netd |
