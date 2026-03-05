@@ -155,7 +155,8 @@ pub fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
         entry.fd_type == .dev_kmesg or entry.fd_type == .dev_drivers or
         entry.fd_type == .dev_pid or entry.fd_type == .dev_user or
         entry.fd_type == .dev_sysstat or
-        entry.fd_type == .dev_trace)
+        entry.fd_type == .dev_trace or
+        entry.fd_type == .dev_fbinfo)
     {
         return EBADF;
     }
@@ -194,6 +195,11 @@ pub fn sysWrite(fd: u64, buf_ptr: u64, count: u64) u64 {
         }
         _ = virtio_net.send(src[0..len]);
         return len;
+    }
+
+    // IRQ forward fd: mask/unmask commands
+    if (entry.fd_type == .dev_irq) {
+        return devfiles.irqWrite(buf_ptr, count, entry);
     }
 
     const chan = ipc.getChannel(entry.channel_id) orelse return EBADF;
@@ -327,6 +333,9 @@ pub fn sysOpen(path_ptr: u64, path_len: u64) u64 {
         }
         if (strEql(path_slice, "/dev/ipcctl")) {
             return proc.allocDevFd(.dev_ipcctl) orelse return EMFILE;
+        }
+        if (strEql(path_slice, "/dev/fbinfo")) {
+            return proc.allocDevFd(.dev_fbinfo) orelse return EMFILE;
         }
     }
 
@@ -579,6 +588,9 @@ pub fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
     if (entry_ptr.fd_type == .dev_pci) {
         return devfiles.pciRead(entry_ptr, buf_ptr, count);
     }
+    if (entry_ptr.fd_type == .dev_fbinfo) {
+        return devfiles.fbinfoRead(entry_ptr, buf_ptr, count);
+    }
     if (entry_ptr.fd_type == .dev_usb) {
         return devfiles.usbRead(entry_ptr, buf_ptr, count);
     }
@@ -622,6 +634,9 @@ pub fn sysRead(fd: u64, buf_ptr: u64, count: u64) u64 {
     }
     if (entry_ptr.fd_type == .dev_ipcctl) {
         return devfiles.ipcctlRead(entry_ptr, buf_ptr, count);
+    }
+    if (entry_ptr.fd_type == .dev_irq) {
+        return devfiles.irqRead(proc, fd, entry_ptr, buf_ptr, count);
     }
 
     const chan = ipc.getChannel(entry_ptr.channel_id) orelse return EBADF;
@@ -794,7 +809,7 @@ pub fn sysClose(fd: u64) u64 {
     }
 
     // Virtual device fds: no cleanup, just close
-    if (entry.fd_type == .dev_null or entry.fd_type == .dev_zero or entry.fd_type == .dev_random) {
+    if (entry.fd_type == .dev_null or entry.fd_type == .dev_zero or entry.fd_type == .dev_random or entry.fd_type == .dev_fbinfo) {
         proc.closeFd(@intCast(fd));
         return 0;
     }
@@ -803,6 +818,14 @@ pub fn sysClose(fd: u64) u64 {
     if (entry.fd_type == .dev_ether) {
         const ether_mod = @import("../ether.zig");
         ether_mod.freeClient(entry.ether_client);
+        proc.closeFd(@intCast(fd));
+        return 0;
+    }
+
+    // IRQ forward fd: free the forward slot
+    if (entry.fd_type == .dev_irq) {
+        const irq_forward = @import("../irq_forward.zig");
+        irq_forward.free(entry.irq_slot);
         proc.closeFd(@intCast(fd));
         return 0;
     }

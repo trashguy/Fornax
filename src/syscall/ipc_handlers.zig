@@ -291,7 +291,7 @@ pub fn sysIpcReply(fd: u64, reply_msg_ptr: u64) u64 {
             }
             // syscall_ret and saved_kernel_rsp already set by OP_EXEC
         },
-        .console_read, .pipe_read, .pipe_write, .sleep, .ether_read, .poll_wait => {},
+        .console_read, .pipe_read, .pipe_write, .sleep, .ether_read, .poll_wait, .irq_read => {},
         .none => {
             if (is_ok) {
                 if (client_proc.ipc_recv_buf_ptr != 0 and reply_data_len > 0) {

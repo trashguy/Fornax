@@ -64,6 +64,8 @@ pub const SYS = enum(u64) {
     shmem_map = 44,
     shmem_destroy = 45,
     proc_setup = 46,
+    mmap_device = 47,
+    irq_alloc = 48,
 };
 
 /// Error return values.
@@ -74,6 +76,7 @@ pub const ENOENT: u64 = @bitCast(@as(i64, -2));
 pub const EMFILE: u64 = @bitCast(@as(i64, -24));
 pub const EIO: u64 = @bitCast(@as(i64, -5));
 pub const ENOMEM: u64 = @bitCast(@as(i64, -12));
+pub const EACCES: u64 = @bitCast(@as(i64, -13));
 pub const EINVAL: u64 = @bitCast(@as(i64, -22));
 
 // --- Shared helpers ---
@@ -242,6 +245,8 @@ pub const sysSleep = ns.sysSleep;
 pub const sysShutdown = ns.sysShutdown;
 
 pub const sysProcSetup = proc_setup.sysProcSetup;
+pub const sysMmapDevice = mem_handlers.sysMmapDevice;
+pub const sysIrqAlloc = mem_handlers.sysIrqAlloc;
 
 /// Main syscall dispatch. Called from arch-specific entry point.
 pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) u64 {
@@ -344,6 +349,8 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         .shmem_map => sysShmemMap(arg0),
         .shmem_destroy => sysShmemDestroy(arg0),
         .proc_setup => sysProcSetup(arg0, arg1, arg2, arg3, arg4),
+        .mmap_device => sysMmapDevice(arg0, arg1, arg2, arg3),
+        .irq_alloc => sysIrqAlloc(arg0, arg1, arg2),
     };
 
     @import("../trace.zig").trace(.syscall_exit, @truncate(nr));

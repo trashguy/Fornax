@@ -25,6 +25,8 @@ pub const Flags = struct {
     pub const DIRTY: u64 = 1 << 6;
     pub const HUGE_PAGE: u64 = 1 << 7; // 2MB in PD, 1GB in PDPT
     pub const GLOBAL: u64 = 1 << 8;
+    pub const DEVICE_MAP: u64 = 1 << 9; // Software bit: marks PTE as device MMIO (not freeable)
+    pub const WRITE_COMBINE: u64 = 1 << 3; // PWT bit — selects PAT index 1 (WC after PAT reprogramming)
     pub const NO_EXECUTE: u64 = @as(u64, 1) << 63;
     pub const EXEC: u64 = 0; // x86_64: pages are executable by default; no-op for compat with riscv64
 };
@@ -124,6 +126,22 @@ fn mapHugePage(pml4: *PageTable, virt: u64, phys: u64) ?void {
 
     // Set 2MB huge page entry
     pd.entries[pd_idx] = phys | Flags.PRESENT | Flags.WRITABLE | Flags.HUGE_PAGE;
+}
+
+/// Map a 2MB huge page into user address space with caller-supplied flags.
+/// Used for device MMIO mappings (VRAM, BARs, etc.).
+pub fn mapHugePageUser(pml4: *PageTable, virt: u64, phys: u64, flags: u64) ?void {
+    const pml4_idx = (virt >> 39) & 0x1FF;
+    const pdpt_idx = (virt >> 30) & 0x1FF;
+    const pd_idx = (virt >> 21) & 0x1FF;
+
+    // Propagate USER and WRITABLE to intermediate table entries
+    const propagate = flags & (Flags.USER | Flags.WRITABLE);
+    const pdpt = getOrAllocTable(pml4, pml4_idx, propagate) orelse return null;
+    const pd = getOrAllocTable(pdpt, pdpt_idx, propagate) orelse return null;
+
+    // Set 2MB huge page entry with caller flags
+    pd.entries[pd_idx] = phys | flags | Flags.PRESENT | Flags.HUGE_PAGE;
 }
 
 const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -248,7 +266,7 @@ pub fn deepCopyAddressSpace(src_pml4: *PageTable) ?*PageTable {
             for (0..512) |pd_idx| {
                 if (src_pd.entries[pd_idx] & Flags.PRESENT == 0) continue;
                 if (src_pd.entries[pd_idx] & Flags.HUGE_PAGE != 0) {
-                    // 2MB huge page — copy entry as-is (identity map region)
+                    // 2MB huge page — copy entry as-is (identity map or device region)
                     new_pd.entries[pd_idx] = src_pd.entries[pd_idx];
                     continue;
                 }
@@ -261,6 +279,12 @@ pub fn deepCopyAddressSpace(src_pml4: *PageTable) ?*PageTable {
                 for (0..512) |pt_idx| {
                     if (src_pt.entries[pt_idx] & Flags.PRESENT == 0) continue;
                     if (src_pt.entries[pt_idx] & Flags.USER == 0) continue; // skip non-user pages
+
+                    if (src_pt.entries[pt_idx] & Flags.DEVICE_MAP != 0) {
+                        // Device-mapped page: share physical mapping (don't copy)
+                        new_pt.entries[pt_idx] = src_pt.entries[pt_idx];
+                        continue;
+                    }
 
                     const src_phys = src_pt.entries[pt_idx] & ADDR_MASK;
                     const new_page = pmm.allocPage() orelse return null;
@@ -409,6 +433,10 @@ pub fn freeAddressSpace(pml4: *PageTable) void {
             for (0..512) |pd_idx| {
                 if (pd.entries[pd_idx] & Flags.PRESENT == 0) continue;
                 if (pd.entries[pd_idx] & Flags.HUGE_PAGE != 0) {
+                    // 2MB huge page: if device-mapped, just unmap (don't free physical memory)
+                    if (pd.entries[pd_idx] & Flags.DEVICE_MAP != 0) {
+                        pd.entries[pd_idx] = 0;
+                    }
                     continue;
                 }
                 const pt_phys = pd.entries[pd_idx] & ADDR_MASK;
@@ -421,6 +449,11 @@ pub fn freeAddressSpace(pml4: *PageTable) void {
                 // Free leaf (4KB) pages that have USER flag
                 for (0..512) |pt_idx| {
                     if (pt.entries[pt_idx] & Flags.PRESENT == 0) continue;
+                    if (pt.entries[pt_idx] & Flags.DEVICE_MAP != 0) {
+                        // Device-mapped page: unmap but don't free physical memory
+                        pt.entries[pt_idx] = 0;
+                        continue;
+                    }
                     if (pt.entries[pt_idx] & Flags.USER != 0) {
                         pmm.freePage(pt.entries[pt_idx] & ADDR_MASK);
                     }

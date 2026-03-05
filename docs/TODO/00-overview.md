@@ -20,16 +20,15 @@ From bare GPU hardware to Chrome rendering in a Fornax window.
 All drivers and servers in userspace, composited via Plan 9 namespaces,
 with POSIX realm bridging for legacy GUI apps.
 
-| Phase | Description | Depends On |
-|-------|-------------|------------|
-| 2000 | srv/gpu — modesetting + framebuffer (UEFI GOP backend) | 17 |
-| 2001 | srv/draw — 2D drawing server (Plan 9 /dev/draw) | 2000 |
-| 2002 | srv/input — input devices (/dev/mouse, /dev/kbd) | 17 |
-| 2003 | srv/wm — window manager (namespace multiplexing) | 2001, 2002 |
-| 2004 | Native GUI apps (cmd/clock, cmd/term) | 2003 |
+| Phase | Description                                             | Depends On |
+|-------|---------------------------------------------------------|------------|
+| 2000 | srv/gpu — modesetting + framebuffer (UEFI GOP backend)  | 17 |
+| 2001 | srv/draw — 2D drawing server (Plan 9 /dev/draw)         | 2000 |
+| 2002 | srv/input — input devices (/dev/mouse, /dev/kbd)        | 17 |
+| 2003 | srv/wm — window manager (namespace multiplexing)        | 2001, 2002 |
 | 2005 | srv/gpu+ — GPU command submission (stretch, not gating) | 2000 |
-| 2006 | Wayland bridge (sommelier in POSIX realm) | 1000, 2003 |
-| 2007 | Chrome in a Fornax window | 2006 |
+| 2006 | Wayland bridge (sommelier in POSIX realm)               | 1000, 2003 |
+| 2007 | Chrome in a Fornax window                               | 2006 |
 
 ## Future: Clustering + Deployment (3000-series, optional)
 

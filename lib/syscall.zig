@@ -52,6 +52,8 @@ pub const SYS = enum(u64) {
     shmem_map = 44,
     shmem_destroy = 45,
     proc_setup = 46,
+    mmap_device = 47,
+    irq_alloc = 48,
 };
 
 const ipc = @import("ipc.zig");
@@ -423,6 +425,19 @@ pub fn mmap(addr: u64, length: u64, prot: u64, flags: u64) u64 {
 
 pub fn munmap(addr: u64, length: u64) u64 {
     return syscall2(.munmap, addr, length);
+}
+
+/// Map physical device memory (MMIO/VRAM) into userspace. Requires uid 0.
+/// flags: bit 0 = write-combining, bit 1 = 2MB huge pages
+pub fn mmap_device(phys_addr: u64, length: u64, flags: u64) u64 {
+    return syscall4(.mmap_device, phys_addr, length, flags, 0);
+}
+
+/// Allocate an MSI-X interrupt forward fd. Requires uid 0.
+/// Returns fd number, or negative error.
+pub fn irq_alloc(bus: u8, slot: u8, func: u8, msix_entry: u16) u64 {
+    const devfn: u64 = (@as(u64, slot) << 3) | func;
+    return syscall3(.irq_alloc, bus, devfn, msix_entry);
 }
 
 pub fn dup(fd: i32) i32 {

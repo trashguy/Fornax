@@ -243,6 +243,43 @@ fn spawnCrond() void {
     _ = fx.close(pair.client_fd);
 }
 
+fn spawnGpud() void {
+    const pair = fx.ipc_pair();
+    if (pair.err < 0) {
+        out.puts("init: failed to create IPC pair for gpud\n");
+        return;
+    }
+
+    const gpud_elf = loadBin("gpud") orelse {
+        out.puts("init: /bin/gpud not found, skipping\n");
+        _ = fx.close(pair.server_fd);
+        _ = fx.close(pair.client_fd);
+        return;
+    };
+
+    // Spawn with fd mapping: server_fd→3
+    const mappings = [_]fx.FdMapping{
+        .{ .parent_fd = @intCast(pair.server_fd), .child_fd = 3 },
+    };
+    const pid = fx.spawn(gpud_elf, &mappings, null);
+    if (pid < 0) {
+        out.puts("init: failed to spawn gpud\n");
+        _ = fx.close(pair.server_fd);
+        _ = fx.close(pair.client_fd);
+        return;
+    }
+
+    const rc = fx.mount(pair.client_fd, "/dev/gpu/", 0);
+    if (rc < 0) {
+        out.puts("init: failed to mount gpud at /dev/gpu\n");
+    } else {
+        out.puts("init: gpud mounted at /dev/gpu\n");
+    }
+
+    _ = fx.close(pair.server_fd);
+    _ = fx.close(pair.client_fd);
+}
+
 /// Discover and register optional supervised services from /bin/.
 /// Called after filesystem is mounted. Services installed via `fay install`
 /// (e.g. fornax-sys) are picked up here without needing a rebuild.
@@ -290,6 +327,9 @@ export fn _start() noreturn {
 
     // Spawn crond (cron daemon)
     spawnCrond();
+
+    // Spawn gpud (GPU server)
+    spawnGpud();
 
     // Determine how many VTs to use (/etc/vts overrides default)
     readVtCount();

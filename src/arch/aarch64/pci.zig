@@ -10,6 +10,15 @@ const ECAM_BASE: u64 = 0x40_1000_0000;
 
 pub const MAX_DEVICES = 32;
 
+pub const MsixCapability = struct {
+    cap_offset: u8,
+    table_size: u16,
+    table_bar: u3,
+    table_offset: u32,
+    pba_bar: u3,
+    pba_offset: u32,
+};
+
 /// A discovered PCI device (identical to x86_64/riscv64 version).
 pub const PciDevice = struct {
     bus: u8,
@@ -25,6 +34,8 @@ pub const PciDevice = struct {
     interrupt_line: u8,
     interrupt_pin: u8,
     bar: [6]u32,
+    bar_size: [6]u64,
+    msix: ?MsixCapability,
 
     pub fn isVirtio(self: *const PciDevice) bool {
         return self.vendor_id == 0x1AF4;
@@ -203,7 +214,9 @@ pub fn enumerate() void {
             } else {
                 dev.bar[i] = 0;
             }
+            dev.bar_size[i] = 0;
         }
+        dev.msix = null;
 
         klog.debug("  [");
         klog.debugDec(slot_usize);

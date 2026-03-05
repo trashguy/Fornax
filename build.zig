@@ -1093,6 +1093,20 @@ const touch_bin = b.addExecutable(.{
     });
     crond_bin.image_base = user_image_base;
 
+    const gpud_bin = b.addExecutable(.{
+        .name = "gpud",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("srv/gpud/main.zig"),
+            .target = x86_64_freestanding,
+            .optimize = user_optimize,
+            .strip = if (user_strip) true else null,
+            .imports = &.{
+                .{ .name = "fornax", .module = fornax_module },
+            },
+        }),
+    });
+    gpud_bin.image_base = user_image_base;
+
     // cntrd, linuxd, fnx, bridge: now in fornax-sys/fnx external package.
     // Build with -Dcontainers=true only affects kernel comptime gating.
     // Install container binaries via: fay install fornax-sys
@@ -1596,6 +1610,7 @@ const touch_bin = b.addExecutable(.{
         curl_bin,
         netd_bin,
         crond_bin,
+        gpud_bin,
         crontab_bin,
         date_bin,
         uptime_bin,
@@ -1770,6 +1785,7 @@ const touch_bin = b.addExecutable(.{
         .{ "smp-test", "cmd/smp-test/main.zig" },
         .{ "netd", "srv/netd/main.zig" },
         .{ "crond", "srv/crond/main.zig" },
+        .{ "gpud", "srv/gpud/main.zig" },
         .{ "crontab", "cmd/crontab/main.zig" },
         .{ "date", "cmd/date/main.zig" },
         .{ "uptime", "cmd/uptime/main.zig" },
@@ -1992,6 +2008,7 @@ const touch_bin = b.addExecutable(.{
         .{ "smp-test", "cmd/smp-test/main.zig" },
         .{ "netd", "srv/netd/main.zig" },
         .{ "crond", "srv/crond/main.zig" },
+        .{ "gpud", "srv/gpud/main.zig" },
         .{ "crontab", "cmd/crontab/main.zig" },
         .{ "date", "cmd/date/main.zig" },
         .{ "uptime", "cmd/uptime/main.zig" },

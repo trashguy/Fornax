@@ -28,6 +28,7 @@ from .test_containers import (
     test_container_pull_real,
     test_container_pull_dockerhub,
 )
+from .test_pci import test_pci_enumeration
 from .test_smp import test_smp_stress
 from .test_supervisor import test_supervisor_status
 from .test_packages import test_fay_install_xxd
@@ -191,6 +192,7 @@ def run_test_session(session_name, ovmf, build_flags, tests, tmpdir,
 ALL_TESTS = {
     "boot": test_boot_login,
     "basic": test_basic_commands,
+    "pci": test_pci_enumeration,
     "supervisor": test_supervisor_status,
     "time": test_time_subsystem,
     "networking": test_host_networking,
@@ -325,6 +327,7 @@ def main():
             core_tests_list = [
                 test_boot_login,
                 test_basic_commands,
+                test_pci_enumeration,
                 test_supervisor_status,
                 test_time_subsystem,
                 test_host_networking,
@@ -345,6 +348,7 @@ def main():
             posix_tests_list = [
                 test_boot_login,
                 test_basic_commands,
+                test_pci_enumeration,
                 test_supervisor_status,
                 test_time_subsystem,
                 test_host_networking,
@@ -365,6 +369,7 @@ def main():
             aa64_tests_list = [
                 test_boot_login,
                 test_basic_commands,
+                test_pci_enumeration,
                 test_supervisor_status,
                 test_time_subsystem,
                 test_host_networking,
@@ -381,6 +386,7 @@ def main():
             rv64_tests_list = [
                 test_boot_login,
                 test_basic_commands,
+                test_pci_enumeration,
                 test_supervisor_status,
                 test_time_subsystem,
                 test_host_networking,

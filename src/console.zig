@@ -57,7 +57,7 @@ const VtDisplay = struct {
 
 // ── Global state ─────────────────────────────────────────────────
 
-var fb: Framebuffer = undefined;
+pub var fb: Framebuffer = undefined;
 var cols: u32 = 80;
 var rows: u32 = 24;
 var initialized: bool = false;

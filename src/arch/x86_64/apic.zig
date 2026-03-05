@@ -12,6 +12,7 @@ const percpu = @import("../../percpu.zig");
 const mem = @import("../../mem.zig");
 const pmm = @import("../../pmm.zig");
 const process = @import("../../process.zig");
+const ioapic = @import("ioapic.zig");
 
 // ── ACPI table structures ────────────────────────────────────────────
 
@@ -60,6 +61,23 @@ const MadtLocalApic = extern struct {
 // MADT entry types
 const MADT_LOCAL_APIC = 0;
 const MADT_IO_APIC = 1;
+const MADT_INT_SRC_OVERRIDE = 2;
+
+const MadtIoApic = extern struct {
+    header: MadtEntryHeader,
+    ioapic_id: u8,
+    reserved: u8,
+    ioapic_address: u32 align(1),
+    gsi_base: u32 align(1),
+};
+
+const MadtIntSrcOverride = extern struct {
+    header: MadtEntryHeader,
+    bus: u8,
+    source: u8,
+    gsi: u32 align(1),
+    flags: u16 align(1),
+};
 
 // ── LAPIC registers (MMIO, at LAPIC base + offset) ──────────────────
 
@@ -94,6 +112,10 @@ pub const IPI_TLB_SHOOTDOWN: u8 = 0xFD;
 var lapic_base: u64 = 0;
 var lapic_virt: u64 = 0; // Higher-half virtual address for MMIO
 
+/// IOAPIC physical address and GSI base discovered from MADT.
+var ioapic_phys_addr: u32 = 0;
+var ioapic_gsi_base_val: u32 = 0;
+
 /// Discovered LAPIC IDs. Index 0 = BSP.
 pub var lapic_ids: [percpu.MAX_CORES]u8 = [_]u8{0} ** percpu.MAX_CORES;
 pub var core_count: u8 = 0;
@@ -101,6 +123,33 @@ pub var core_count: u8 = 0;
 /// Convert physical address to higher-half virtual address.
 inline fn physToVirt(phys: u64) u64 {
     return phys +% mem.KERNEL_VIRT_BASE;
+}
+
+// ── Dynamic vector allocation ───────────────────────────────────────
+// Vectors 48-239 are available for dynamic allocation (MSI-X, IOAPIC routing).
+// Vectors 32-47 are legacy PIC IRQs, 240-252 reserved, 253-255 IPIs.
+const VECTOR_ALLOC_BASE: u8 = 48;
+const VECTOR_ALLOC_MAX: u8 = 239;
+const VECTOR_POOL_SIZE = VECTOR_ALLOC_MAX - VECTOR_ALLOC_BASE + 1;
+
+var vector_allocated: [VECTOR_POOL_SIZE]bool = [_]bool{false} ** VECTOR_POOL_SIZE;
+
+/// Allocate a free LAPIC vector from the dynamic range (48-239).
+/// Returns null if no vectors are available.
+pub fn allocVector() ?u8 {
+    for (0..VECTOR_POOL_SIZE) |i| {
+        if (!vector_allocated[i]) {
+            vector_allocated[i] = true;
+            return VECTOR_ALLOC_BASE + @as(u8, @truncate(i));
+        }
+    }
+    return null;
+}
+
+/// Return a dynamically allocated vector to the pool.
+pub fn freeVector(vec: u8) void {
+    if (vec < VECTOR_ALLOC_BASE or vec > VECTOR_ALLOC_MAX) return;
+    vector_allocated[vec - VECTOR_ALLOC_BASE] = false;
 }
 
 // AP boot synchronization (accessed via @atomicStore/@atomicLoad)
@@ -165,6 +214,13 @@ fn parseMadt(madt_phys: u64) void {
                 klog.info("\n");
                 core_count += 1;
             }
+        } else if (entry.entry_type == MADT_IO_APIC and entry.length >= @sizeOf(MadtIoApic)) {
+            const io_entry: *align(1) const MadtIoApic = @ptrCast(entry_ptr);
+            ioapic_phys_addr = io_entry.ioapic_address;
+            ioapic_gsi_base_val = io_entry.gsi_base;
+        } else if (entry.entry_type == MADT_INT_SRC_OVERRIDE and entry.length >= @sizeOf(MadtIntSrcOverride)) {
+            const ovr: *align(1) const MadtIntSrcOverride = @ptrCast(entry_ptr);
+            ioapic.addOverride(ovr.bus, ovr.source, ovr.gsi, ovr.flags);
         }
 
         offset += entry.length;
@@ -382,6 +438,9 @@ export fn apEntry() callconv(.{ .x86_64_sysv = .{} }) noreturn {
     // Configure SYSCALL/SYSRET MSRs (EFER.SCE, STAR, LSTAR, SFMASK)
     syscall_entry.init();
 
+    // Initialize PAT for write-combining support
+    cpu.initPAT();
+
     // Enable this AP's local APIC
     lapicWrite(LAPIC_SVR, SVR_ENABLE | SVR_SPURIOUS_VECTOR);
     lapicWrite(LAPIC_TPR, 0);
@@ -527,6 +586,11 @@ pub fn init(rsdp: ?[*]const u8) void {
 
     // Initialize BSP LAPIC
     initLapic();
+
+    // Initialize IOAPIC if discovered in MADT
+    if (ioapic_phys_addr != 0) {
+        ioapic.init(ioapic_phys_addr, ioapic_gsi_base_val);
+    }
 
     // Start APs
     startAps();

@@ -98,9 +98,9 @@ pub const ResourceQuotas = struct {
     cpu_priority: u8 = 128, // 0=lowest, 255=highest
 };
 
-pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, remove, rename, truncate, wstat, console_read, pipe_read, pipe_write, sleep, ether_read, linux_stat_open, linux_stat_done, poll_wait, linux_sock_step, linux_exec_wait };
+pub const PendingOp = enum(u8) { none, open, create, read, write, close, stat, remove, rename, truncate, wstat, console_read, pipe_read, pipe_write, sleep, ether_read, linux_stat_open, linux_stat_done, poll_wait, linux_sock_step, linux_exec_wait, irq_read };
 
-pub const FdType = enum(u8) { ipc, pipe, blk, proc, dev_null, dev_zero, dev_random, dev_pci, dev_usb, dev_mouse, dev_cpu, dev_ether, dev_sysname, dev_osversion, dev_time, dev_kmesg, dev_reboot, dev_drivers, dev_pid, dev_user, dev_consctl, dev_sysstat, dev_trace, dev_ipcctl, dev_epoll, dev_eventfd, dev_timerfd, net };
+pub const FdType = enum(u8) { ipc, pipe, blk, proc, dev_null, dev_zero, dev_random, dev_pci, dev_usb, dev_mouse, dev_cpu, dev_ether, dev_sysname, dev_osversion, dev_time, dev_kmesg, dev_reboot, dev_drivers, dev_pid, dev_user, dev_consctl, dev_sysstat, dev_trace, dev_ipcctl, dev_epoll, dev_eventfd, dev_timerfd, dev_irq, dev_fbinfo, net };
 
 pub const ProcFdKind = enum(u8) {
     dir,
@@ -133,6 +133,8 @@ pub const FdEntry = struct {
     proc_pid: u32 = 0,
     /// Ether-specific fields (only used when fd_type == .dev_ether)
     ether_client: u8 = 0,
+    /// IRQ forward slot index (only used when fd_type == .dev_irq)
+    irq_slot: u8 = 0,
 };
 
 pub const Process = struct {
@@ -1468,6 +1470,43 @@ fn switchTo(proc: *Process) noreturn {
         } else {
             proc.syscall_ret = 0;
         }
+        proc.ipc_recv_buf_ptr = 0;
+        proc.pending_op = .none;
+        proc.pending_fd = 0;
+    }
+
+    // IRQ read delivery — address space is active, so user pointers are valid
+    if (proc.pending_op == .irq_read) {
+        const irq_forward = @import("irq_forward.zig");
+        const irq_slot = @as(u8, @intCast(proc.pending_fd >> 8)); // stashed in upper bits
+
+        var irq_data_ready = irq_forward.hasPending(irq_slot);
+        if (!irq_data_ready) {
+            // No data — set .blocked BEFORE registering waiter
+            // (same SMP race prevention as pipe_read / ether_read).
+            proc.state = .blocked;
+            irq_forward.setWaiter(irq_slot, @intCast(proc.pid));
+            irq_data_ready = irq_forward.hasPending(irq_slot);
+            if (!irq_data_ready) {
+                setCurrentInternal(null);
+                scheduleNext();
+            }
+            // Data arrived during re-check — undo block
+            proc.state = .running;
+        }
+        if (proc.ipc_recv_buf_ptr != 0 and proc.ipc_recv_buf_ptr < 0x0000_8000_0000_0000) {
+            const count = irq_forward.consumePending(irq_slot);
+            const dest: [*]u8 = @ptrFromInt(proc.ipc_recv_buf_ptr);
+            // Write u32 little-endian
+            dest[0] = @truncate(count);
+            dest[1] = @truncate(count >> 8);
+            dest[2] = @truncate(count >> 16);
+            dest[3] = @truncate(count >> 24);
+            proc.syscall_ret = 4;
+        } else {
+            proc.syscall_ret = 0;
+        }
+        irq_forward.setWaiter(irq_slot, 0);
         proc.ipc_recv_buf_ptr = 0;
         proc.pending_op = .none;
         proc.pending_fd = 0;

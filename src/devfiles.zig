@@ -119,6 +119,27 @@ fn fmtHex2(buf: *[2]u8, val: u8) void {
     buf[1] = hex[@as(u4, @truncate(val))];
 }
 
+/// Format a u64 as variable-width hex into buf, returning number of chars written.
+fn fmtHexVar(buf: []u8, val: u64) usize {
+    const hex = "0123456789abcdef";
+    if (val == 0) {
+        if (buf.len > 0) buf[0] = '0';
+        return 1;
+    }
+    var v = val;
+    var tmp: [16]u8 = undefined;
+    var n: usize = 0;
+    while (v != 0) : (n += 1) {
+        tmp[n] = hex[@as(u4, @truncate(v & 0xF))];
+        v >>= 4;
+    }
+    if (n > buf.len) return 0;
+    for (0..n) |j| {
+        buf[j] = tmp[n - 1 - j];
+    }
+    return n;
+}
+
 // ---------- State ----------
 
 const ProcDirEntry = extern struct {
@@ -678,14 +699,12 @@ pub fn pciRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
     };
     const devs = pci.getDevices();
 
-    // Generate text into static buffer
-    // Each line: "BB:SS.F VVVV:DDDD CC:SS:PP\n" = 27 chars max
-    // Max 32 devices = 864 bytes
-    var text_buf: [1024]u8 = undefined;
+    // Extended format: "BB:SS.F VVVV:DDDD CC:SS:PP [sz0 sz1 sz2 sz3 sz4 sz5] [b0 b1 b2 b3 b4 b5] [MSI-X:N]\n"
+    var text_buf: [8192]u8 = undefined;
     var pos: usize = 0;
 
     for (devs) |d| {
-        if (pos + 27 > text_buf.len) break;
+        if (pos + 256 > text_buf.len) break;
         // BB:SS.F
         fmtHex2(text_buf[pos..][0..2], d.bus);
         pos += 2;
@@ -719,12 +738,125 @@ pub fn pciRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
         pos += 1;
         fmtHex2(text_buf[pos..][0..2], d.prog_if);
         pos += 2;
+
+        // BAR sizes: [sz0 sz1 sz2 sz3 sz4 sz5]
+        text_buf[pos] = ' ';
+        pos += 1;
+        text_buf[pos] = '[';
+        pos += 1;
+        for (0..6) |bi| {
+            if (bi > 0) {
+                text_buf[pos] = ' ';
+                pos += 1;
+            }
+            const n = fmtHexVar(text_buf[pos..], d.bar_size[bi]);
+            pos += n;
+        }
+        text_buf[pos] = ']';
+        pos += 1;
+
+        // BAR base addresses: [b0 b1 b2 b3 b4 b5]
+        text_buf[pos] = ' ';
+        pos += 1;
+        text_buf[pos] = '[';
+        pos += 1;
+        for (0..6) |bi| {
+            if (bi > 0) {
+                text_buf[pos] = ' ';
+                pos += 1;
+            }
+            const base: u64 = if (d.memBase(@as(u3, @intCast(bi)))) |mb|
+                mb
+            else if (bi == 0)
+                if (d.ioBase()) |io| @as(u64, io) else 0
+            else
+                0;
+            const n = fmtHexVar(text_buf[pos..], base);
+            pos += n;
+        }
+        text_buf[pos] = ']';
+        pos += 1;
+
+        // MSI-X info if present
+        if (d.msix) |mx| {
+            const msix_hdr = " [MSI-X:";
+            @memcpy(text_buf[pos..][0..msix_hdr.len], msix_hdr);
+            pos += msix_hdr.len;
+            var dec_buf: [20]u8 = undefined;
+            const dec_str = fmtDecimal(@as(u64, mx.table_size), &dec_buf);
+            @memcpy(text_buf[pos..][0..dec_str.len], dec_str);
+            pos += dec_str.len;
+            text_buf[pos] = ']';
+            pos += 1;
+        }
+
         text_buf[pos] = '\n';
         pos += 1;
     }
 
     const dest: [*]u8 = @ptrFromInt(buf_ptr);
-    const max_bytes: usize = @intCast(@min(count, 4096));
+    const max_bytes: usize = @intCast(@min(count, 8192));
+    const offset: usize = entry_ptr.read_offset;
+    if (offset >= pos) return 0;
+    const available = pos - offset;
+    const to_copy = @min(available, max_bytes);
+    @memcpy(dest[0..to_copy], text_buf[offset..][0..to_copy]);
+    entry_ptr.read_offset += @intCast(to_copy);
+    return to_copy;
+}
+
+pub fn fbinfoRead(entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
+    const console = @import("console.zig");
+    var text_buf: [128]u8 = undefined;
+    var pos: usize = 0;
+    var dec_buf: [20]u8 = undefined;
+
+    // Physical address: on UEFI x86_64 the framebuffer is identity-mapped,
+    // so the pointer value IS the physical address (below higher-half).
+    const fb_phys = @intFromPtr(console.fb.base);
+    pos += fmtHexVar(text_buf[pos..], fb_phys);
+    text_buf[pos] = ' ';
+    pos += 1;
+
+    // Width
+    const w_str = fmtDecimal(@as(u64, console.fb.width), &dec_buf);
+    @memcpy(text_buf[pos..][0..w_str.len], w_str);
+    pos += w_str.len;
+    text_buf[pos] = ' ';
+    pos += 1;
+
+    // Height
+    const h_str = fmtDecimal(@as(u64, console.fb.height), &dec_buf);
+    @memcpy(text_buf[pos..][0..h_str.len], h_str);
+    pos += h_str.len;
+    text_buf[pos] = ' ';
+    pos += 1;
+
+    // Stride
+    const s_str = fmtDecimal(@as(u64, console.fb.stride), &dec_buf);
+    @memcpy(text_buf[pos..][0..s_str.len], s_str);
+    pos += s_str.len;
+    text_buf[pos] = ' ';
+    pos += 1;
+
+    // BPP (always 32)
+    const bpp_str = "32 ";
+    @memcpy(text_buf[pos..][0..bpp_str.len], bpp_str);
+    pos += bpp_str.len;
+
+    // Format
+    if (console.fb.is_bgr) {
+        @memcpy(text_buf[pos..][0..3], "bgr");
+        pos += 3;
+    } else {
+        @memcpy(text_buf[pos..][0..3], "rgb");
+        pos += 3;
+    }
+    text_buf[pos] = '\n';
+    pos += 1;
+
+    const dest: [*]u8 = @ptrFromInt(buf_ptr);
+    const max_bytes: usize = @intCast(@min(count, 128));
     const offset: usize = entry_ptr.read_offset;
     if (offset >= pos) return 0;
     const available = pos - offset;
@@ -1213,6 +1345,65 @@ fn supervisorWrite(buf_ptr: u64, count: u64) u64 {
         cmd[3] == 'e' and cmd[4] == 't')
     {
         supervisor.resetService(svc);
+        return len;
+    }
+
+    return EINVAL;
+}
+
+/// Read from an IRQ forward fd. Returns 4 bytes (u32 pending count) or blocks.
+pub fn irqRead(proc: *process.Process, fd_num: u64, entry_ptr: *process.FdEntry, buf_ptr: u64, count: u64) u64 {
+    const irq_forward = @import("irq_forward.zig");
+    const irq_slot = entry_ptr.irq_slot;
+
+    if (count < 4) return EINVAL;
+
+    if (irq_forward.hasPending(irq_slot)) {
+        // Data available — consume and return immediately
+        const pending = irq_forward.consumePending(irq_slot);
+        const dest: [*]u8 = @ptrFromInt(buf_ptr);
+        dest[0] = @truncate(pending);
+        dest[1] = @truncate(pending >> 8);
+        dest[2] = @truncate(pending >> 16);
+        dest[3] = @truncate(pending >> 24);
+        return 4;
+    }
+
+    // Block until IRQ fires. Stash irq_slot in upper byte of pending_fd
+    // so switchTo's irq_read delivery can recover it.
+    proc.pending_op = .irq_read;
+    proc.ipc_recv_buf_ptr = buf_ptr;
+    proc.pending_fd = @as(u32, irq_slot) << 8 | @as(u32, @intCast(fd_num));
+    proc.syscall_ret = count;
+    proc.state = .blocked;
+    irq_forward.setWaiter(irq_slot, @intCast(proc.pid));
+    process.scheduleNext();
+}
+
+/// Write to an IRQ forward fd. Supports "mask" and "unmask" commands.
+pub fn irqWrite(buf_ptr: u64, count: u64, entry: process.FdEntry) u64 {
+    const irq_forward = @import("irq_forward.zig");
+    const src: [*]const u8 = @ptrFromInt(buf_ptr);
+    const len: usize = @intCast(@min(count, 64));
+
+    // Strip trailing whitespace/newline
+    var cmd_len = len;
+    while (cmd_len > 0 and (src[cmd_len - 1] == '\n' or src[cmd_len - 1] == ' ')) {
+        cmd_len -= 1;
+    }
+    if (cmd_len == 0) return EINVAL;
+
+    // "mask"
+    if (cmd_len == 4 and src[0] == 'm' and src[1] == 'a' and src[2] == 's' and src[3] == 'k') {
+        irq_forward.maskEntry(entry.irq_slot);
+        return len;
+    }
+
+    // "unmask"
+    if (cmd_len == 6 and src[0] == 'u' and src[1] == 'n' and src[2] == 'm' and
+        src[3] == 'a' and src[4] == 's' and src[5] == 'k')
+    {
+        irq_forward.unmaskEntry(entry.irq_slot);
         return len;
     }
 

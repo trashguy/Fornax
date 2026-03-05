@@ -66,6 +66,24 @@ pub fn registerIrqHandler(irq: u8, handler: IrqHandler) bool {
     return false;
 }
 
+/// Generic vector handler table for dynamic vectors (48-252).
+/// Used by MSI-X and IOAPIC-routed interrupts. LAPIC EOI is sent by the dispatcher.
+pub const VectorHandler = *const fn () bool;
+var vector_handlers: [256]?VectorHandler = [_]?VectorHandler{null} ** 256;
+
+/// Register a handler for a specific LAPIC vector (typically 48-252).
+/// Returns false if the vector already has a handler.
+pub fn registerVectorHandler(vector: u8, handler: VectorHandler) bool {
+    if (vector_handlers[vector] != null) return false;
+    vector_handlers[vector] = handler;
+    return true;
+}
+
+/// Unregister a handler for a specific vector.
+pub fn unregisterVectorHandler(vector: u8) void {
+    vector_handlers[vector] = null;
+}
+
 /// Output a u64 as hex using only serial.putChar and arithmetic (no memory reads).
 /// Avoids both serial.putHex (function call) and string literals (.rodata access).
 inline fn inlineHex(val: u64) void {
@@ -132,6 +150,25 @@ pub fn handleException(frame: *idt.ExceptionFrame) void {
 
         @import("../../trace.zig").trace(.irq_exit, irq);
         pic.sendEoi(irq);
+        return;
+    }
+
+    // Dynamic vector dispatch (vectors 48-252) — MSI-X and IOAPIC-routed interrupts
+    if (frame.vector >= 48 and frame.vector < 253) {
+        {
+            const percpu = @import("../../percpu.zig");
+            const core_id = percpu.getCoreId();
+            percpu.percpu_array[core_id].interrupts += 1;
+        }
+        const vec: u8 = @intCast(frame.vector);
+        if (vector_handlers[vec]) |handler| {
+            _ = handler();
+        } else {
+            klog.debug("Vector ");
+            klog.debugDec(vec);
+            klog.debug(": unhandled\n");
+        }
+        apic.sendEoi();
         return;
     }
 
@@ -316,5 +353,6 @@ pub fn init() void {
     gdt.init();
     idt.init();
     paging.init();
+    cpu.initPAT();
     klog.info("x86_64: GDT + IDT + paging initialized\n");
 }

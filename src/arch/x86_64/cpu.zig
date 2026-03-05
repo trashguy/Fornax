@@ -1,3 +1,5 @@
+const klog = @import("../../klog.zig");
+
 pub fn halt() noreturn {
     while (true) {
         asm volatile ("cli");
@@ -168,3 +170,16 @@ pub const MSR_SFMASK = 0xC0000084;
 
 // EFER bits
 pub const EFER_SCE: u64 = 1 << 0; // System Call Extensions
+pub const MSR_PAT: u32 = 0x277;
+
+/// Initialize PAT: reprogram entry 1 from WT to Write-Combining (WC).
+/// PAT layout after init:
+///   0=WB  1=WC  2=UC-  3=UC  4=WB  5=WT  6=UC-  7=UC
+/// This is safe because nothing in the codebase uses WT (all MMIO uses NO_CACHE).
+pub fn initPAT() void {
+    // Default PAT: 0x00070406_00070406 (entries: WB,WT,UC-,UC,WB,WT,UC-,UC)
+    // We change entry 1 from WT(0x04) to WC(0x01): 0x00070406_00070106
+    const pat_value: u64 = 0x00070406_00070106;
+    wrmsr(MSR_PAT, pat_value);
+    klog.info("x86_64: PAT initialized (entry 1 = WC)\n");
+}

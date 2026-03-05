@@ -148,6 +148,7 @@ for arg in "$@"; do
     fi
 done
 
+# Phase 2000g: add '-device virtio-gpu-pci' for virtio-gpu backend testing
 exec qemu-system-x86_64 \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF" \
     -drive format=raw,file=fat:rw:"$PROJECT_DIR/zig-out/esp" \
@@ -156,6 +157,7 @@ exec qemu-system-x86_64 \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0 \
     -device virtio-keyboard-pci \
+    -vga std \
     -device nec-usb-xhci,id=xhci \
     -device usb-kbd,bus=xhci.0 \
     -device usb-mouse,bus=xhci.0 \

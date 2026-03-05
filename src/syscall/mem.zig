@@ -16,6 +16,8 @@ const EBADF = root.EBADF;
 const EINVAL = root.EINVAL;
 const ENOMEM = root.ENOMEM;
 const EMFILE = root.EMFILE;
+const EACCES = root.EACCES;
+const ENOENT = root.ENOENT;
 
 /// SYS 32: mmap — Anonymous memory mapping.
 /// args: addr (hint, ignored), length, prot, flags
@@ -206,4 +208,147 @@ pub fn sysShmemDestroy(shmem_id: u64) u64 {
     const proc = process.getCurrent() orelse return EBADF;
     if (shmem.destroy(@intCast(shmem_id), proc.pid)) return 0;
     return EINVAL;
+}
+
+/// SYS 47: mmap_device — Map physical device memory (MMIO/VRAM) into userspace.
+/// Args: phys_addr, length, flags (bit 0 = write-combining, bit 1 = 2MB huge pages), prot (unused, reserved)
+/// Returns: virtual address of mapping, or negative errno.
+pub fn sysMmapDevice(phys_addr: u64, length: u64, flags: u64, prot: u64) u64 {
+    _ = prot;
+    const proc = process.getCurrent() orelse return ENOSYS;
+
+    // Only root (uid 0) can map device memory
+    if (proc.uid != 0) return EACCES;
+
+    if (length == 0) return EINVAL;
+
+    const use_huge = (flags & 0x2) != 0;
+    const use_wc = (flags & 0x1) != 0;
+    const HUGE_SIZE: u64 = 2 * 1024 * 1024; // 2MB
+
+    // Validate alignment
+    if (use_huge) {
+        if (phys_addr & (HUGE_SIZE - 1) != 0) return EINVAL;
+        if (length & (HUGE_SIZE - 1) != 0) return EINVAL;
+    } else {
+        if (phys_addr & (mem.PAGE_SIZE - 1) != 0) return EINVAL;
+    }
+
+    // Build mapping flags
+    var map_flags: u64 = paging.Flags.WRITABLE | paging.Flags.USER | paging.Flags.NO_EXECUTE | paging.Flags.DEVICE_MAP;
+    if (use_wc) {
+        map_flags |= paging.Flags.WRITE_COMBINE;
+    } else {
+        map_flags |= paging.Flags.NO_CACHE;
+    }
+
+    // Get shared or local mmap_next and pml4
+    const proc_pml4 = if (proc.thread_group) |tg| tg.pml4 else proc.pml4;
+    const pml4 = proc_pml4 orelse return ENOMEM;
+
+    // Lock thread group if threaded
+    if (proc.thread_group) |tg| tg.lock.lock();
+    defer if (proc.thread_group) |tg| tg.lock.unlock();
+
+    var base = if (proc.thread_group) |tg| tg.mmap_next else proc.mmap_next;
+
+    if (use_huge) {
+        // Align base to 2MB boundary
+        base = (base + HUGE_SIZE - 1) & ~(HUGE_SIZE - 1);
+        const page_count = length / HUGE_SIZE;
+
+        var i: u64 = 0;
+        while (i < page_count) : (i += 1) {
+            paging.mapHugePageUser(pml4, base + i * HUGE_SIZE, phys_addr + i * HUGE_SIZE, map_flags) orelse return ENOMEM;
+        }
+
+        const new_next = base + page_count * HUGE_SIZE;
+        if (proc.thread_group) |tg| {
+            tg.mmap_next = new_next;
+        } else {
+            proc.mmap_next = new_next;
+        }
+    } else {
+        const page_count = (length + mem.PAGE_SIZE - 1) / mem.PAGE_SIZE;
+
+        var i: u64 = 0;
+        while (i < page_count) : (i += 1) {
+            paging.mapPage(pml4, base + i * mem.PAGE_SIZE, phys_addr + i * mem.PAGE_SIZE, map_flags) orelse return ENOMEM;
+        }
+
+        const new_next = base + page_count * mem.PAGE_SIZE;
+        if (proc.thread_group) |tg| {
+            tg.mmap_next = new_next;
+        } else {
+            proc.mmap_next = new_next;
+        }
+    }
+
+    return base;
+}
+
+/// SYS 48: irq_alloc — Allocate an MSI-X interrupt forward to userspace.
+/// args: bus, devfn (slot<<3 | func), msix_entry_index
+/// Returns fd number, or error.
+pub fn sysIrqAlloc(bus_arg: u64, devfn_arg: u64, entry_arg: u64) u64 {
+    const arch = @import("builtin").cpu.arch;
+    if (arch != .x86_64) return ENOSYS;
+
+    const pci = @import("../arch/x86_64/pci.zig");
+    const irq_forward = @import("../irq_forward.zig");
+
+    const proc = process.getCurrent() orelse return EBADF;
+
+    // Only root can allocate IRQ forwards
+    if (proc.uid != 0) return EACCES;
+
+    const bus: u8 = @truncate(bus_arg);
+    const devfn: u8 = @truncate(devfn_arg);
+    const slot: u8 = devfn >> 3;
+    const func: u8 = devfn & 7;
+    const msix_entry: u16 = @truncate(entry_arg);
+
+    // Find PCI device by BDF
+    const devs = pci.getDevices();
+    var dev_index: ?u16 = null;
+    for (devs, 0..) |*d, i| {
+        if (d.bus == bus and d.slot == slot and d.func == func) {
+            dev_index = @intCast(i);
+            break;
+        }
+    }
+    const idx = dev_index orelse return ENOENT;
+
+    // Validate MSI-X capability
+    const dev = &devs[idx];
+    const msix_cap = dev.msix orelse return EINVAL;
+    if (msix_entry >= msix_cap.table_size) return EINVAL;
+
+    // Allocate IRQ forward
+    const result = irq_forward.alloc(idx, msix_entry, proc.pid) orelse return ENOMEM;
+
+    // Allocate fd
+    const fd_num = proc.allocDevFd(.dev_irq) orelse {
+        irq_forward.free(result.slot);
+        return EMFILE;
+    };
+
+    // Set irq_slot on the fd entry
+    const entry_ptr = proc.getFdEntryPtr(fd_num) orelse {
+        irq_forward.free(result.slot);
+        return EMFILE;
+    };
+    entry_ptr.irq_slot = result.slot;
+
+    klog.info("[irq_forward] Allocated vector ");
+    klog.infoDec(result.vector);
+    klog.info(" slot ");
+    klog.infoDec(result.slot);
+    klog.info(" fd ");
+    klog.infoDec(fd_num);
+    klog.info(" for pid ");
+    klog.infoDec(proc.pid);
+    klog.info("\n");
+
+    return fd_num;
 }

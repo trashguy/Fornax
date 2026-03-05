@@ -239,6 +239,11 @@ pub fn sysExit(status: u64) noreturn {
                     ether_mod.freeClient(entry.ether_client);
                     fds[i] = null;
                 }
+                if (entry.fd_type == .dev_irq) {
+                    const irq_forward = @import("../irq_forward.zig");
+                    irq_forward.free(entry.irq_slot);
+                    fds[i] = null;
+                }
                 // IPC (server-backed) fd: send fire-and-forget T_CLOSE so
                 // the server frees its handle.  Only send if a server
                 // worker is waiting (fast-path delivery), which avoids
@@ -387,6 +392,11 @@ pub fn sysThreadExit(status: u64) noreturn {
                 }
                 if (entry.fd_type == .dev_ether) {
                     ether_mod.freeClient(entry.ether_client);
+                    fds[i] = null;
+                }
+                if (entry.fd_type == .dev_irq) {
+                    const irq_forward = @import("../irq_forward.zig");
+                    irq_forward.free(entry.irq_slot);
                     fds[i] = null;
                 }
                 if (entry.server_handle > 0) {
