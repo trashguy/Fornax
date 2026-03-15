@@ -42,7 +42,18 @@ zig build x86_64 -Dcluster=true       # Multi-node clustering (Phase 3000+)
 zig build x86_64 -Dviceroy=true       # Deployment tooling (Phase 3003+, implies cluster)
 ```
 
+## Supported Platforms
+
+| Platform | Arch | Status |
+|----------|------|--------|
+| QEMU virt | x86_64, riscv64, aarch64 | Full — SMP, virtio, filesystem, networking, userspace |
+| [Milk-V Mars](docs/boards/milkv-mars.md) | riscv64 | Boots — 4 cores, 8 GiB, Sv39 paging, PLIC |
+
+Hardware board documentation lives in [`docs/boards/`](docs/boards/).
+
 ## Running
+
+### QEMU
 
 Requires QEMU with OVMF firmware.
 
@@ -61,6 +72,16 @@ make run-dev             # development mode (8 cores, 8 GB)
 
 This builds the kernel and userspace, creates a disk image with fxfs, and launches QEMU with framebuffer, serial on stdio, virtio-net, virtio-blk, and USB devices.
 
+### Hardware
+
+```sh
+# Milk-V Mars (JH7110, riscv64)
+zig build riscv64 -Dboard=milkv_mars
+sudo ./scripts/mars-boot.py --ip <host-ip> --mars-ip <mars-ip>
+```
+
+See [board-specific docs](docs/boards/) for firmware setup and wiring.
+
 ## Documentation
 
 | Doc | Contents |
@@ -73,6 +94,7 @@ This builds the kernel and userspace, creates a disk image with fxfs, and launch
 | [POSIX Realms](docs/posix-realms.md) | C/POSIX support, musl integration, syscall translation |
 | [Control Files](docs/ctl.md) | Plan 9-style ctl files across all subsystems |
 | [Package Manager](docs/fay.md) | fay package manager design |
+| [Board Support](docs/boards/) | Hardware board guides (firmware, wiring, boot) |
 | [Roadmap](docs/TODO/00-overview.md) | Phase tracking, milestones, dependency graph |
 
 ## License
