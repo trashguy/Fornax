@@ -87,8 +87,16 @@ export fn riscv64KernelMain(hartid: u64, dtb_ptr: u64) callconv(.c) noreturn {
     var ram_size = RAM_SIZE;
 
     if (cfg.ram_count > 0) {
-        ram_base = cfg.ram_regions[0].base;
-        ram_size = cfg.ram_regions[0].size;
+        // Pick the largest non-zero RAM region (new U-Boot FDTs may
+        // include a 0-size reserved region before the real one).
+        var best: usize = 0;
+        for (0..cfg.ram_count) |i| {
+            if (cfg.ram_regions[i].size > cfg.ram_regions[best].size) {
+                best = i;
+            }
+        }
+        ram_base = cfg.ram_regions[best].base;
+        ram_size = cfg.ram_regions[best].size;
         klog.info("FDT: RAM at ");
         klog.infoHex(ram_base);
         klog.info(" size ");

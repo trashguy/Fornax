@@ -167,7 +167,8 @@ def serial_reconnect(ser):
         time.sleep(0.5)
         if os.path.exists(port):
             try:
-                new_ser = serial.Serial(port, baud, timeout=0.1)
+                new_ser = serial.Serial(port, baud, timeout=0.1, dsrdtr=True)
+                new_ser.dtr = False  # Don't assert DTR — it resets the Mars
                 print(f"[serial] Reconnected to {port}")
                 return new_ser
             except serial.SerialException:
@@ -175,7 +176,7 @@ def serial_reconnect(ser):
     return None
 
 
-def wait_for(ser, patterns, timeout=30):
+def wait_for(ser, patterns, timeout=30, logfile=None):
     """Read serial until one of `patterns` is seen. Returns (index, accumulated_data)."""
     if isinstance(patterns, (bytes, str)):
         patterns = [patterns]
@@ -189,6 +190,9 @@ def wait_for(ser, patterns, timeout=30):
                 chunk = ser.read(ser.in_waiting)
                 sys.stdout.buffer.write(chunk)
                 sys.stdout.buffer.flush()
+                if logfile:
+                    logfile.write(chunk)
+                    logfile.flush()
                 buf += chunk
                 for i, pat in enumerate(patterns):
                     if pat in buf:
@@ -265,7 +269,7 @@ def interrupt_uboot(ser, timeout=30):
     return False, ser
 
 
-def interactive_console(ser):
+def interactive_console(ser, logfile=None, reconnect=False):
     """Pass-through serial console with raw terminal input."""
     print("[console] Interactive serial console (Ctrl-D or Ctrl-] to exit)")
 
@@ -273,19 +277,46 @@ def interactive_console(ser):
     try:
         tty.setraw(sys.stdin.fileno())
         while True:
-            r, _, _ = select.select([sys.stdin, ser], [], [], 0.1)
+            if not serial_ok(ser):
+                if not reconnect:
+                    return
+                # Temporarily restore terminal so reconnect messages are readable
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+                ser = serial_reconnect(ser)
+                tty.setraw(sys.stdin.fileno())
+                continue
+
+            try:
+                r, _, _ = select.select([sys.stdin, ser], [], [], 0.1)
+            except (OSError, ValueError):
+                if not reconnect:
+                    return
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+                ser = serial_reconnect(ser)
+                tty.setraw(sys.stdin.fileno())
+                continue
+
             for src in r:
                 if src is sys.stdin:
                     ch = os.read(sys.stdin.fileno(), 1)
                     if not ch or ch in (b"\x04", b"\x1d"):  # EOF, Ctrl-D, Ctrl-]
                         return
-                    ser.write(ch)
-                    ser.flush()
+                    try:
+                        ser.write(ch)
+                        ser.flush()
+                    except (OSError, serial.SerialException):
+                        pass
                 elif src is ser:
-                    if ser.in_waiting:
-                        data = ser.read(ser.in_waiting)
-                        os.write(sys.stdout.fileno(), data)
-    except (OSError, KeyboardInterrupt):
+                    try:
+                        if ser.in_waiting:
+                            data = ser.read(ser.in_waiting)
+                            os.write(sys.stdout.fileno(), data)
+                            if logfile:
+                                logfile.write(data)
+                                logfile.flush()
+                    except (OSError, serial.SerialException):
+                        pass
+    except KeyboardInterrupt:
         pass
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
@@ -335,8 +366,11 @@ def main():
                         help="Boot from SD card instead of TFTP")
     parser.add_argument("--monitor", action="store_true",
                         help="Just connect to serial (no boot sequence)")
+    parser.add_argument("--log", default=None, metavar="FILE",
+                        help="Log all serial output to file")
     args = parser.parse_args()
 
+    logfile = open(args.log, "wb") if args.log else None
     host_ip = args.ip or detect_host_ip()
 
     # If --mars-ip not given, derive one on the same /24 as host
@@ -383,7 +417,8 @@ def main():
 
     # ── Serial connection ───────────────────────────────────────────
     try:
-        ser = serial.Serial(args.port, args.baud, timeout=0.1)
+        ser = serial.Serial(args.port, args.baud, timeout=0.1, dsrdtr=True)
+        ser.dtr = False  # Don't assert DTR — it resets the Mars
     except serial.SerialException as e:
         print(f"[error] Cannot open {args.port}: {e}")
         if tftp:
@@ -393,18 +428,22 @@ def main():
     print(f"[serial] Connected to {args.port} at {args.baud}")
 
     if args.monitor:
-        interactive_console(ser)
+        interactive_console(ser, logfile, reconnect=True)
         ser.close()
+        if logfile:
+            logfile.close()
         return
 
     # ── Interrupt U-Boot ────────────────────────────────────────────
     ok, ser = interrupt_uboot(ser, timeout=60)
     if not ok:
         print("[error] Could not reach U-Boot prompt")
-        interactive_console(ser)
+        interactive_console(ser, logfile)
         ser.close()
         if tftp:
             tftp.stop()
+        if logfile:
+            logfile.close()
         sys.exit(1)
 
     # Small delay for U-Boot to settle
@@ -420,7 +459,7 @@ def main():
     if args.sd:
         # SD card boot
         send_cmd(ser, f"fatload mmc 1:1 {args.addr} fornax-riscv64.bin")
-        idx, buf = wait_for(ser, [b"bytes read", b"** Unable", UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=30)
+        idx, buf = wait_for(ser, [b"bytes read", b"** Unable", UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=30, logfile=logfile)
         load_ok = (idx == 0)
         if not load_ok:
             print("[error] SD card load failed")
@@ -429,7 +468,7 @@ def main():
         def uboot_setenv(ser, var, val):
             send_cmd(ser, f"setenv {var} {val}")
             time.sleep(0.3)
-            wait_for(ser, [UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=5)
+            wait_for(ser, [UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=5, logfile=logfile)
 
         if args.mars_ip:
             uboot_setenv(ser, "ipaddr", args.mars_ip)
@@ -445,7 +484,7 @@ def main():
         # the first ARP request can be lost during link-up.
         send_cmd(ser, f"ping {host_ip}")
         idx, _ = wait_for(ser, [b"is alive", b"not alive",
-                                 UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=30)
+                                 UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=30, logfile=logfile)
         if idx != 0:
             print("[error] Cannot ping host — check cable/switch")
             # Fall through to TFTP anyway in case ping is unreliable
@@ -455,12 +494,12 @@ def main():
         idx, buf = wait_for(ser,
             [b"Bytes transferred", b"ARP Retry count exceeded",
              b"TFTP error", b"T T T T T", UBOOT_PROMPT, UBOOT_PROMPT_ALT],
-            timeout=120)
+            timeout=120, logfile=logfile)
 
         if idx == 0:
             load_ok = True
             # Wait for U-Boot prompt after transfer message
-            wait_for(ser, [UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=10)
+            wait_for(ser, [UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=10, logfile=logfile)
         else:
             reasons = {1: "ARP failed (subnet mismatch?)", 2: "TFTP error",
                        3: "TFTP timeout", -1: "timeout"}
@@ -469,10 +508,12 @@ def main():
 
     if not load_ok:
         print("[boot] Skipping jump — dropping to serial console")
-        interactive_console(ser)
+        interactive_console(ser, logfile)
         ser.close()
         if tftp:
             tftp.stop()
+        if logfile:
+            logfile.close()
         return
 
     # Copy U-Boot's FDT to a known address so the kernel can find it.
@@ -480,9 +521,9 @@ def main():
     # so the kernel uses fdt_fallback_addr (0x46000000) as a backup.
     print("[boot] Copying FDT to 0x46000000...")
     send_cmd(ser, "fdt addr $fdtcontroladdr")
-    wait_for(ser, [UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=5)
+    wait_for(ser, [UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=5, logfile=logfile)
     send_cmd(ser, "fdt move $fdtcontroladdr 0x46000000")
-    wait_for(ser, [UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=5)
+    wait_for(ser, [UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=5, logfile=logfile)
 
     # Jump to kernel
     send_cmd(ser, f"go {args.addr}")
@@ -490,12 +531,14 @@ def main():
 
     # ── Interactive console (kernel output + user input) ────────────
     time.sleep(0.5)
-    interactive_console(ser)
+    interactive_console(ser, logfile, reconnect=True)
 
     # ── Cleanup ─────────────────────────────────────────────────────
     ser.close()
     if tftp:
         tftp.stop()
+    if logfile:
+        logfile.close()
 
 
 if __name__ == "__main__":
