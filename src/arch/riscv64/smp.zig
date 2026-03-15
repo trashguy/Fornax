@@ -11,6 +11,8 @@ const pmm = @import("../../pmm.zig");
 const mem = @import("../../mem.zig");
 const process = @import("../../process.zig");
 const syscall_entry = @import("syscall_entry.zig");
+const board = @import("board/board.zig");
+const fdt = @import("fdt.zig");
 
 /// Maximum number of harts to probe via SBI.
 const MAX_PROBE_HARTS: u8 = 16;
@@ -37,6 +39,14 @@ extern fn ap_entry_asm() callconv(.naked) noreturn;
 pub const IPI_SCHEDULE: u8 = 0xFE;
 pub const IPI_TLB_SHOOTDOWN: u8 = 0xFD;
 
+/// Check if a hart is in the board's excluded list.
+fn isExcludedHart(hartid: u32) bool {
+    for (board.active.excluded_harts) |excluded| {
+        if (excluded == @as(u8, @intCast(hartid))) return true;
+    }
+    return false;
+}
+
 /// Initialize SMP: start secondary harts via SBI HSM.
 pub fn init() void {
     const boot = @import("boot.zig");
@@ -46,15 +56,46 @@ pub fn init() void {
     ap_bsp_satp = cpu.csrRead(cpu.CSR_SATP);
     hart_ids[0] = @intCast(bsp_hartid);
 
-    klog.info("SMP: BSP is hart ");
-    klog.infoDec(@as(u8, @intCast(bsp_hartid)));
-    klog.info(", probing via SBI HSM...\n");
+    const fdt_cfg = &fdt.fdt_config;
+    const use_fdt_harts = fdt_cfg.cpu_count > 0;
+    if (use_fdt_harts) {
+        klog.info("SMP: BSP is hart ");
+        klog.infoDec(@as(u8, @intCast(bsp_hartid)));
+        klog.info(", ");
+        klog.infoDec(fdt_cfg.cpu_count);
+        klog.info(" hart(s) from FDT\n");
+    } else {
+        klog.info("SMP: BSP is hart ");
+        klog.infoDec(@as(u8, @intCast(bsp_hartid)));
+        klog.info(", probing via SBI HSM...\n");
+    }
 
     var next_core: u8 = 1;
-    var hartid: u32 = 0;
-    while (hartid < MAX_PROBE_HARTS and next_core < percpu.MAX_CORES) : (hartid += 1) {
+
+    // Build hart candidate list: prefer FDT, fall back to 0..MAX_PROBE_HARTS
+    var candidates: [MAX_PROBE_HARTS]u32 = undefined;
+    var num_candidates: u8 = 0;
+    if (use_fdt_harts) {
+        for (0..fdt_cfg.cpu_count) |i| {
+            if (num_candidates >= MAX_PROBE_HARTS) break;
+            candidates[num_candidates] = fdt_cfg.cpu_harts[i];
+            num_candidates += 1;
+        }
+    } else {
+        while (num_candidates < MAX_PROBE_HARTS) : (num_candidates += 1) {
+            candidates[num_candidates] = num_candidates;
+        }
+    }
+
+    var ci: u8 = 0;
+    while (ci < num_candidates and next_core < percpu.MAX_CORES) : (ci += 1) {
+        const hartid = candidates[ci];
+
         // Skip the BSP hart
         if (hartid == @as(u32, @intCast(bsp_hartid))) continue;
+
+        // Skip board-excluded harts (e.g. JH7110 S7 monitor core)
+        if (isExcludedHart(hartid)) continue;
 
         // Check if hart exists and is in STOPPED state.
         // If STARTED (0), the hart may still be calling sbi_hart_stop in _start.

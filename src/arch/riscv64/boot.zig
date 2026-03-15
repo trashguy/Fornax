@@ -2,14 +2,8 @@
 ///
 /// Called from _start in entry.S after stack setup.
 /// Replaces the UEFI boot path used on x86_64.
-///
-/// QEMU virt memory layout:
-///   0x0200_0000  CLINT
-///   0x0300_0000  PCI I/O window (64 KB)
-///   0x0C00_0000  PLIC
-///   0x1000_0000  UART0
-///   0x3000_0000  PCI ECAM
-///   0x8000_0000  RAM base (OpenSBI at 0x80000000, kernel loaded at 0x80200000)
+/// Board-specific addresses (RAM base, initrd) come from board/ config.
+/// FDT overrides board defaults at runtime when available.
 const serial = @import("../../serial.zig");
 const pmm = @import("../../pmm.zig");
 const heap = @import("../../heap.zig");
@@ -17,9 +11,11 @@ const klog = @import("../../klog.zig");
 const initrd_mod = @import("../../initrd.zig");
 const main = @import("../../main.zig");
 const fdt = @import("fdt.zig");
+const board = @import("board/board.zig");
+const build_options = @import("build_options");
 
-/// QEMU virt: RAM starts at 0x80000000 (2 GiB).
-const RAM_BASE: u64 = 0x8000_0000;
+/// Default RAM base (board-specific, fallback if FDT parsing fails).
+const RAM_BASE: u64 = board.active.ram_base;
 
 /// Default RAM size (fallback if FDT parsing fails).
 const RAM_SIZE: u64 = 256 * 1024 * 1024;
@@ -27,9 +23,8 @@ const RAM_SIZE: u64 = 256 * 1024 * 1024;
 /// Reservation for OpenSBI + kernel + boot data (32 MB from RAM base).
 const RESERVED_SIZE: u64 = 32 * 1024 * 1024;
 
-/// Well-known initrd load address. QEMU script uses:
-///   -device loader,file=INITRD,addr=0x8400_0000,force-raw=on
-const INITRD_ADDR: u64 = 0x8400_0000;
+/// Well-known initrd load address (board-specific).
+const INITRD_ADDR: u64 = board.active.initrd_addr;
 
 /// 16 KB kernel boot stack (BSS).
 const BOOT_STACK_SIZE = 16 * 1024;
@@ -46,28 +41,55 @@ comptime {
 /// Boot hart ID — saved for SMP init so we know which hart is BSP.
 pub var boot_hartid: u64 = 0;
 
+/// FDT blob address — saved for later subsystem use.
+pub var dtb_addr: u64 = 0;
+
 /// Kernel entry point called from _start in entry.S.
 /// a0 = hartid, a1 = FDT pointer (passed by OpenSBI).
 export fn riscv64KernelMain(hartid: u64, dtb_ptr: u64) callconv(.c) noreturn {
     boot_hartid = hartid;
+    dtb_addr = dtb_ptr;
 
     // Serial console first — earliest possible output
     serial.init();
     klog.console_level = .info;
-    klog.info("Fornax RISC-V booting...\n");
+    const board_name = switch (build_options.board) {
+        .qemu_virt => "qemu-virt",
+        .milkv_mars => "milkv-mars",
+    };
+    klog.info("\nFornax RISC-V booting (");
+    klog.info(board_name);
+    klog.info(")...\n");
+
+    klog.info("Boot hart: ");
+    klog.infoDec(hartid);
+    klog.info(", FDT at ");
+    klog.infoHex(dtb_ptr);
+    klog.info("\n");
 
     // No framebuffer on riscv64 (serial-only mode).
     // Skip console.init() so console stays uninitialized — putChar
     // will output to serial only.
 
+    // Full FDT probe — discovers RAM, UART, PLIC, CPUs, peripherals.
+    // U-Boot `go` doesn't pass DTB in a1 (passes argv instead), so try
+    // the board's fallback FDT address if the primary probe fails.
+    var cfg = fdt.probe(dtb_ptr);
+    if (!cfg.valid() and board.active.fdt_fallback_addr != 0) {
+        klog.info("FDT: a1 invalid, trying fallback at ");
+        klog.infoHex(board.active.fdt_fallback_addr);
+        klog.info("\n");
+        cfg = fdt.probe(board.active.fdt_fallback_addr);
+    }
+
     // Detect RAM from FDT, fall back to hardcoded values
     var ram_base = RAM_BASE;
     var ram_size = RAM_SIZE;
 
-    if (fdt.probeMemory(dtb_ptr)) |mem_region| {
-        ram_base = mem_region.base;
-        ram_size = mem_region.size;
-        klog.info("FDT: RAM at 0x");
+    if (cfg.ram_count > 0) {
+        ram_base = cfg.ram_regions[0].base;
+        ram_size = cfg.ram_regions[0].size;
+        klog.info("FDT: RAM at ");
         klog.infoHex(ram_base);
         klog.info(" size ");
         klog.infoDec(ram_size / (1024 * 1024));
@@ -76,6 +98,11 @@ export fn riscv64KernelMain(hartid: u64, dtb_ptr: u64) callconv(.c) noreturn {
         klog.warn("FDT: memory probe failed, using defaults (");
         klog.warnDec(RAM_SIZE / (1024 * 1024));
         klog.warn(" MB)\n");
+    }
+
+    // Log FDT discoveries
+    if (cfg.valid()) {
+        fdt.dumpConfig();
     }
 
     const reserved_end = ram_base + RESERVED_SIZE;
@@ -127,7 +154,9 @@ export fn riscv64KernelMain(hartid: u64, dtb_ptr: u64) callconv(.c) noreturn {
             if (end > initrd_size) initrd_size = end;
         }
 
-        klog.info("Initrd found at 0x84000000\n");
+        klog.info("Initrd found at ");
+        klog.infoHex(INITRD_ADDR);
+        klog.info("\n");
         main.kernelInit(initrd_ptr, initrd_size, null);
     } else {
         main.kernelInit(null, 0, null);

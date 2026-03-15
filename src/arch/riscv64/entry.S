@@ -56,6 +56,18 @@
 .set ASM_SAVED_USER_RFLAGS, 24
 .set ASM_SAVED_KERNEL_RSP, 32
 
+# NS16550 UART for ultra-early debug (same base for QEMU virt and JH7110).
+# THR (Transmit Holding Register) is always at offset 0 regardless of
+# register stride, so we skip LSR polling — the TX FIFO is empty after
+# U-Boot's last serial output. Clobbers t3, t4.
+.set UART_BASE, 0x10000000
+
+.macro uart_putc char
+    li t3, UART_BASE
+    li t4, \char
+    sb t4, 0(t3)
+.endm
+
 .text
 
 # =============================================================================
@@ -74,6 +86,9 @@ _start:
     amoswap.w.aq t2, t1, (t0)
     bnez t2, .stop_hart           # Another hart already claimed boot
 
+    # Early debug: 'F' = first sign of life (CPU is running Fornax code)
+    uart_putc 'F'
+
     # Set up kernel boot stack (16 KB, defined in boot.zig)
     la sp, __boot_stack_top
 
@@ -86,6 +101,9 @@ _start:
     addi t0, t0, 8
     j .clear_bss
 .bss_done:
+
+    # Early debug: 'x' = BSS cleared, about to enter Zig
+    uart_putc 'x'
 
     # Call Zig kernel main: a0=hartid, a1=dtb_ptr (already in registers)
     call riscv64KernelMain
@@ -141,12 +159,12 @@ ap_entry_asm:
     sfence.vma
 
     # Convert SP from physical to higher-half virtual address.
-    # KERNEL_VIRT_BASE = 0xFFFF_8000_0000_0000 = (-1) << 47
+    # KERNEL_VIRT_BASE = 0xFFFF_FFC0_0000_0000 = (-1) << 38  (Sv39)
     # Must do this BEFORE calling Zig — otherwise the function prologue
     # sets s0 (frame pointer) to the physical stack, while callees use
     # the virtual SP, causing stack frame aliasing corruption.
     li t2, -1
-    slli t2, t2, 47
+    slli t2, t2, 38
     add sp, sp, t2
 
     # Call Zig AP init function with virtual stack ready.

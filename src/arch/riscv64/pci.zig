@@ -1,12 +1,13 @@
 /// PCI ECAM (Enhanced Configuration Access Mechanism) for RISC-V.
 ///
-/// QEMU virt machine ECAM base: 0x30000000
 /// Address formula: base + (bus<<20 | slot<<15 | func<<12 | offset)
+/// ECAM base and availability are board-specific (see board/ config).
 const klog = @import("../../klog.zig");
 const mem = @import("../../mem.zig");
 const paging = @import("paging.zig");
+const board = @import("board/board.zig");
 
-const ECAM_BASE: u64 = 0x3000_0000;
+const ECAM_BASE: u64 = board.active.ecam_base;
 
 pub const MAX_DEVICES = 32;
 
@@ -177,7 +178,12 @@ fn assignBars(bus: u8, slot: u8, func: u8) void {
 }
 
 /// Enumerate PCI bus 0 and discover all devices.
+/// No-op on boards without raw ECAM (e.g. JH7110 with PLDA PCIe).
 pub fn enumerate() void {
+    if (!board.active.has_pci_ecam) {
+        klog.info("PCI ECAM: not available on this board\n");
+        return;
+    }
     device_count = 0;
     next_io_port = 0;
     klog.debug("PCI ECAM: scanning bus 0...\n");

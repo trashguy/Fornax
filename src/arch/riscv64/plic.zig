@@ -1,29 +1,37 @@
-/// RISC-V PLIC (Platform-Level Interrupt Controller) for QEMU virt machine.
+/// RISC-V PLIC (Platform-Level Interrupt Controller).
 ///
-/// PLIC base address: 0x0C000000
-/// Context 1 = S-mode, hart 0
-///
-/// QEMU virt PLIC IRQs:
-///   1-8   = virtio devices
-///   10    = UART0
+/// Base address comes from FDT discovery, with board config as fallback.
+/// Context is computed at init() from the boot hart ID.
 const klog = @import("../../klog.zig");
 const mem = @import("../../mem.zig");
 const paging = @import("paging.zig");
+const board = @import("board/board.zig");
+const fdt = @import("fdt.zig");
 
-const PLIC_BASE: u64 = 0x0C00_0000;
+/// Effective PLIC base — set at init() from FDT or board fallback.
+var plic_base: u64 = board.active.plic_base;
 
-// Context 1 = S-mode hart 0
-const CONTEXT: u64 = 1;
-
-// Register offsets
+// Register base offsets (context-dependent offsets computed at runtime)
 const PRIORITY_BASE: u64 = 0x0000_0000;
-const ENABLE_BASE: u64 = 0x0000_2000 + CONTEXT * 0x80;
-const THRESHOLD_OFF: u64 = 0x0020_0000 + CONTEXT * 0x1000;
-const CLAIM_OFF: u64 = 0x0020_0004 + CONTEXT * 0x1000;
+
+/// S-mode PLIC context for the boot hart, set during init().
+var context: u64 = 1;
+
+inline fn enableBase() u64 {
+    return 0x0000_2000 + context * 0x80;
+}
+
+inline fn thresholdOff() u64 {
+    return 0x0020_0000 + context * 0x1000;
+}
+
+inline fn claimOff() u64 {
+    return 0x0020_0004 + context * 0x1000;
+}
 
 /// Get the effective PLIC address (higher-half after paging init).
 inline fn plicAddr(offset: u64) u64 {
-    const addr = PLIC_BASE + offset;
+    const addr = plic_base + offset;
     return if (paging.isInitialized()) addr +% mem.KERNEL_VIRT_BASE else addr;
 }
 
@@ -35,10 +43,23 @@ fn mmioWrite32(addr: u64, val: u32) void {
     @as(*volatile u32, @ptrFromInt(addr)).* = val;
 }
 
-/// Initialize PLIC: set threshold to 0 (accept all priorities).
+/// Initialize PLIC: use FDT-discovered base (or board fallback),
+/// compute context from boot hart, set threshold to 0.
 pub fn init() void {
-    mmioWrite32(plicAddr(THRESHOLD_OFF), 0);
-    klog.info("PLIC: initialized (threshold=0)\n");
+    const boot = @import("boot.zig");
+
+    // Override with FDT-discovered address if available
+    if (fdt.fdt_config.plic_base != 0) {
+        plic_base = fdt.fdt_config.plic_base;
+    }
+
+    context = board.active.plicSContext(boot.boot_hartid);
+    mmioWrite32(plicAddr(thresholdOff()), 0);
+    klog.info("PLIC: initialized at ");
+    klog.infoHex(plic_base);
+    klog.info(" (context=");
+    klog.infoDec(context);
+    klog.info(", threshold=0)\n");
 }
 
 /// Enable an interrupt source and set its priority to 1.
@@ -46,8 +67,8 @@ pub fn enable(irq: u32) void {
     // Set priority to 1 (minimum non-zero)
     mmioWrite32(plicAddr(PRIORITY_BASE + irq * 4), 1);
 
-    // Enable the interrupt for context 1
-    const reg_offset = ENABLE_BASE + (irq / 32) * 4;
+    // Enable the interrupt for the boot hart's S-mode context
+    const reg_offset = enableBase() + (irq / 32) * 4;
     const bit: u32 = @as(u32, 1) << @intCast(irq % 32);
     const current = mmioRead32(plicAddr(reg_offset));
     mmioWrite32(plicAddr(reg_offset), current | bit);
@@ -55,10 +76,10 @@ pub fn enable(irq: u32) void {
 
 /// Claim the highest-priority pending interrupt. Returns the IRQ number (0 = none).
 pub fn claim() u32 {
-    return mmioRead32(plicAddr(CLAIM_OFF));
+    return mmioRead32(plicAddr(claimOff()));
 }
 
 /// Complete (acknowledge) an interrupt.
 pub fn complete(irq: u32) void {
-    mmioWrite32(plicAddr(CLAIM_OFF), irq);
+    mmioWrite32(plicAddr(claimOff()), irq);
 }

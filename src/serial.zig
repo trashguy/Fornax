@@ -15,11 +15,17 @@ const cpu = switch (builtin.cpu.arch) {
     },
 };
 
+const rv_board = if (builtin.cpu.arch == .riscv64) @import("arch/riscv64/board/board.zig") else struct {
+    pub const active = struct {
+        pub const uart_base: u64 = 0;
+        pub const uart_irq: u32 = 0;
+    };
+};
+
 const COM1: u16 = 0x3F8;
 
-// QEMU virt UART base address
 const UART_BASE: u64 = switch (builtin.cpu.arch) {
-    .riscv64 => 0x1000_0000, // 16550 UART
+    .riscv64 => rv_board.active.uart_base,
     .aarch64 => 0x0900_0000, // PL011 UART
     else => 0x1000_0000,
 };
@@ -45,8 +51,14 @@ const paging = switch (builtin.cpu.arch) {
 const mem = @import("mem.zig");
 const SpinLock = @import("spinlock.zig").SpinLock;
 
-/// Get effective UART MMIO address (higher-half after paging init).
-inline fn uartAddr(offset: u64) u64 {
+/// Get effective UART MMIO address for register index (higher-half after paging init).
+/// DW APB UART (JH7110) uses 4-byte register spacing (reg_shift=2).
+/// Standard NS16550 (QEMU) uses 1-byte spacing (reg_shift=0).
+inline fn uartAddr(reg: u64) u64 {
+    const offset = if (builtin.cpu.arch == .riscv64)
+        reg << rv_board.active.uart_reg_shift
+    else
+        reg;
     const addr = UART_BASE + offset;
     return if (paging.isInitialized()) addr +% mem.KERNEL_VIRT_BASE else addr;
 }
@@ -113,11 +125,11 @@ pub fn enableRxInterrupt() void {
             // Enable "data available" interrupt (IER bit 0)
             cpu.mmioWrite8(uartAddr(1), 0x01);
 
-            // Register PLIC IRQ 10 handler (UART0 on QEMU virt)
-            _ = interrupts.registerIrqHandler(10, handleIrq);
+            // Register PLIC IRQ handler (board-specific: QEMU=10, JH7110=32)
+            _ = interrupts.registerIrqHandler(rv_board.active.uart_irq, handleIrq);
 
-            // Enable IRQ 10 on PLIC
-            plic.enable(10);
+            // Enable UART IRQ on PLIC
+            plic.enable(rv_board.active.uart_irq);
         },
         .aarch64 => {
             const gic = @import("arch/aarch64/gic.zig");

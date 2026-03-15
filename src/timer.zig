@@ -1,8 +1,16 @@
 /// Timer tick counter for TCP retransmission and sleep.
 ///
 /// x86_64: PIT IRQ 0 at ~18.2 Hz (default PIT frequency).
-/// riscv64: CLINT via SBI set_timer at ~18 Hz (10 MHz timebase / 555555).
+/// riscv64: CLINT via SBI set_timer at ~18 Hz (timebase / TICKS_PER_SEC).
 const builtin = @import("builtin");
+
+const rv_board = if (builtin.cpu.arch == .riscv64) @import("arch/riscv64/board/board.zig") else struct {
+    pub const active = struct {
+        pub const timer_freq: u32 = 0;
+    };
+};
+
+const rv_fdt = if (builtin.cpu.arch == .riscv64) @import("arch/riscv64/fdt.zig") else struct {};
 
 const tsc = switch (builtin.cpu.arch) {
     .x86_64 => @import("arch/x86_64/tsc.zig"),
@@ -29,8 +37,22 @@ const interrupts = switch (builtin.cpu.arch) {
 
 pub const TICKS_PER_SEC: u32 = 18;
 
-/// CLINT timer interval for ~18 Hz at 10 MHz timebase
-const CLINT_INTERVAL: u64 = 555555;
+/// CLINT timer interval for ~18 Hz — default from board config, overridden
+/// at init() if FDT provides a timebase-frequency.
+const CLINT_INTERVAL_DEFAULT: u64 = if (builtin.cpu.arch == .riscv64)
+    rv_board.active.timer_freq / TICKS_PER_SEC
+else
+    555555;
+
+var clint_interval: u64 = CLINT_INTERVAL_DEFAULT;
+
+/// Effective RISC-V timer frequency — FDT override or board default.
+fn effectiveTimerFreq() u64 {
+    if (builtin.cpu.arch != .riscv64) return 0;
+    const fdt_freq = rv_fdt.fdt_config.timer_freq;
+    if (fdt_freq != 0) return @as(u64, fdt_freq);
+    return @as(u64, rv_board.active.timer_freq);
+}
 
 /// Generic Timer interval (computed at init from CNTFRQ_EL0)
 var arm_timer_interval: u32 = 0;
@@ -46,10 +68,15 @@ pub fn init() void {
             pic.unmask(0);
         },
         .riscv64 => {
+            // Override timer interval from FDT if available
+            const fdt_freq = rv_fdt.fdt_config.timer_freq;
+            if (fdt_freq != 0) {
+                clint_interval = @as(u64, fdt_freq) / TICKS_PER_SEC;
+            }
             // Program first timer interrupt via SBI
             const cpu = @import("arch/riscv64/cpu.zig");
             const now = cpu.rdtime();
-            cpu.sbiSetTimer(now + CLINT_INTERVAL);
+            cpu.sbiSetTimer(now + clint_interval);
         },
         .aarch64 => {
             // ARM Generic Timer: compute interval from CNTFRQ_EL0
@@ -79,7 +106,8 @@ pub fn getMillis() u64 {
         },
         .riscv64 => {
             const cpu = @import("arch/riscv64/cpu.zig");
-            return cpu.rdtime() / 10_000; // 10 MHz timebase
+            const freq = effectiveTimerFreq();
+            return cpu.rdtime() / (freq / 1000);
         },
         .aarch64 => {
             const cpu = @import("arch/aarch64/cpu.zig");
@@ -102,7 +130,8 @@ pub fn getMicros() u64 {
         },
         .riscv64 => {
             const cpu = @import("arch/riscv64/cpu.zig");
-            return cpu.rdtime() / 10; // 10 MHz timebase → µs
+            const freq = effectiveTimerFreq();
+            return cpu.rdtime() / (freq / 1_000_000);
         },
         .aarch64 => {
             const cpu = @import("arch/aarch64/cpu.zig");
@@ -124,7 +153,7 @@ fn handleIrq() bool {
     if (builtin.cpu.arch == .riscv64) {
         const cpu = @import("arch/riscv64/cpu.zig");
         const now = cpu.rdtime();
-        cpu.sbiSetTimer(now + CLINT_INTERVAL);
+        cpu.sbiSetTimer(now + clint_interval);
     }
 
     // Re-arm timer on aarch64 (per-core — PPI is private to each core)

@@ -30,6 +30,27 @@ with POSIX realm bridging for legacy GUI apps.
 | 2006 | Wayland bridge (sommelier in POSIX realm)               | 1000, 2003 |
 | 2007 | Chrome in a Fornax window                               | 2006 |
 
+## Future: Milk-V Mars Hardware Bring-up (4000-series)
+
+Real RISC-V hardware target: Milk-V Mars (StarFive JH7110 SoC).
+Build with: `zig build riscv64 -Dboard=milkv-mars`
+
+Reference SDK: https://github.com/milkv-mars/mars-buildroot-sdk
+
+| Phase | Description | Depends On |
+|-------|-------------|------------|
+| 4000 | Build target (`-Dboard=milkv-mars`), board config module | — |
+| 4001 | FDT parser extension (UART, PLIC, CPU, ethernet, MMC discovery) | 4000 |
+| 4002 | Mars first boot — serial output on real hardware | 4000, 4001 |
+| 4003 | JH7110 clock/reset controller (minimal: UART, SD, ETH, PCIe clocks) | 4000, 4002 |
+| 4004 | DW-MMC SD/eMMC driver (boot media, block device) | 4003 |
+| 4005 | DW-GMAC ethernet driver (Synopsys GMAC 5.20, RGMII PHY) | 4003 |
+| 4006 | PLDA PCIe host bridge (M.2 NVMe slot, enables existing NVMe/xHCI) | 4003 |
+| 4007 | Cadence USB3 controller (wrapper → xHCI, shares lane with PCIe) | 4003 |
+| 4008a | DC8200 + HDMI framebuffer (dumb framebuffer, no GPU) | 4003 |
+| 4008b-d | Imagination BXE-4-32 GPU (firmware, MMU, command submission) | 4008a |
+| 4008e | GPU integration with srv/gpu | 4008d, 2000 |
+
 ## Future: Clustering + Deployment (3000-series, optional)
 
 Clustering and deployment are optional build-time features. Clustering provides
@@ -96,6 +117,16 @@ Phases 1-24, 100-101 (done)
 │   │                              2003 srv/wm ── 2004 native apps
 │   │                                    |
 │   └── 1000 (done) ───────────── 2006 Wayland bridge ── 2007 Chrome
+│
+├── Future: Milk-V Mars (StarFive JH7110) — real RISC-V hardware
+│   ├── 4000 build target + board config
+│   ├── 4001 FDT parser extension
+│   ├── 4002 first boot (serial)
+│   ├── 4003 clock/reset controller
+│   ├── 4004 DW-MMC (SD/eMMC) ── 4005 DW-GMAC (ethernet)
+│   ├── 4006 PLDA PCIe ── existing NVMe/xHCI
+│   ├── 4007 Cadence USB3
+│   └── 4008a DC8200 framebuffer ── 4008b-d IMG BXE-4-32 GPU ── 4008e srv/gpu
 │
 └── Future: Clustering + Deployment (-Dcluster / -Dviceroy)
     ├── 3000 gossip discovery

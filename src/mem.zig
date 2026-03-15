@@ -10,10 +10,19 @@ pub const PAGE_SIZE: usize = 4096;
 pub const PAGE_SHIFT: u6 = 12;
 
 /// Kernel virtual address base — physical address 0 maps here.
-pub const KERNEL_VIRT_BASE: u64 = 0xFFFF_8000_0000_0000;
+/// x86_64/aarch64: Sv48-canonical (bit 47 sign-extended).
+/// riscv64: Sv39-canonical (bit 38 sign-extended) — Sv48 not available on all hardware.
+pub const KERNEL_VIRT_BASE: u64 = switch (@import("builtin").cpu.arch) {
+    .riscv64 => 0xFFFF_FFC0_0000_0000,
+    else => 0xFFFF_8000_0000_0000,
+};
 
 /// User stack top (grows down).
-pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFF0_0000;
+/// riscv64 Sv39: user half is 0-256 GB, so stack must be below 0x40_0000_0000.
+pub const USER_STACK_TOP: u64 = switch (@import("builtin").cpu.arch) {
+    .riscv64 => 0x0000_003F_FFF0_0000,
+    else => 0x0000_7FFF_FFF0_0000,
+};
 
 /// Initial user SP:
 /// x86_64:  RSP ≡ 8 (mod 16) at function entry (as if `call` pushed RA) → TOP - 8

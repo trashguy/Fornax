@@ -10,6 +10,9 @@ const plic = @import("plic.zig");
 const supervisor = @import("../../supervisor.zig");
 const process = @import("../../process.zig");
 
+/// Assembly trap entry point from entry.S — needed for early STVEC setup.
+extern fn trap_entry() callconv(.naked) void;
+
 /// IRQ handler function type. Returns true if it handled the IRQ.
 pub const IrqHandler = *const fn () bool;
 
@@ -30,6 +33,26 @@ pub fn registerIrqHandler(irq: u8, handler: IrqHandler) bool {
         }
     }
     return false;
+}
+
+/// Direct physical UART write — bypasses serial module entirely.
+/// Uses the physical UART address via identity map, no LSR polling.
+/// Safe to call from trap handlers where the serial module might double-fault.
+fn rawPutChar(c: u8) void {
+    @as(*volatile u8, @ptrFromInt(@as(u64, 0x10000000))).* = c;
+}
+
+/// Output a u64 as hex using raw UART writes (no serial module, no LSR polling).
+fn rawHex(val: u64) void {
+    rawPutChar('0');
+    rawPutChar('x');
+    inline for (0..16) |i| {
+        const shift: u6 = @intCast(60 - i * 4);
+        const nibble: u4 = @intCast((val >> shift) & 0xF);
+        const n: u8 = nibble;
+        const c: u8 = if (n < 10) '0' + n else 'A' - 10 + n;
+        rawPutChar(c);
+    }
 }
 
 /// Output a u64 as hex using only serial.putChar (no memory reads for strings).
@@ -124,60 +147,46 @@ export fn handleExceptionRv(frame_ptr: u64, scause: u64, stval: u64) callconv(.c
             cpu.halt();
         }
     } else {
-        // Kernel-mode fault — attempt recovery
-        serial.putChar('\n');
-        serial.putChar('s');
-        serial.putChar('=');
-        inlineHex(scause);
-        serial.putChar(' ');
-        serial.putChar('p');
-        serial.putChar('=');
-        inlineHex(cpu.csrRead(cpu.CSR_SEPC));
-        serial.putChar(' ');
-        serial.putChar('v');
-        serial.putChar('=');
-        inlineHex(stval);
-        serial.putChar('\r');
-        serial.putChar('\n');
-        // Print RA (return address), S0 (frame pointer), A0 (first arg) from trap frame
-        serial.putChar('r');
-        serial.putChar('a');
-        serial.putChar('=');
-        inlineHex(frame[0]); // ra = x1
-        serial.putChar(' ');
-        serial.putChar('s');
-        serial.putChar('0');
-        serial.putChar('=');
-        inlineHex(frame[7]); // s0 = x8
-        serial.putChar(' ');
-        serial.putChar('a');
-        serial.putChar('0');
-        serial.putChar('=');
-        inlineHex(frame[9]); // a0 = x10
-        serial.putChar(' ');
-        serial.putChar('a');
-        serial.putChar('1');
-        serial.putChar('=');
-        inlineHex(frame[10]); // a1 = x11
-        serial.putChar('\r');
-        serial.putChar('\n');
+        // Kernel-mode fault — use raw UART writes (no serial module) to
+        // avoid double-faulting if the UART is inaccessible through paging.
+        rawPutChar('\r');
+        rawPutChar('\n');
+        rawPutChar('!');
+        rawPutChar('K');
+        rawPutChar('F');
+        rawPutChar(' ');
+        rawPutChar('s');
+        rawPutChar('=');
+        rawHex(scause);
+        rawPutChar(' ');
+        rawPutChar('p');
+        rawPutChar('=');
+        rawHex(cpu.csrRead(cpu.CSR_SEPC));
+        rawPutChar(' ');
+        rawPutChar('v');
+        rawPutChar('=');
+        rawHex(stval);
+        rawPutChar('\r');
+        rawPutChar('\n');
+        rawPutChar('r');
+        rawPutChar('a');
+        rawPutChar('=');
+        rawHex(frame[0]); // ra = x1
+        rawPutChar(' ');
+        rawPutChar('s');
+        rawPutChar('0');
+        rawPutChar('=');
+        rawHex(frame[7]); // s0 = x8
+        rawPutChar(' ');
+        rawPutChar('a');
+        rawPutChar('0');
+        rawPutChar('=');
+        rawHex(frame[9]); // a0 = x10
+        rawPutChar('\r');
+        rawPutChar('\n');
 
-        // Try to recover instead of halting.
-        const percpu = @import("../../percpu.zig");
-        const my_core = percpu.getCoreId();
-        if (percpu.percpu_array[my_core].in_fault_recovery) {
-            cpu.halt();
-        }
-        percpu.percpu_array[my_core].in_fault_recovery = true;
-
-        if (process.getCurrent()) |proc| {
-            proc.state = .dead;
-            percpu.percpu_array[my_core].current = null;
-        }
-
-        paging.switchToKernel();
-        percpu.percpu_array[my_core].in_fault_recovery = false;
-        process.scheduleNext();
+        // Halt — don't attempt recovery (percpu not yet initialized at boot)
+        cpu.halt();
     }
 }
 
@@ -254,6 +263,12 @@ export fn handleInterruptRv(scause: u64, frame_ptr: u64) callconv(.c) void {
 
 pub fn init() void {
     plic.init();
+
+    // Set STVEC early so paging faults go to our handler, not OpenSBI.
+    // Must set SSCRATCH=0 first (S-mode trap protocol in entry.S).
+    cpu.csrWrite(cpu.CSR_SSCRATCH, 0);
+    cpu.csrWrite(cpu.CSR_STVEC, @intFromPtr(&trap_entry));
+
     paging.init();
-    klog.info("riscv64: PLIC + Sv48 paging initialized\n");
+    klog.info("riscv64: PLIC + Sv39 paging initialized\n");
 }

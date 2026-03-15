@@ -277,6 +277,8 @@ pub fn build(b: *std.Build) void {
     const containers = b.option(bool, "containers", "Enable container support (fnx CLI, Linux compat, bridge)") orelse false;
     const test_packages = b.option(bool, "test-packages", "Build test packages (xxd) for integration tests") orelse false;
     const amdgpu = b.option(bool, "amdgpu", "Use AMD GPU driver from fornax-amdgpu package") orelse false;
+    const Board = enum { qemu_virt, milkv_mars };
+    const board = b.option(Board, "board", "RISC-V board target (default: qemu_virt)") orelse .qemu_virt;
     const user_strip = b.option(bool, "strip", "Strip debug info from userspace binaries") orelse
         (optimize != .Debug); // strip by default on release builds
 
@@ -289,6 +291,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "cluster", cluster);
     build_options.addOption(bool, "posix", posix);
     build_options.addOption(bool, "containers", containers);
+    build_options.addOption(Board, "board", board);
 
     // ── Host tool: mkinitrd ───────────────────────────────────────────
     const mkinitrd = b.addExecutable(.{
@@ -1933,7 +1936,10 @@ const touch_bin = b.addExecutable(.{
     riscv64_bin.root_module.addOptions("build_options", build_options);
     riscv64_bin.addAssemblyFile(b.path("src/arch/riscv64/entry.S"));
     riscv64_bin.entry = .disabled; // _start is in entry.S
-    riscv64_bin.setLinkerScript(b.path("src/arch/riscv64/kernel.ld"));
+    riscv64_bin.setLinkerScript(if (board == .milkv_mars)
+        b.path("src/arch/riscv64/kernel_mars.ld")
+    else
+        b.path("src/arch/riscv64/kernel.ld"));
 
     const riscv64_install = b.addInstallArtifact(riscv64_bin, .{
         .dest_dir = .{ .override = .{ .custom = "esp-riscv64" } },
