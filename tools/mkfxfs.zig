@@ -521,29 +521,6 @@ pub fn main() !void {
     // Sort all items by key
     std.mem.sort(SortableItem, items.items, {}, SortableItem.orderLessThan);
 
-    // Debug: dump sorted items
-    std.debug.print("  --- sorted leaf items ---\n", .{});
-    for (items.items, 0..) |item, idx| {
-        const type_name: []const u8 = switch (item.key.item_type) {
-            INODE_ITEM => "INODE",
-            DIR_ENTRY => "DIREN",
-            EXTENT_DATA => "EXTEN",
-            else => "?????",
-        };
-        if (item.key.item_type == DIR_ENTRY and item.data.len >= 10) {
-            const name_len: usize = item.data[9];
-            const name = if (name_len <= item.data.len - 10) item.data[10..][0..name_len] else "???";
-            std.debug.print("  [{d:>2}] inode={d} type={s} off=0x{x:0>16} -> \"{s}\" (target inode {d})\n", .{
-                idx, item.key.inode_nr, type_name, item.key.offset, name,
-                @as(u64, item.data[0]) | (@as(u64, item.data[1]) << 8) | (@as(u64, item.data[2]) << 16) | (@as(u64, item.data[3]) << 24) | (@as(u64, item.data[4]) << 32) | (@as(u64, item.data[5]) << 40) | (@as(u64, item.data[6]) << 48) | (@as(u64, item.data[7]) << 56),
-            });
-        } else {
-            std.debug.print("  [{d:>2}] inode={d} type={s} off=0x{x:0>16} datalen={d}\n", .{
-                idx, item.key.inode_nr, type_name, item.key.offset, item.data.len,
-            });
-        }
-    }
-
     // Build B-tree from sorted items — split across multiple leaves if needed
     const LeafEntry = struct { first_key: Key, data: [BLOCK_SIZE]u8 };
     var leaves: std.ArrayList(LeafEntry) = .empty;

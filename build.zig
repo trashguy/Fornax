@@ -276,6 +276,7 @@ pub fn build(b: *std.Build) void {
     const posix = b.option(bool, "posix", "Enable C/POSIX realm support") orelse false;
     const containers = b.option(bool, "containers", "Enable container support (fnx CLI, Linux compat, bridge)") orelse false;
     const test_packages = b.option(bool, "test-packages", "Build test packages (xxd) for integration tests") orelse false;
+    const amdgpu = b.option(bool, "amdgpu", "Use AMD GPU driver from fornax-amdgpu package") orelse false;
     const user_strip = b.option(bool, "strip", "Strip debug info from userspace binaries") orelse
         (optimize != .Debug); // strip by default on release builds
 
@@ -1093,10 +1094,14 @@ const touch_bin = b.addExecutable(.{
     });
     crond_bin.image_base = user_image_base;
 
+    const gpud_source: std.Build.LazyPath = if (amdgpu)
+        .{ .cwd_relative = "../fornax-amdgpu/srv/gpud/main.zig" }
+    else
+        b.path("srv/gpud/main.zig");
     const gpud_bin = b.addExecutable(.{
         .name = "gpud",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("srv/gpud/main.zig"),
+            .root_source_file = gpud_source,
             .target = x86_64_freestanding,
             .optimize = user_optimize,
             .strip = if (user_strip) true else null,
@@ -1180,20 +1185,6 @@ const touch_bin = b.addExecutable(.{
         }),
     });
     smp_test_bin.image_base = user_image_base;
-
-    const iperf_bin = b.addExecutable(.{
-        .name = "iperf",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("../fornax-tools/iperf/main.zig"),
-            .target = x86_64_freestanding,
-            .optimize = user_optimize,
-            .strip = if (user_strip) true else null,
-            .imports = &.{
-                .{ .name = "fornax", .module = fornax_module },
-            },
-        }),
-    });
-    iperf_bin.image_base = user_image_base;
 
     // ── TLS support (BearSSL, x86_64 only) ────────────────────────────
     // BearSSL compiled as static library, linked into TLS-capable programs.
@@ -1616,7 +1607,6 @@ const touch_bin = b.addExecutable(.{
         uptime_bin,
         ktrace_bin,
         smp_test_bin,
-        iperf_bin,
     };
     for (disk_programs) |prog| {
         const install = b.addInstallArtifact(prog, .{
@@ -1789,7 +1779,6 @@ const touch_bin = b.addExecutable(.{
         .{ "crontab", "cmd/crontab/main.zig" },
         .{ "date", "cmd/date/main.zig" },
         .{ "uptime", "cmd/uptime/main.zig" },
-        .{ "iperf", "../fornax-tools/iperf/main.zig" },
     };
 
     var aa64_initrd_bins: [3]*std.Build.Step.Compile = undefined;
@@ -2012,7 +2001,6 @@ const touch_bin = b.addExecutable(.{
         .{ "crontab", "cmd/crontab/main.zig" },
         .{ "date", "cmd/date/main.zig" },
         .{ "uptime", "cmd/uptime/main.zig" },
-        .{ "iperf", "../fornax-tools/iperf/main.zig" },
     };
 
     // Build riscv64 initrd programs (init, partfs, fxfs)

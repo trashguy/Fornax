@@ -28,8 +28,8 @@ const PAGE_SIZE = 4096;
 /// Maximum number of shared memory segments system-wide.
 pub const MAX_SHMEM = 64;
 
-/// Maximum pages per segment (128KB).
-pub const MAX_SHMEM_PAGES = 32;
+/// Maximum pages per segment (512KB).
+pub const MAX_SHMEM_PAGES = 128;
 
 pub const Segment = struct {
     phys_pages: [MAX_SHMEM_PAGES]u64,
@@ -84,6 +84,58 @@ pub fn create(size: u32, pid: u32) ?u32 {
         seg.phys_pages[i] = @intCast(phys);
     }
 
+    seg.page_count = @intCast(page_count);
+    seg.ref_count = 1;
+    seg.creator_pid = pid;
+    seg.size = size;
+    seg.active = true;
+
+    return id;
+}
+
+/// Get the physical address of a page within a shared memory segment.
+/// Returns null if the segment or page index is invalid.
+pub fn getPhysAddr(shmem_id: u32, page_index: u32) ?u64 {
+    if (shmem_id >= MAX_SHMEM) return null;
+
+    lock.lock();
+    defer lock.unlock();
+
+    const seg = &segments[shmem_id];
+    if (!seg.active) return null;
+    if (page_index >= seg.page_count) return null;
+
+    return seg.phys_pages[page_index];
+}
+
+/// Create a shared memory segment backed by physically contiguous pages
+/// aligned to `align_bytes`. Returns shmem_id or null on failure.
+pub fn createContiguous(size: u32, pid: u32, align_bytes: u32) ?u32 {
+    if (size == 0 or size > MAX_SHMEM_PAGES * PAGE_SIZE) return null;
+    if (align_bytes == 0) return create(size, pid);
+
+    const page_count = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    const align_pages = (align_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    lock.lock();
+    defer lock.unlock();
+
+    var slot: ?u32 = null;
+    for (&segments, 0..) |*seg, i| {
+        if (!seg.active) {
+            slot = @intCast(i);
+            break;
+        }
+    }
+    const id = slot orelse return null;
+
+    const phys = pmm.allocAlignedContiguousPages(page_count, align_pages) orelse
+        return null;
+
+    var seg = &segments[id];
+    for (0..page_count) |i| {
+        seg.phys_pages[i] = phys + i * PAGE_SIZE;
+    }
     seg.page_count = @intCast(page_count);
     seg.ref_count = 1;
     seg.creator_pid = pid;

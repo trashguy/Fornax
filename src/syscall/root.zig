@@ -57,7 +57,7 @@ pub const SYS = enum(u64) {
     clone = 37,
     futex = 38,
     ipc_pair = 39,
-    reserved_40 = 40,
+    shmem_create_dma = 40,
     thread_exit = 41,
     writev = 42,
     shmem_create = 43,
@@ -66,6 +66,7 @@ pub const SYS = enum(u64) {
     proc_setup = 46,
     mmap_device = 47,
     irq_alloc = 48,
+    shmem_phys = 49,
 };
 
 /// Error return values.
@@ -233,6 +234,7 @@ pub const sysDup = mem_handlers.sysDup;
 pub const sysDup2 = mem_handlers.sysDup2;
 pub const sysArchPrctl = mem_handlers.sysArchPrctl;
 pub const sysShmemCreate = mem_handlers.sysShmemCreate;
+pub const sysShmemCreateDma = mem_handlers.sysShmemCreateDma;
 pub const sysShmemMap = mem_handlers.sysShmemMap;
 pub const sysShmemDestroy = mem_handlers.sysShmemDestroy;
 
@@ -247,6 +249,7 @@ pub const sysShutdown = ns.sysShutdown;
 pub const sysProcSetup = proc_setup.sysProcSetup;
 pub const sysMmapDevice = mem_handlers.sysMmapDevice;
 pub const sysIrqAlloc = mem_handlers.sysIrqAlloc;
+pub const sysShmemPhys = mem_handlers.sysShmemPhys;
 
 /// Main syscall dispatch. Called from arch-specific entry point.
 pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) u64 {
@@ -342,7 +345,7 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         .bind => sysBind(arg0, arg1, arg2, arg3),
         .unmount => sysUnmount(arg0, arg1),
         .ipc_pair => sysIpcPair(arg0),
-        .reserved_40 => ENOSYS,
+        .shmem_create_dma => sysShmemCreateDma(arg0, arg1),
         .thread_exit => sysThreadExit(arg0),
         .writev => sysWritev(arg0, arg1, arg2),
         .shmem_create => sysShmemCreate(arg0),
@@ -351,6 +354,7 @@ pub fn dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         .proc_setup => sysProcSetup(arg0, arg1, arg2, arg3, arg4),
         .mmap_device => sysMmapDevice(arg0, arg1, arg2, arg3),
         .irq_alloc => sysIrqAlloc(arg0, arg1, arg2),
+        .shmem_phys => sysShmemPhys(arg0, arg1),
     };
 
     @import("../trace.zig").trace(.syscall_exit, @truncate(nr));

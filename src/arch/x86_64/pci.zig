@@ -365,6 +365,13 @@ fn scanFunction(bus: u8, slot: u8, func: u8, depth: u8) void {
         dev.msix = null;
     }
 
+    // Enable Memory Space + Bus Master for all endpoint devices.
+    // VFIO passthrough / FLR can leave these disabled, causing BAR
+    // reads to return 0xFFFFFFFF.
+    if (header_type == 0) {
+        enableBusMastering(dev);
+    }
+
     klog.debug("  ");
     klog.debugHex(bus);
     klog.debug(":");

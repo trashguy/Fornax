@@ -193,21 +193,25 @@ fn allocHandle(file_idx: u8) ?u32 {
     for (&handles, 0..) |*h, i| {
         if (!h.active) {
             h.* = .{ .file_idx = file_idx, .active = true };
-            return @intCast(i);
+            return @intCast(i + 1); // +1: handle 0 is reserved (kernel treats 0 as "no handle")
         }
     }
     return null;
 }
 
 fn freeHandle(id: u32) void {
-    if (id < MAX_HANDLES) {
-        handles[@intCast(id)].active = false;
+    if (id == 0) return;
+    const idx = id - 1;
+    if (idx < MAX_HANDLES) {
+        handles[@intCast(idx)].active = false;
     }
 }
 
 fn getHandle(id: u32) ?*Handle {
-    if (id >= MAX_HANDLES) return null;
-    const h = &handles[@intCast(id)];
+    if (id == 0) return null;
+    const idx = id - 1;
+    if (idx >= MAX_HANDLES) return null;
+    const h = &handles[@intCast(idx)];
     if (!h.active) return null;
     return h;
 }

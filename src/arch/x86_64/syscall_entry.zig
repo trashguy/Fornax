@@ -24,9 +24,9 @@ pub extern fn resume_from_kernel_frame(saved_ksp: u64) callconv(.{ .x86_64_sysv 
 
 /// Initialize the SYSCALL/SYSRET mechanism.
 pub fn init() void {
-    // Enable SCE (System Call Extensions) in EFER MSR
+    // Enable SCE (System Call Extensions) and NXE (No-Execute Enable) in EFER MSR
     const efer = cpu.rdmsr(cpu.MSR_EFER);
-    cpu.wrmsr(cpu.MSR_EFER, efer | cpu.EFER_SCE);
+    cpu.wrmsr(cpu.MSR_EFER, efer | cpu.EFER_SCE | cpu.EFER_NXE);
 
     // STAR MSR: segment selectors
     // Bits [47:32] = kernel CS selector (for SYSCALL): 0x08

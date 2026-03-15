@@ -493,9 +493,9 @@ pub fn init() bool {
     }
 
     // Scan for first SATA disk
-    var port_num: u5 = 0;
     var found = false;
-    while (port_num < 32) : (port_num += 1) {
+    for (0..32) |port_idx| {
+        const port_num: u5 = @intCast(port_idx);
         if (pi & (@as(u32, 1) << port_num) == 0) continue;
 
         const base = portBase(port_num);

@@ -170,6 +170,7 @@ pub const MSR_SFMASK = 0xC0000084;
 
 // EFER bits
 pub const EFER_SCE: u64 = 1 << 0; // System Call Extensions
+pub const EFER_NXE: u64 = 1 << 11; // No-Execute Enable
 pub const MSR_PAT: u32 = 0x277;
 
 /// Initialize PAT: reprogram entry 1 from WT to Write-Combining (WC).

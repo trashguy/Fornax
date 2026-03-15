@@ -204,7 +204,13 @@ pub fn handleException(frame: *idt.ExceptionFrame) void {
         if (frame.vector == 14) {
             klog.debug("CR2: ");
             klog.debugHex(cpu.readCr2());
-            klog.debug("\n");
+            klog.debug(" err=");
+            klog.debugHex(frame.error_code);
+            klog.debug(" (");
+            if (frame.error_code & 1 != 0) klog.debug("P") else klog.debug("NP");
+            if (frame.error_code & 2 != 0) klog.debug(",W") else klog.debug(",R");
+            if (frame.error_code & 4 != 0) klog.debug(",U") else klog.debug(",S");
+            klog.debug(")\n");
         }
 
         // Get the faulting process

@@ -12,3 +12,4 @@ test-serial.log
 fornax-syms.gdb
 .serena/
 .claude/
+tmp/

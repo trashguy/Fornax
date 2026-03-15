@@ -2,7 +2,7 @@
 .PHONY: release release-x86_64 release-aarch64 release-riscv64 run-release disk-img disk-format
 .PHONY: run-posix run-posix-riscv64 run-posix-aarch64
 .PHONY: run-containers run-containers-dev run-containers-riscv64 run-containers-aarch64
-.PHONY: run-dev test unit-test integration-test
+.PHONY: run-dev run-amdgpu debug-amdgpu test unit-test integration-test
 .PHONY: debug debug-smp debug-dev debug-containers
 .PHONY: cleanup-network setup-network
 
@@ -96,6 +96,12 @@ debug-containers:
 run-dev:
 	zig build x86_64
 	./scripts/run-x86_64.sh -smp 8 -m 8192
+
+run-amdgpu:
+	./scripts/run-amdgpu.sh
+
+debug-amdgpu:
+	./scripts/run-amdgpu.sh --debug
 
 test: unit-test
 

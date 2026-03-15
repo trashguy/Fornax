@@ -45,7 +45,7 @@ pub const SYS = enum(u64) {
     clone = 37,
     futex = 38,
     ipc_pair = 39,
-    reserved_40 = 40,
+    shmem_create_dma = 40,
     thread_exit = 41,
     writev = 42,
     shmem_create = 43,
@@ -54,6 +54,7 @@ pub const SYS = enum(u64) {
     proc_setup = 46,
     mmap_device = 47,
     irq_alloc = 48,
+    shmem_phys = 49,
 };
 
 const ipc = @import("ipc.zig");
@@ -473,6 +474,14 @@ pub fn shmemCreate(size: u32) ?u32 {
     return @intCast(result);
 }
 
+/// Create a shared memory segment with contiguous, aligned physical pages.
+/// `alignment` is in bytes (e.g. 0x100000 for 1MB). Returns shmem_id or null.
+pub fn shmemCreateDma(size: u32, alignment: u32) ?u32 {
+    const result = syscall2(.shmem_create_dma, @as(u64, size), @as(u64, alignment));
+    if (result >= 0x8000_0000_0000_0000) return null;
+    return @intCast(result);
+}
+
 /// Map a shared memory segment into the caller's address space. Returns pointer or null.
 pub fn shmemMap(id: u32) ?[*]u8 {
     const result = syscall1(.shmem_map, @as(u64, id));
@@ -483,6 +492,14 @@ pub fn shmemMap(id: u32) ?[*]u8 {
 /// Destroy a shared memory segment (creator only). Returns true on success.
 pub fn shmemDestroy(id: u32) bool {
     return syscall1(.shmem_destroy, @as(u64, id)) == 0;
+}
+
+/// Get the physical address of a page in a shared memory segment. Requires uid 0.
+/// Returns the physical address or null on error.
+pub fn shmemPhys(id: u32, page_index: u32) ?u64 {
+    const result = syscall2(.shmem_phys, @as(u64, id), @as(u64, page_index));
+    if (result >= 0x8000_0000_0000_0000) return null;
+    return result;
 }
 
 pub const RFNAMEG: u64 = 0x08;

@@ -251,6 +251,49 @@ pub fn allocContiguousPages(count: usize) ?usize {
     return null;
 }
 
+/// Allocate `count` physically contiguous pages starting at a physical
+/// address aligned to `align_pages` pages. Returns the physical address
+/// of the first page, or null if no suitable run is found.
+pub fn allocAlignedContiguousPages(count: usize, align_pages: usize) ?usize {
+    if (!initialized or count == 0 or align_pages == 0) return null;
+    pmm_lock.lock();
+    defer pmm_lock.unlock();
+
+    // Round search_hint up to the next alignment boundary
+    var start = (search_hint + align_pages - 1) / align_pages * align_pages;
+    var checked: usize = 0;
+    while (checked < total_pages) {
+        if (start + count > total_pages) {
+            // Wrap to the first aligned position
+            start = 0;
+            checked += align_pages;
+            if (checked >= total_pages) break;
+            continue;
+        }
+
+        var run_ok = true;
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            if (!isFree(start + i)) {
+                checked += i + 1;
+                // Skip to next aligned position past the used page
+                start = ((start + i + 1) + align_pages - 1) / align_pages * align_pages;
+                run_ok = false;
+                break;
+            }
+        }
+        if (run_ok) {
+            for (0..count) |j| {
+                markUsed(start + j);
+            }
+            free_pages -= count;
+            search_hint = start + count;
+            return start * page_size;
+        }
+    }
+    return null;
+}
+
 pub fn freePage(phys_addr: usize) void {
     if (!initialized) return;
     // Trap: catch unexpected frees of DMA pages (aarch64 virtqueue debug)

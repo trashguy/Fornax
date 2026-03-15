@@ -191,6 +191,18 @@ pub fn sysShmemCreate(size: u64) u64 {
     return @as(u64, id);
 }
 
+/// Create a shared memory segment with contiguous, aligned physical pages.
+/// arg0 = size in bytes, arg1 = alignment in bytes (e.g. 0x100000 for 1MB).
+/// Returns shmem_id or ENOMEM.
+pub fn sysShmemCreateDma(size: u64, alignment: u64) u64 {
+    const shmem = @import("../shmem.zig");
+    const proc = process.getCurrent() orelse return EBADF;
+    if (size == 0 or size > shmem.MAX_SHMEM_PAGES * 4096) return EINVAL;
+    if (alignment == 0) return EINVAL;
+    const id = shmem.createContiguous(@intCast(size), proc.pid, @intCast(alignment)) orelse return ENOMEM;
+    return @as(u64, id);
+}
+
 /// Map a shared memory segment into the caller's address space.
 /// arg0 = shmem_id. Returns virtual address or EINVAL.
 pub fn sysShmemMap(shmem_id: u64) u64 {
@@ -208,6 +220,17 @@ pub fn sysShmemDestroy(shmem_id: u64) u64 {
     const proc = process.getCurrent() orelse return EBADF;
     if (shmem.destroy(@intCast(shmem_id), proc.pid)) return 0;
     return EINVAL;
+}
+
+/// SYS 49: shmem_phys — Get physical address of a page in a shared memory segment.
+/// arg0 = shmem_id, arg1 = page_index. Returns physical address or EINVAL.
+/// Only root (uid 0) can query physical addresses (needed for DMA).
+pub fn sysShmemPhys(shmem_id: u64, page_index: u64) u64 {
+    const shmem = @import("../shmem.zig");
+    const proc = process.getCurrent() orelse return EBADF;
+    if (proc.uid != 0) return EACCES;
+    const phys = shmem.getPhysAddr(@intCast(shmem_id), @intCast(page_index)) orelse return EINVAL;
+    return phys;
 }
 
 /// SYS 47: mmap_device — Map physical device memory (MMIO/VRAM) into userspace.
