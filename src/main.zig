@@ -175,6 +175,21 @@ pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize, rsdp: ?[*]const
     // Phase 14: Process Groups
     process_group.init();
 
+    // Phase 4003: JH7110 clock/reset init (Mars only — before peripheral drivers)
+    if (builtin.cpu.arch == .riscv64 and @import("build_options").board == .milkv_mars) {
+        const jh7110_crg = @import("arch/riscv64/jh7110_crg.zig");
+        jh7110_crg.enablePeripheral(.sdio0);
+        jh7110_crg.enablePeripheral(.sdio1);
+        jh7110_crg.enablePeripheral(.gmac1);
+        klog.info("JH7110 CRG: peripheral clocks initialized.\n");
+
+        // Phase 4004: DW-MMC SD card
+        const dwmmc = @import("dwmmc.zig");
+        if (dwmmc.init()) {
+            klog.info("Block device ready (SD card).\n");
+        }
+    }
+
     // Phase 15: PCI + virtio-net
     if (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .riscv64 or builtin.cpu.arch == .aarch64) {
         const pci_mod = switch (builtin.cpu.arch) {
