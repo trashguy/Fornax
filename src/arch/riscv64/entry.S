@@ -361,6 +361,7 @@ trap_return:
     bnez t0, .smode_return
 
     # ── Returning to U-mode ──
+
     # Save kernel TP (percpu ptr) to SSCRATCH for next trap entry
     csrw sscratch, tp
 
@@ -513,5 +514,10 @@ resume_user_mode:
     li t4, 0
     li t5, 0
     li t6, 0
+
+    # Ensure icache coherence for freshly-loaded user code (first run).
+    # ASID-based address space switching skips sfence.vma, so the icache
+    # may still hold stale entries from a previous process in this slot.
+    fence.i
 
     sret

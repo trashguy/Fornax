@@ -1,7 +1,9 @@
-/// Goldfish RTC driver for riscv64.
+/// RTC driver for riscv64.
 ///
-/// QEMU virt machine provides a Goldfish RTC at MMIO address 0x101000.
-/// Returns nanoseconds since Unix epoch.
+/// QEMU virt: Goldfish RTC at MMIO address 0x101000 (nanoseconds since epoch).
+/// Milk-V Mars (JH7110): no on-chip RTC — boot_epoch stays 0.
+
+const build_options = @import("build_options");
 
 pub var boot_epoch: u64 = 0;
 
@@ -9,7 +11,13 @@ pub var boot_epoch: u64 = 0;
 const RTC_BASE: usize = 0x101000;
 
 pub fn init() void {
-    // Read TIME_LOW first (latches TIME_HIGH), then TIME_HIGH
+    if (comptime build_options.board == .milkv_mars) {
+        // JH7110 has no memory-mapped RTC; avoid faulting on unmapped MMIO.
+        // Wall-clock time can be set later via NTP or /dev/time ctl.
+        return;
+    }
+
+    // QEMU Goldfish RTC: read TIME_LOW first (latches TIME_HIGH), then TIME_HIGH
     const time_low = mmioRead32(RTC_BASE + 0x00);
     const time_high = mmioRead32(RTC_BASE + 0x04);
 

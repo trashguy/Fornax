@@ -17,6 +17,14 @@ pub const KERNEL_VIRT_BASE: u64 = switch (@import("builtin").cpu.arch) {
     else => 0xFFFF_8000_0000_0000,
 };
 
+/// Starting virtual address for anonymous mmap allocations.
+/// riscv64 Sv39: user half is 256 GiB, start at 32 GiB.
+/// x86_64/aarch64: user half is 128+ TiB, start at 64 TiB.
+pub const MMAP_BASE: u64 = switch (@import("builtin").cpu.arch) {
+    .riscv64 => 0x0000_0008_0000_0000, // 32 GiB — within Sv39 lower half
+    else => 0x0000_4000_0000_0000, // 64 TiB
+};
+
 /// User stack top (grows down).
 /// riscv64 Sv39: user half is 0-256 GB, so stack must be below 0x40_0000_0000.
 pub const USER_STACK_TOP: u64 = switch (@import("builtin").cpu.arch) {
@@ -42,13 +50,15 @@ pub const ARGV_BASE: u64 = USER_STACK_TOP - PAGE_SIZE;
 pub const AUXV_BASE: u64 = ARGV_BASE - PAGE_SIZE;
 
 /// How much physical memory to map in the kernel half.
-/// AArch64 QEMU virt: RAM starts at 0x4000_0000, so 4 GB of RAM occupies
-/// physical addresses up to 0x1_4000_0000 — requiring an 8 GB map.
-/// x86_64 and riscv64 RAM starts near 0, so 4 GB suffices.
-pub const KERNEL_MAP_SIZE: u64 = if (@import("builtin").cpu.arch == .aarch64)
-    8 * 1024 * 1024 * 1024
-else
-    4 * 1024 * 1024 * 1024;
+/// Must cover the highest physical address used by RAM or MMIO.
+/// AArch64 QEMU virt: RAM starts at 0x4000_0000, 4 GB → up to 0x1_4000_0000 = 8 GB.
+/// riscv64 Mars: RAM starts at 0x4000_0000, 8 GB → up to 0x2_4000_0000 = 10 GB.
+/// x86_64: RAM starts near 0, so 4 GB suffices.
+pub const KERNEL_MAP_SIZE: u64 = switch (@import("builtin").cpu.arch) {
+    .aarch64 => 8 * 1024 * 1024 * 1024,
+    .riscv64 => 10 * 1024 * 1024 * 1024,
+    else => 4 * 1024 * 1024 * 1024,
+};
 
 /// Convert a physical address to its kernel virtual address.
 pub fn physToVirt(phys: u64) u64 {

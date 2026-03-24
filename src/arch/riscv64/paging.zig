@@ -8,8 +8,8 @@
 ///   - Non-leaf: V=1, R=W=X=0, PPN→next table
 ///   - Leaf: V=1, at least one of R|W|X set
 ///
-/// Initial kernel mapping:
-///   - Identity map first 4 GB with 2MB superpages
+/// Initial kernel mapping (size determined by mem.KERNEL_MAP_SIZE):
+///   - Identity map with 2MB superpages (covers all RAM + device MMIO)
 ///   - Higher-half map at KERNEL_VIRT_BASE (0xFFFF_FFC0_0000_0000) with 2MB superpages
 ///   - After SATP switch, kernel runs in higher-half
 const klog = @import("../../klog.zig");
@@ -21,6 +21,18 @@ const PAGE_SIZE = mem.PAGE_SIZE;
 
 /// SATP mode for Sv39.
 const SATP_MODE_SV39: u64 = 8;
+
+/// ASID support: probed in init(), ASID bits sit at SATP[59:44].
+/// max_asid = 0 means no ASID support (or probing not done yet).
+var max_asid: u16 = 0;
+
+pub fn hasAsidSupport() bool {
+    return max_asid > 0;
+}
+
+pub fn getMaxAsid() u16 {
+    return max_asid;
+}
 
 /// Sv39 PTE flag bits.
 pub const Flags = struct {
@@ -108,14 +120,15 @@ pub fn init() void {
     const root: *PageTable = @ptrFromInt(root_page);
     root.zero();
 
-    // Identity map first 4 GB using 2MB superpages
-    mapHugeRegion(root, 0, 0, 4 * 1024 / 2) orelse {
+    // Identity map using 2MB superpages (size from KERNEL_MAP_SIZE)
+    const huge_count = mem.KERNEL_MAP_SIZE / (2 * 1024 * 1024);
+    mapHugeRegion(root, 0, 0, huge_count) orelse {
         klog.err("Paging: failed to map identity region!\n");
         return;
     };
 
-    // Higher-half map: virtual KERNEL_VIRT_BASE → physical 0, 4 GB
-    mapHugeRegion(root, mem.KERNEL_VIRT_BASE, 0, 4 * 1024 / 2) orelse {
+    // Higher-half map: virtual KERNEL_VIRT_BASE → physical 0
+    mapHugeRegion(root, mem.KERNEL_VIRT_BASE, 0, huge_count) orelse {
         klog.err("Paging: failed to map higher-half region!\n");
         return;
     };
@@ -138,7 +151,35 @@ pub fn init() void {
 
     initialized = true;
 
-    klog.info("Paging: Sv39 4GB identity + higher-half mapped\n");
+    // Probe ASID width: write all-ones to SATP ASID field, read back.
+    // SATP layout: [63:60]=mode, [59:44]=ASID, [43:0]=PPN
+    {
+        const satp_with_asid: u64 = (SATP_MODE_SV39 << 60) | (@as(u64, 0xFFFF) << 44) | (kernel_root_phys >> 12);
+        cpu.csrWrite(cpu.CSR_SATP, satp_with_asid);
+        const readback = cpu.csrRead(cpu.CSR_SATP);
+        const asid_readback: u16 = @truncate((readback >> 44) & 0xFFFF);
+        // Restore original SATP (ASID 0 for kernel)
+        const satp_orig: u64 = (SATP_MODE_SV39 << 60) | (kernel_root_phys >> 12);
+        cpu.csrWrite(cpu.CSR_SATP, satp_orig);
+        asm volatile ("sfence.vma" ::: .{ .memory = true });
+        max_asid = asid_readback;
+    }
+
+    klog.info("Paging: Sv39 ");
+    klog.infoDec(mem.KERNEL_MAP_SIZE / (1024 * 1024 * 1024));
+    klog.info("GB identity + higher-half mapped, ASID bits=");
+    if (max_asid > 0) {
+        // Count bits: max_asid is all-ones for the supported width
+        var bits: u64 = 0;
+        var v: u16 = max_asid;
+        while (v != 0) : (v >>= 1) {
+            bits += 1;
+        }
+        klog.infoDec(bits);
+    } else {
+        klog.info("0");
+    }
+    klog.info("\n");
 }
 
 /// Map `count` 2MB superpages starting at `virt_base` → `phys_base`.
@@ -215,21 +256,19 @@ pub fn createAddressSpace() ?*PageTable {
         new_root.entries[i] = kernel_root.entries[i];
     }
 
-    // Deep-copy identity map entries (0-3 for 4 GB) so mapPage() can split
-    // superpages without corrupting the kernel's shared tables.
-    // In Sv39, root entries 0-3 point directly to L1 tables (not L2).
-    for (0..4) |root_idx| {
+    // Deep-copy identity map entries so mapPage() can split superpages
+    // without corrupting the kernel's shared tables.
+    const id_entries = mem.KERNEL_MAP_SIZE / (1024 * 1024 * 1024);
+    for (0..id_entries) |root_idx| {
         if (kernel_root.entries[root_idx] & Flags.VALID == 0) continue;
 
         if (isLeaf(kernel_root.entries[root_idx])) {
-            // 1GB superpage — just copy the entry
             new_root.entries[root_idx] = kernel_root.entries[root_idx];
         } else {
-            // Points to an L1 table — allocate a private copy
             const kernel_l1: *PageTable = tablePtr(pteToPhys(kernel_root.entries[root_idx]));
             const new_l1_page = pmm.allocPage() orelse return null;
             const new_l1: *PageTable = tablePtr(new_l1_page);
-            new_l1.* = kernel_l1.*; // Copy all entries (including superpages)
+            new_l1.* = kernel_l1.*;
             new_root.entries[root_idx] = physToPte(new_l1_page) | (kernel_root.entries[root_idx] & 0xFF);
         }
     }
@@ -237,15 +276,37 @@ pub fn createAddressSpace() ?*PageTable {
     return new_root;
 }
 
-/// Deep-copy the entire user-half address space (Sv39 entries 1-255) for fork.
-/// Entry 0 (identity map) is handled by createAddressSpace(). The kernel half
+/// Clear identity map entries from a user page table.
+/// Call after elf.load() to prevent TLB conflicts on JH7110 where
+/// user image base (0x40000000) overlaps with identity-mapped RAM.
+/// Only clears entries that DON'T contain user mappings (still superpages).
+pub fn clearIdentityMap(root: *PageTable) void {
+    const id_entries = mem.KERNEL_MAP_SIZE / (1024 * 1024 * 1024);
+    for (0..id_entries) |root_idx| {
+        if (root.entries[root_idx] & Flags.VALID == 0) continue;
+        // Only clear entries that are still identity-map superpages or
+        // point to L1 tables where ALL entries are identity-map superpages.
+        // If mapPage modified this entry (split superpages for user code),
+        // the L1/L0 tables contain user mappings — keep those.
+        // Simple approach: clear entries that user code doesn't touch.
+        // Entry 1 covers 0x40000000-0x7FFFFFFF (user image base) — keep it.
+        // Clear all other identity map entries (0, 2-9).
+        if (root_idx != 1) {
+            root.entries[root_idx] = 0;
+        }
+    }
+}
+
+/// Deep-copy the entire user-half address space for fork.
+/// Identity map entries are handled by createAddressSpace(). The kernel half
 /// (entries 256-511) is shared. Each 4KB user page is fully copied (no COW).
 pub fn deepCopyAddressSpace(src_root: *PageTable) ?*PageTable {
     // Create base address space (kernel half + identity map deep-copy)
     const new_root = createAddressSpace() orelse return null;
 
-    // Walk root entries 1-255 (user half, excluding identity map entries 0-3)
-    for (4..256) |l2_idx| {
+    // Walk root entries past identity map through user half (256 = kernel half start)
+    const id_entries2 = mem.KERNEL_MAP_SIZE / (1024 * 1024 * 1024);
+    for (id_entries2..256) |l2_idx| {
         if (src_root.entries[l2_idx] & Flags.VALID == 0) continue;
         if (isLeaf(src_root.entries[l2_idx])) {
             // 1GB superpage — copy as-is
@@ -349,21 +410,33 @@ pub fn unmapPage(root: *PageTable, virt: u64) void {
     );
 }
 
-/// Switch to a different address space.
-pub fn switchAddressSpace(root: *PageTable) void {
+/// Switch to a different address space with ASID.
+/// When ASIDs are available, the ASID is encoded in SATP[59:44] and no
+/// sfence.vma is needed — each ASID has its own TLB partition.
+/// Without ASIDs, sfence.vma flushes the entire TLB after SATP switch.
+/// (The earlier "sfence.vma kills timer" was caused by PLIC/identity-map
+/// bugs, not sfence.vma itself — Linux uses sfence.vma on U74 without issues.)
+pub fn switchAddressSpace(root: *PageTable, asid: u16) void {
     const virt = @intFromPtr(root);
     const phys = if (virt >= mem.KERNEL_VIRT_BASE) virt - mem.KERNEL_VIRT_BASE else virt;
-    const satp_val: u64 = (SATP_MODE_SV39 << 60) | (phys >> 12);
+    const satp_val: u64 = (SATP_MODE_SV39 << 60) | (@as(u64, asid) << 44) | (phys >> 12);
+    asm volatile ("fence rw, rw" ::: .{ .memory = true });
     cpu.csrWrite(cpu.CSR_SATP, satp_val);
-    asm volatile ("sfence.vma" ::: .{ .memory = true });
+    if (max_asid == 0) {
+        // No ASID support: must flush entire TLB to clear stale entries.
+        // With ASIDs, each process has its own TLB partition — no flush needed.
+        asm volatile ("sfence.vma" ::: .{ .memory = true });
+    }
+    asm volatile ("fence.i" ::: .{ .memory = true });
 }
 
-/// Switch SATP to the kernel's root page table.
+/// Switch SATP to the kernel's root page table (ASID 0).
 /// Must be called before freeAddressSpace() to avoid walking freed page tables.
 pub fn switchToKernel() void {
     const satp_val: u64 = (SATP_MODE_SV39 << 60) | (kernel_root_phys >> 12);
+    asm volatile ("fence rw, rw" ::: .{ .memory = true });
     cpu.csrWrite(cpu.CSR_SATP, satp_val);
-    asm volatile ("sfence.vma" ::: .{ .memory = true });
+    asm volatile ("fence.i" ::: .{ .memory = true });
 }
 
 /// Get the kernel root page table.
@@ -371,9 +444,14 @@ pub fn getKernelRoot() *PageTable {
     return tablePtr(kernel_root_phys);
 }
 
-/// Get the SATP value for the kernel page tables (Sv39 mode).
+/// Get the SATP value for the kernel page tables (Sv39 mode, ASID 0).
 pub fn getKernelSatp() u64 {
     return (SATP_MODE_SV39 << 60) | (kernel_root_phys >> 12);
+}
+
+/// Flush TLB entries for a specific ASID (all addresses).
+pub fn flushAsid(asid: u16) void {
+    cpu.sfenceVmaAsid(asid);
 }
 
 /// Walk page tables to translate a virtual address to physical.

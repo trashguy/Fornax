@@ -653,10 +653,9 @@ pub fn sysClone(stack_top: u64, tls: u64, ctid_ptr: u64, ptid_ptr: u64, flags: u
             .aarch64 => 32, // ELR_EL1
             else => unreachable,
         };
-        child_frame[RIP_SLOT] = parent_frame[RIP_SLOT] + switch (arch) {
-            .riscv64 => 4,
-            else => 0,
-        };
+        // entry.S ecall handler already advanced SEPC past the ecall
+        // instruction, so the frame has the correct return address.
+        child_frame[RIP_SLOT] = parent_frame[RIP_SLOT];
 
         // Patch TLS register in frame for riscv64 (TP restored from frame[3])
         if (arch == .riscv64 and tls != 0) {
@@ -664,17 +663,24 @@ pub fn sysClone(stack_top: u64, tls: u64, ctid_ptr: u64, ptid_ptr: u64, flags: u
         }
 
         // Use resume_from_kernel_frame path (not IRETQ first-run)
-        child.saved_kernel_rsp = child_frame_base;
+        // Atomic store with release ordering ensures the frame contents are
+        // visible to whichever core picks up this process from the run queue.
+        @atomicStore(u64, &child.saved_kernel_rsp, child_frame_base, .release);
     } else {
         // Fallback: no parent frame (shouldn't happen for clone from userspace)
         child.saved_kernel_rsp = 0;
     }
 
     // Set fields used by switchTo (TLS MSR write, etc.)
-    child.user_rip = parent.user_rip + switch (@import("builtin").cpu.arch) {
-        .riscv64 => 4,
-        else => 0,
-    };
+    // user_rip is used as fallback if saved_kernel_rsp is 0 on dispatch.
+    // On riscv64, read current SEPC from parent's trap frame (user_rip is stale).
+    // entry.S already advanced SEPC past ecall, so no +4 needed.
+    if (@import("builtin").cpu.arch == .riscv64 and parent_frame_ptr != 0) {
+        const pf: [*]const u64 = @ptrFromInt(parent_frame_ptr);
+        child.user_rip = pf[31]; // SEPC slot
+    } else {
+        child.user_rip = parent.user_rip;
+    }
     child.user_rsp = stack_top;
     child.user_rflags = parent.user_rflags;
     child.syscall_ret = 0;
@@ -770,10 +776,21 @@ pub fn sysRfork(flags: u64) u64 {
         // Set up child process state
         child.pid = @atomicRmw(u32, &process.next_pid, .Add, 1, .monotonic);
         child.kernel_stack_top = stack_virt + process.KERNEL_STACK_PAGES * mem.PAGE_SIZE;
-        child.user_rip = parent.user_rip;
-        child.user_rsp = parent.user_rsp;
-        child.user_rflags = parent.user_rflags;
-        child.saved_kernel_rsp = 0; // Force IRETQ path (first run)
+
+        // On riscv64, user_rip is not updated on every syscall — the current
+        // PC lives in the trap frame's SEPC slot. Read it from there so the
+        // child resumes at the instruction after the fork ecall.
+        if (@import("builtin").cpu.arch == .riscv64 and parent.saved_kernel_rsp != 0) {
+            const parent_frame: [*]const u64 = @ptrFromInt(parent.saved_kernel_rsp);
+            child.user_rip = parent_frame[31]; // SEPC (already advanced past ecall)
+            child.user_rsp = parent_frame[1];  // user SP
+            child.user_rflags = parent_frame[32]; // SSTATUS
+        } else {
+            child.user_rip = parent.user_rip;
+            child.user_rsp = parent.user_rsp;
+            child.user_rflags = parent.user_rflags;
+        }
+        child.saved_kernel_rsp = 0; // Force SRET/IRETQ path (first run)
         child.syscall_ret = 0; // Child sees 0 from fork
         child.brk = parent.brk;
         child.mmap_next = parent.mmap_next;
@@ -977,8 +994,17 @@ pub fn sysExec(elf_ptr: u64, elf_len: u64, argv_ptr: u64) u64 {
     }
 
     // === Point of no return: swap to new address space ===
-    // Old PML4 + user pages freed
+    // Flush old ASID's TLB entries before freeing page tables.
+    // On SMP, also shootdown remote cores that ran this process.
+    if (@import("builtin").cpu.arch == .riscv64) {
+        const rv_paging = @import("../arch/riscv64/paging.zig");
+        if (rv_paging.hasAsidSupport()) {
+            rv_paging.flushAsid(process.getAsid(proc));
+        }
+    }
     if (proc.pml4) |old_pml4| {
+        process.tlbShootdown(proc);
+        paging.switchToKernel();
         paging.freeAddressSpace(old_pml4);
     }
     proc.pml4 = new_pml4;
@@ -993,7 +1019,8 @@ pub fn sysExec(elf_ptr: u64, elf_len: u64, argv_ptr: u64) u64 {
     proc.pages_used = 0;
     proc.saved_kernel_rsp = 0; // Force IRETQ path in switchTo
     proc.syscall_ret = 0;
-    proc.mmap_next = 0x0000_4000_0000_0000;
+    proc.mmap_next = mem.MMAP_BASE;
+    proc.cores_ran_on = 0; // New address space — no stale TLB entries
 
     // Clear IPC state (old user buffers are gone)
     proc.ipc_pending_msg = null;

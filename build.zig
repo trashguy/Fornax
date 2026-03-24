@@ -2042,6 +2042,34 @@ const touch_bin = b.addExecutable(.{
         }
     }
 
+    // dwmac: DW-GMAC NIC driver from fornax-nics (needs nic module)
+    {
+        const rv_nic_module = b.createModule(.{
+            .root_source_file = b.path("../fornax-nics/lib/nic.zig"),
+            .target = riscv64_freestanding,
+            .optimize = user_optimize,
+            .imports = &.{
+                .{ .name = "fornax", .module = rv_fornax_module },
+            },
+        });
+        const rv_dwmac = b.addExecutable(.{
+            .name = "dwmac",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("../fornax-nics/dwmac/src/main.zig"),
+                .target = riscv64_freestanding,
+                .optimize = user_optimize,
+                .strip = if (user_strip) true else null,
+                .imports = &.{
+                    .{ .name = "fornax", .module = rv_fornax_module },
+                    .{ .name = "nic", .module = rv_nic_module },
+                },
+            }),
+        });
+        rv_dwmac.image_base = user_image_base;
+        rv_disk_bin_buf[rv_disk_bin_count] = rv_dwmac;
+        rv_disk_bin_count += 1;
+    }
+
     const rv_initrd = addInitrdStep(b, mkinitrd, "esp-riscv64", &rv_initrd_bins);
     rv_initrd.step.dependOn(&riscv64_install.step);
 

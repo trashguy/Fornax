@@ -54,6 +54,23 @@ pub fn init() void {
     }
 
     context = board.active.plicSContext(boot.boot_hartid);
+
+    // Clear all interrupt enables left over from U-Boot.
+    // Without this, stale enables (e.g. UART TX-empty, DW-MMC) flood
+    // core 0 with external interrupts that starve the timer.
+    // JH7110 has ~136 interrupt sources; clear 8 regs to cover 0-255.
+    for (0..8) |i| {
+        mmioWrite32(plicAddr(enableBase() + @as(u64, @intCast(i)) * 4), 0);
+    }
+    // Also clear enables for all AP contexts (harts 2-4 S-mode)
+    for (1..5) |hart| {
+        const ap_ctx = hart * 2;
+        const ap_enable_base: u64 = 0x0000_2000 + ap_ctx * 0x80;
+        for (0..8) |i| {
+            mmioWrite32(plicAddr(ap_enable_base + @as(u64, @intCast(i)) * 4), 0);
+        }
+    }
+
     mmioWrite32(plicAddr(thresholdOff()), 0);
     klog.info("PLIC: initialized at ");
     klog.infoHex(plic_base);

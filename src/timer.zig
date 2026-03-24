@@ -151,9 +151,7 @@ fn handleIrq() bool {
 
     // Re-arm timer on riscv64 (per-core — each core's timer is private)
     if (builtin.cpu.arch == .riscv64) {
-        const cpu = @import("arch/riscv64/cpu.zig");
-        const now = cpu.rdtime();
-        cpu.sbiSetTimer(now + clint_interval);
+        rearmRiscvTimer();
     }
 
     // Re-arm timer on aarch64 (per-core — PPI is private to each core)
@@ -192,4 +190,12 @@ fn handleIrq() bool {
     @import("supervisor.zig").timerTick(ticks);
 
     return true;
+}
+
+/// Re-arm the RISC-V timer. Safe to call from any context.
+/// Exported so the scheduler idle loop can use it as a safety net.
+pub fn rearmRiscvTimer() void {
+    const cpu2 = @import("arch/riscv64/cpu.zig");
+    const now = cpu2.rdtime();
+    cpu2.sbiSetTimer(now + clint_interval);
 }

@@ -119,17 +119,25 @@ pub fn enableRxInterrupt() void {
             pic.unmask(4);
         },
         .riscv64 => {
-            const plic = @import("arch/riscv64/plic.zig");
             const interrupts = @import("arch/riscv64/interrupts.zig");
-
-            // Enable "data available" interrupt (IER bit 0)
-            cpu.mmioWrite8(uartAddr(1), 0x01);
 
             // Register PLIC IRQ handler (board-specific: QEMU=10, JH7110=32)
             _ = interrupts.registerIrqHandler(rv_board.active.uart_irq, handleIrq);
 
-            // Enable UART IRQ on PLIC
-            plic.enable(rv_board.active.uart_irq);
+            // On JH7110 (Mars), do NOT enable UART PLIC interrupt.
+            // U-Boot leaves the UART in a state where enabling PLIC IRQ 32
+            // floods core 0 with external interrupts, starving the timer.
+            // UART RX is polled via timer tick instead.
+            if (!rv_board.active.has_pci_ecam) {
+                // Board without PCI = Mars (no UART PLIC enable)
+                // Just enable IER for RX so LSR polling sees data
+                cpu.mmioWrite8(uartAddr(1), 0x01);
+            } else {
+                // QEMU virt: safe to use PLIC interrupt
+                const plic = @import("arch/riscv64/plic.zig");
+                cpu.mmioWrite8(uartAddr(1), 0x01);
+                plic.enable(rv_board.active.uart_irq);
+            }
         },
         .aarch64 => {
             const gic = @import("arch/aarch64/gic.zig");

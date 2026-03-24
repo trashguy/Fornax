@@ -454,7 +454,7 @@ fn opExec(caller: *process.Process, target: *process.Process, elf_ptr: u64, elf_
     target.pages_used = 0;
     target.saved_kernel_rsp = 0; // Force IRETQ path in switchTo
     target.syscall_ret = 0;
-    target.mmap_next = 0x0000_4000_0000_0000;
+    target.mmap_next = mem.MMAP_BASE;
 
     // Clear IPC state (old user buffers are gone)
     target.ipc_pending_msg = null;

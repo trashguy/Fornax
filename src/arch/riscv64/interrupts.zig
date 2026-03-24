@@ -35,15 +35,18 @@ pub fn registerIrqHandler(irq: u8, handler: IrqHandler) bool {
     return false;
 }
 
-/// Direct physical UART write — bypasses serial module entirely.
-/// Uses the physical UART address via identity map, no LSR polling.
-/// Safe to call from trap handlers where the serial module might double-fault.
-fn rawPutChar(c: u8) void {
-    @as(*volatile u8, @ptrFromInt(@as(u64, 0x10000000))).* = c;
+/// Direct UART write — bypasses serial module entirely (no spinlock).
+/// Uses the higher-half kernel address so it works with ANY page table
+/// (user process tables don't have the identity map, but do have higher-half).
+/// Safe to call from trap handlers, switchTo, and interrupt context.
+pub fn rawPutChar(c: u8) void {
+    const mem = @import("../../mem.zig");
+    const base = @as(u64, 0x10000000) +% mem.KERNEL_VIRT_BASE;
+    @as(*volatile u8, @ptrFromInt(base)).* = c;
 }
 
 /// Output a u64 as hex using raw UART writes (no serial module, no LSR polling).
-fn rawHex(val: u64) void {
+pub fn rawHex(val: u64) void {
     rawPutChar('0');
     rawPutChar('x');
     inline for (0..16) |i| {
@@ -71,6 +74,12 @@ inline fn inlineHex(val: u64) void {
 /// Exception handler — called from entry.S for synchronous exceptions.
 /// a0=frame_ptr, a1=scause, a2=stval
 export fn handleExceptionRv(frame_ptr: u64, scause: u64, stval: u64) callconv(.c) void {
+    // Debug: 'E' = exception handler entered (raw UART, no dependencies)
+    rawPutChar('E');
+    rawPutChar('=');
+    rawHex(scause);
+    rawPutChar(' ');
+
     const frame: [*]const u64 = @ptrFromInt(frame_ptr);
 
     // Check if the fault came from user mode (SSTATUS.SPP == 0)
@@ -194,12 +203,15 @@ export fn handleExceptionRv(frame_ptr: u64, scause: u64, stval: u64) callconv(.c
 /// a0=scause (with bit 63 set), a1=frame_ptr
 export fn handleInterruptRv(scause: u64, frame_ptr: u64) callconv(.c) void {
     _ = frame_ptr;
+
+
     // Increment per-core interrupt counter
     {
         const percpu = @import("../../percpu.zig");
         const core_id = percpu.getCoreId();
         percpu.percpu_array[core_id].interrupts += 1;
     }
+
     const cause = scause & ~cpu.SCAUSE_INT_BIT;
     @import("../../trace.zig").trace(.irq_enter, @truncate(cause));
 
@@ -226,8 +238,9 @@ export fn handleInterruptRv(scause: u64, frame_ptr: u64) callconv(.c) void {
                     _ = handler();
                 }
             }
-            // Clear timer interrupt pending (will be re-armed by timer handler)
-            cpu.csrClear(cpu.CSR_SIP, cpu.SIE_STIE);
+            // Note: sbiSetTimer already clears STIP as a side effect.
+            // Do NOT csrClear SIP here — on some implementations the
+            // SIE_STIE constant (bit 5) could alias the wrong CSR field.
         },
         9 => {
             // Supervisor external interrupt (PLIC)

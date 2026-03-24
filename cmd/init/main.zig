@@ -280,6 +280,38 @@ fn spawnGpud() void {
     _ = fx.close(pair.client_fd);
 }
 
+/// Spawn dwmac: userspace DW-GMAC NIC driver at /dev/ether0 (Milk-V Mars).
+/// Must be called before spawnNetd() so that /dev/ether0 is available.
+fn spawnDwmac() void {
+    const dwmac_elf = loadBin("dwmac") orelse return; // not present = skip
+
+    const pair = fx.ipc_pair();
+    if (pair.err < 0) return;
+
+    // Mount client end at /dev/ether0 FIRST (before spawning)
+    // so it's available when spawnNetd() opens it
+    const rc = fx.mount(pair.client_fd, "/dev/ether0", 0);
+    if (rc < 0) {
+        _ = fx.close(pair.server_fd);
+        _ = fx.close(pair.client_fd);
+        return;
+    }
+
+    const mappings = [_]fx.FdMapping{
+        .{ .parent_fd = @intCast(pair.server_fd), .child_fd = 3 },
+    };
+    const pid = fx.spawn(dwmac_elf, &mappings, null);
+    if (pid < 0) {
+        _ = fx.close(pair.server_fd);
+        _ = fx.close(pair.client_fd);
+        return;
+    }
+    out.puts("init: dwmac at /dev/ether0\n");
+
+    _ = fx.close(pair.server_fd);
+    _ = fx.close(pair.client_fd);
+}
+
 /// Discover and register optional supervised services from /bin/.
 /// Called after filesystem is mounted. Services installed via `fay install`
 /// (e.g. fornax-sys) are picked up here without needing a rebuild.
@@ -316,19 +348,11 @@ export fn _start() noreturn {
         _ = fx.close(shadow_fd);
     }
 
-    // Spawn bridge (optional, for container networking)
-    spawnBridge();
-
     // Register optional services discovered on disk (e.g. after fay install)
     startOptionalServices();
 
-    // Spawn netd (userspace network server)
-    spawnNetd();
-
-    // Spawn crond (cron daemon)
+    // Spawn crond (cron daemon) and gpud (GPU server) — non-blocking
     spawnCrond();
-
-    // Spawn gpud (GPU server)
     spawnGpud();
 
     // Determine how many VTs to use (/etc/vts overrides default)
@@ -362,6 +386,12 @@ export fn _start() noreturn {
         spawnLogin(i);
         vt_last_spawn[i] = now;
     }
+
+    // Spawn network services AFTER login — dwmac PHY init may block
+    // spawnNetd() for several seconds, so login must be available first.
+    spawnBridge();
+    spawnDwmac();
+    spawnNetd();
 
     // Respawn loop: when any child exits, check which VT lost its login
     while (true) {

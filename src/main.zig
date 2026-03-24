@@ -134,7 +134,6 @@ pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize, rsdp: ?[*]const
         const apic = @import("arch/x86_64/apic.zig");
         apic.init(rsdp);
     } else if (builtin.cpu.arch == .riscv64) {
-        // riscv64: Start secondary harts via SBI HSM
         const smp = @import("arch/riscv64/smp.zig");
         smp.init();
     } else if (builtin.cpu.arch == .aarch64) {
@@ -305,6 +304,9 @@ fn spawnPartfs() void {
         proc.state = .dead;
         return;
     };
+    // JH7110: clear identity map entries to prevent TLB conflicts
+    // with user code at 0x40000000 (overlaps identity-mapped RAM)
+    if (@import("builtin").cpu.arch == .riscv64) paging.clearIdentityMap(proc.pml4.?);
 
     proc.user_rip = load_result.entry_point;
     proc.brk = load_result.brk;
@@ -386,6 +388,38 @@ fn spawnPartfs() void {
     klog.info(")\n");
 }
 
+/// Scan known LBA offsets for an FXFS superblock ("FXFS0001" at byte 0).
+/// Used when GPT parsing fails (e.g. Mars SD card without protective MBR).
+fn scanFxfsSuperblock(blk_mod: anytype) ?u64 {
+    const FXFS_MAGIC = "FXFS0001";
+    // Known offsets: Mars SD layout (LBA 20480), common defaults
+    const probe_lbas = [_]u64{ 20480, 2048, 8192, 0 };
+    var buf: [4096]u8 = undefined;
+
+    for (probe_lbas) |lba| {
+        const block = (lba * 512) / 4096;
+        const off_in_block: usize = @intCast((lba * 512) % 4096);
+        if (blk_mod.readBlock(block, &buf)) {
+            if (off_in_block + 8 <= 4096 and
+                buf[off_in_block] == FXFS_MAGIC[0] and
+                buf[off_in_block + 1] == FXFS_MAGIC[1] and
+                buf[off_in_block + 2] == FXFS_MAGIC[2] and
+                buf[off_in_block + 3] == FXFS_MAGIC[3] and
+                buf[off_in_block + 4] == FXFS_MAGIC[4] and
+                buf[off_in_block + 5] == FXFS_MAGIC[5] and
+                buf[off_in_block + 6] == FXFS_MAGIC[6] and
+                buf[off_in_block + 7] == FXFS_MAGIC[7])
+            {
+                klog.info("fxfs: found superblock at LBA ");
+                klog.infoDec(lba);
+                klog.info("\n");
+                return lba * 512;
+            }
+        }
+    }
+    return null;
+}
+
 fn spawnFxfs() void {
     // Only spawn fxfs if a block device is available
     if (!@import("blk.zig").isInitialized()) return;
@@ -405,6 +439,7 @@ fn spawnFxfs() void {
         proc.state = .dead;
         return;
     };
+    if (@import("builtin").cpu.arch == .riscv64) paging.clearIdentityMap(proc.pml4.?);
 
     proc.user_rip = load_result.entry_point;
     proc.brk = load_result.brk;
@@ -438,6 +473,7 @@ fn spawnFxfs() void {
     proc.setFd(3, chan.server, true);
 
     // Block device as fd 4 (with partition offset if GPT detected)
+    const blk_mod = @import("blk.zig");
     const gpt = @import("gpt.zig");
     if (gpt.isInitialized() and gpt.getPartitionCount() > 0) {
         const part = gpt.getPartition(0).?;
@@ -453,6 +489,19 @@ fn spawnFxfs() void {
         klog.debug("[fxfs: using partition 1 at LBA ");
         klog.debugDec(part.first_lba);
         klog.debug("]\n");
+    } else if (scanFxfsSuperblock(blk_mod)) |offset| {
+        // GPT failed — scan for FXFS magic at known LBA offsets
+        proc.fds[4] = .{
+            .fd_type = .blk,
+            .channel_id = 0,
+            .is_server = false,
+            .read_offset = 0,
+            .server_handle = 0,
+            .blk_offset = offset,
+        };
+        klog.info("[fxfs: superblock found at byte offset ");
+        klog.infoDec(offset);
+        klog.info("]\n");
     } else {
         // Fallback: whole disk (backward compatible with unpartitioned disks)
         proc.fds[4] = .{
@@ -597,6 +646,7 @@ fn spawnInit() void {
         proc.state = .dead;
         return;
     };
+    if (@import("builtin").cpu.arch == .riscv64) paging.clearIdentityMap(proc.pml4.?);
 
     proc.user_rip = load_result.entry_point;
     proc.brk = load_result.brk;

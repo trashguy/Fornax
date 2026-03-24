@@ -199,7 +199,7 @@ pub const Process = struct {
     /// Bitmap of cores that have run this process (for TLB shootdown).
     cores_ran_on: u128 = 0,
     /// Next virtual address for anonymous mmap allocations.
-    mmap_next: u64 = 0x0000_4000_0000_0000,
+    mmap_next: u64 = mem.MMAP_BASE,
     /// Saved FS_BASE MSR value (for TLS, used by musl libc).
     fs_base: u64 = 0,
     /// Thread group pointer (non-null for threads sharing an address space).
@@ -539,6 +539,13 @@ pub fn create() ?*Process {
         break :blk p;
     } orelse return null;
 
+    // Flush stale TLB entries for this slot's ASID before reuse.
+    // On riscv64 with ASID support, the old process's TLB entries may
+    // still be cached under this ASID on any core.
+    if (@import("builtin").cpu.arch == .riscv64 and paging.hasAsidSupport()) {
+        cpu.sfenceVmaAsid(getAsid(proc));
+    }
+
     // Free deferred kernel stack from previous incarnation
     if (proc.needs_stack_free) {
         freeKernelStack(proc);
@@ -596,7 +603,7 @@ pub fn create() ?*Process {
     proc.thread_group = null;
     proc.ctid_ptr = 0;
     proc.fs_base = 0;
-    proc.mmap_next = 0x0000_4000_0000_0000;
+    proc.mmap_next = mem.MMAP_BASE;
     proc.group_id = 0xFF; // host (not in any group)
     proc.compat = 0; // native Fornax
     proc.name = .{0} ** 16;
@@ -672,6 +679,11 @@ pub fn createThread(parent: *Process) ?*Process {
         p.state = .blocked;
         break :blk p;
     } orelse return null;
+
+    // Flush stale TLB entries for this slot's ASID before reuse
+    if (@import("builtin").cpu.arch == .riscv64 and paging.hasAsidSupport()) {
+        cpu.sfenceVmaAsid(getAsid(proc));
+    }
 
     // Free deferred kernel stack from previous incarnation
     if (proc.needs_stack_free) {
@@ -780,6 +792,11 @@ pub fn procIndex(proc: *const Process) u16 {
     return @intCast((@intFromPtr(proc) - @intFromPtr(&processes[0])) / @sizeOf(Process));
 }
 
+/// Get the ASID for a process (slot_index + 1). ASID 0 = kernel.
+pub fn getAsid(proc: *const Process) u16 {
+    return procIndex(proc) + 1;
+}
+
 /// Mark a process as ready and enqueue it on its assigned core's run queue.
 /// Uses CAS to prevent double-push on SMP: only blocked→ready and running→ready
 /// transitions actually enqueue. Already-ready or terminal processes are skipped.
@@ -850,7 +867,11 @@ pub fn tlbShootdown(proc: *const Process) void {
             if (arch == .x86_64) {
                 @import("arch/x86_64/cpu.zig").flushTlb();
             } else if (arch == .riscv64) {
-                cpu.sfenceVma();
+                if (paging.hasAsidSupport()) {
+                    cpu.sfenceVmaAsid(getAsid(proc));
+                } else {
+                    cpu.sfenceVma();
+                }
             } else if (arch == .aarch64) {
                 @import("arch/aarch64/cpu.zig").flushTlb();
             }
@@ -1059,6 +1080,17 @@ fn scheduleNextImpl() noreturn {
             // Atomically claim: CAS .ready → .running ensures only one core
             // can schedule a given process, preventing double-scheduling on SMP.
             if (@cmpxchgStrong(ProcessState, &proc.state, .ready, .running, .seq_cst, .seq_cst) == null) {
+                // U74 (JH7110) workaround: after SATP write + sfence.vma, the U74
+                // needs additional time for the i-TLB invalidation to propagate.
+                // Poll the UART LSR register in a loop — each MMIO read forces a
+                // device memory access that drains the store buffer and pipeline.
+                if (@import("builtin").cpu.arch == .riscv64) {
+                    const lsr = @as(u64, 0x10000005) +% mem.KERNEL_VIRT_BASE;
+                    var i: u32 = 0;
+                    while (i < 32) : (i += 1) {
+                        _ = @as(*volatile u8, @ptrFromInt(lsr)).*;
+                    }
+                }
                 switchTo(proc);
             }
             // If CAS failed, process is no longer ready (killed, already claimed,
@@ -1110,6 +1142,9 @@ fn scheduleNextImpl() noreturn {
             percpu.percpu_array[my_core].idle_ticks +%= 1;
             switch (@import("builtin").cpu.arch) {
                 .riscv64 => {
+                    // Safety net: re-arm timer before WFI in case the
+                    // interrupt handler's re-arm was lost.
+                    @import("timer.zig").rearmRiscvTimer();
                     asm volatile ("csrsi sstatus, 0x2"); // SIE=1
                     asm volatile ("wfi");
                     asm volatile ("csrci sstatus, 0x2"); // SIE=0
@@ -1240,7 +1275,11 @@ fn switchTo(proc: *Process) noreturn {
 
     // Switch address space
     if (proc.pml4) |pml4| {
-        paging.switchAddressSpace(pml4);
+        if (@import("builtin").cpu.arch == .riscv64) {
+            paging.switchAddressSpace(pml4, getAsid(proc));
+        } else {
+            paging.switchAddressSpace(pml4);
+        }
     }
 
     // Restore TLS register for musl libc errno, etc.
@@ -1535,10 +1574,12 @@ fn switchTo(proc: *Process) noreturn {
         proc.pending_op = .none;
     }
 
-    if (proc.saved_kernel_rsp != 0) {        // Resume from blocked syscall: the process's kernel stack still has
+    // Acquire load ensures we see the frame contents stored by the core
+    // that set up saved_kernel_rsp (e.g., clone's atomic release store).
+    const saved_ksp = @atomicLoad(u64, &proc.saved_kernel_rsp, .acquire);
+    if (saved_ksp != 0) {        // Resume from blocked syscall: the process's kernel stack still has
         // the full GPR frame from entry.S. Write the return value into the
         // saved return register slot and jump to the restore/return path.
-        const saved_ksp = proc.saved_kernel_rsp;
         const frame: [*]u64 = @ptrFromInt(saved_ksp);
 
         frame[RET_SLOT] = proc.syscall_ret;
@@ -1547,7 +1588,8 @@ fn switchTo(proc: *Process) noreturn {
         if (@import("builtin").cpu.arch == .riscv64 and proc.fs_base != 0) {
             frame[3] = proc.fs_base;
         }
-        proc.saved_kernel_rsp = 0;
+
+        @atomicStore(u64, &proc.saved_kernel_rsp, 0, .release);
         syscall_entry.resume_from_kernel_frame(@intFromPtr(frame));
     } else {
         // First run (no saved kernel frame) — use IRETQ/SRET path

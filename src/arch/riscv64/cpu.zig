@@ -160,11 +160,11 @@ pub fn mmioWrite32(addr: u64, val: u32) void {
 
 // ── SBI calls (ecall from S-mode to M-mode/SBI firmware) ─────────────
 /// SBI set_timer — programs the next timer interrupt.
+/// Uses legacy SBI call (EID=0) for maximum compatibility with JH7110 OpenSBI.
 pub fn sbiSetTimer(stime_value: u64) void {
     asm volatile ("ecall"
         :
-        : [a7] "{a7}" (@as(u64, 0x54494D45)), // SBI extension: TIME
-          [a6] "{a6}" (@as(u64, 0)), // function: set_timer
+        : [a7] "{a7}" (@as(u64, 0)), // Legacy SBI: set_timer
           [a0] "{a0}" (stime_value),
         : .{ .memory = true }
     );
@@ -294,4 +294,15 @@ pub const SCAUSE_S_SOFT: u64 = SCAUSE_INT_BIT | 1;
 /// Full TLB flush (all ASIDs, all addresses).
 pub inline fn sfenceVma() void {
     asm volatile ("sfence.vma" ::: .{ .memory = true });
+}
+
+/// ASID-targeted TLB flush: invalidate all entries for a specific ASID.
+/// sfence.vma zero, rs2 — address=0 (all), ASID=asid.
+pub inline fn sfenceVmaAsid(asid: u16) void {
+    const asid_val: u64 = asid;
+    asm volatile ("sfence.vma zero, %[asid]"
+        :
+        : [asid] "r" (asid_val),
+        : .{ .memory = true }
+    );
 }

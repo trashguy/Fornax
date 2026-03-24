@@ -284,7 +284,7 @@ pub fn sysOpen(path_ptr: u64, path_len: u64) u64 {
         if (strEql(path_slice, "/dev/cpu")) {
             return proc.allocDevFd(.dev_cpu) orelse return EMFILE;
         }
-        if (strEql(path_slice, "/dev/ether0")) {
+        if (strEql(path_slice, "/dev/ether0") and @import("../net.zig").isInitialized()) {
             const ether_mod = @import("../ether.zig");
             const client_idx = ether_mod.allocClient() orelse return EMFILE;
             const fd_num = proc.allocDevFd(.dev_ether) orelse {

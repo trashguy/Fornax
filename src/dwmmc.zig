@@ -66,6 +66,13 @@ const CTRL_RESET: u32 = 1 << 0;
 const CTRL_FIFO_RESET: u32 = 1 << 1;
 const CTRL_DMA_RESET: u32 = 1 << 2;
 const CTRL_INT_ENABLE: u32 = 1 << 4;
+const CTRL_DMA_ENABLE: u32 = 1 << 5;
+const CTRL_USE_IDMAC: u32 = 1 << 25;
+
+// BMOD (Bus Mode) register — controls IDMAC
+const BMOD: u32 = 0x080;
+const BMOD_DE: u32 = 1 << 7; // DMA enable
+const BMOD_SWR: u32 = 1 << 0; // software reset
 
 // CMD bits
 const CMD_START: u32 = 1 << 31;
@@ -137,8 +144,16 @@ fn reg32(offset: u32) u32 {
     return @as(*volatile u32, @ptrFromInt(addr(offset))).*;
 }
 
+fn reg64(offset: u32) u64 {
+    return @as(*volatile u64, @ptrFromInt(addr(offset))).*;
+}
+
 fn wreg32(offset: u32, val: u32) void {
     @as(*volatile u32, @ptrFromInt(addr(offset))).* = val;
+}
+
+fn wreg64(offset: u32, val: u64) void {
+    @as(*volatile u64, @ptrFromInt(addr(offset))).* = val;
 }
 
 // ── Internal helpers ───────────────────────────────────────────────────
@@ -329,7 +344,9 @@ fn dumpUbootState(base: u64, name: []const u8) void {
     klog.info("\n");
 }
 
-/// Try soft init: use U-Boot's clock/controller config, just re-idle the card.
+/// Try soft init: keep U-Boot's controller AND card state entirely intact.
+/// Don't re-initialize the card — just verify it's responsive and do a
+/// test read. U-Boot already completed identification + selection.
 fn trySoftInit(base: u64, name: []const u8) bool {
     mmc_base = base;
 
@@ -338,43 +355,31 @@ fn trySoftInit(base: u64, name: []const u8) bool {
 
     klog.info("dwmmc: ");
     klog.info(name);
-    klog.info(" trying soft init (no reset)...\n");
+    klog.info(" trying soft init...\n");
 
-    // Reset card state only — clear pending interrupts, FIFO
-    wreg32(RINTSTS, 0xFFFFFFFF);
+    // Disable IDMAC — U-Boot uses DMA mode; we use polled FIFO.
+    wreg32(BMOD, 0); // clear BMOD.DE (DMA enable)
+    wreg32(CTRL, (reg32(CTRL) & ~(CTRL_DMA_ENABLE | CTRL_USE_IDMAC)) | CTRL_INT_ENABLE);
+
+    // Reset FIFO to flush any stale DMA data, clear interrupts
     resetFifo();
+    wreg32(RINTSTS, 0xFFFFFFFF);
 
-    // Ensure CTRL has INT_ENABLE
-    wreg32(CTRL, reg32(CTRL) | CTRL_INT_ENABLE);
+    // U-Boot leaves the card selected in transfer state (tran) with SDHC
+    // addressing. Don't send CMD0 — that resets the card to idle and
+    // requires a full re-identification sequence.
+    card_sdhc = true; // Mars SD cards are always SDHC
+    card_rca = 0; // not needed — card is already selected by U-Boot
 
-    // Send CMD0 to idle the card (use existing clock)
-    delayMs(5);
-    _ = sendCmd(SD_CMD0_GO_IDLE, 0, CMD_INIT);
-    delayMs(5);
-    if (!sendCmd(SD_CMD0_GO_IDLE, 0, CMD_INIT)) {
-        klog.warn("dwmmc: soft CMD0 failed\n");
-        return false;
-    }
-    delayMs(2);
-
-    // Try CMD8
-    if (!sendCmd(SD_CMD8_SEND_IF_COND, 0x1AA, CMD_RESP_EXPECTED | CMD_CHECK_RESP_CRC)) {
-        klog.warn("dwmmc: soft CMD8 failed\n");
-        return false;
-    }
-    klog.info("dwmmc: soft CMD8 OK!\n");
-
-    // Continue with full card init from ACMD41 onward
-    card_rca = 0;
-    card_sdhc = false;
-
-    const r7 = reg32(RESP0);
-    if ((r7 & 0xFF) != 0xAA) {
-        klog.err("dwmmc: CMD8 bad pattern\n");
+    // Verify with a test read of block 0
+    var test_buf: [4096]u8 = undefined;
+    if (!readBlockInternal(0, &test_buf)) {
+        klog.warn("dwmmc: soft init test read failed\n");
         return false;
     }
 
-    return finishCardInit();
+    klog.info("dwmmc: soft init OK (U-Boot state preserved)\n");
+    return true;
 }
 
 /// Card init from ACMD41 onward (shared between soft and hard init paths).
@@ -482,31 +487,42 @@ pub fn isInitialized() bool {
 /// Read a 4096-byte (8-sector) block. block is a 4K-block number.
 pub fn readBlock(block: u64, buf: *[4096]u8) bool {
     if (!initialized) return false;
+    return readBlockInternal(block, buf);
+}
 
+fn readBlockInternal(block: u64, buf: *[4096]u8) bool {
+    const base_sector = block * SECTORS_PER_BLOCK;
+
+    // Read 8 × 512-byte sectors using CMD17 (single-block read).
+    // Avoids CMD18 multi-block + auto CMD12 which has timing issues
+    // on JH7110's DW-MMC controller after the first transaction.
+    var s: u64 = 0;
+    while (s < SECTORS_PER_BLOCK) : (s += 1) {
+        if (!readSector(base_sector + s, buf[@intCast(s * 512)..][0..512])) return false;
+    }
+    return true;
+}
+
+/// Read a single 512-byte sector via CMD17 (READ_SINGLE_BLOCK).
+fn readSector(sector: u64, buf: *[512]u8) bool {
     resetFifo();
 
-    const sector = block * SECTORS_PER_BLOCK;
     const card_addr: u32 = if (card_sdhc)
-        @intCast(sector) // SDHC: block address
+        @intCast(sector)
     else
-        @intCast(sector * 512); // SD: byte address
+        @intCast(sector * 512);
 
-    // Set up for 4096-byte transfer (8 sectors of 512)
     wreg32(BLKSIZ, 512);
-    wreg32(BYTCNT, 4096);
-
-    // Clear interrupts
+    wreg32(BYTCNT, 512);
     wreg32(RINTSTS, 0xFFFFFFFF);
 
-    // CMD18: READ_MULTIPLE_BLOCK (CMD_SEND_STOP → auto CMD12 after BYTCNT bytes)
-    if (!sendCmd(SD_CMD18_READ_MULTI, card_addr, CMD_RESP_EXPECTED | CMD_CHECK_RESP_CRC | CMD_DATA_EXPECTED | CMD_SEND_STOP)) {
+    if (!sendCmd(SD_CMD17_READ_SINGLE, card_addr, CMD_RESP_EXPECTED | CMD_CHECK_RESP_CRC | CMD_DATA_EXPECTED)) {
         return false;
     }
 
-    // Read data from FIFO — 1024 × 32-bit words = 4096 bytes
+    // Read 128 × 32-bit words = 512 bytes from FIFO
     var offset: usize = 0;
-    while (offset < 4096) {
-        // Wait for data available in FIFO
+    while (offset < 512) {
         var timeout: u32 = 500_000;
         while (timeout > 0) : (timeout -= 1) {
             const sts = reg32(RINTSTS);
@@ -523,32 +539,33 @@ pub fn readBlock(block: u64, buf: *[4096]u8) bool {
             return false;
         }
 
-        // Drain available FIFO entries
-        while (offset < 4096) {
+        while (offset < 512) {
             if ((reg32(STATUS) & STATUS_FIFO_EMPTY) != 0) break;
             const word = reg32(DATA);
             const dst: *align(1) u32 = @ptrCast(buf[offset..][0..4]);
             dst.* = word;
             offset += 4;
         }
-
-        // Clear RXDR so we get another watermark interrupt
         wreg32(RINTSTS, INT_RXDR);
     }
 
-    // Wait for data transfer complete + auto-stop done
+    // Wait for transfer complete
     var done_timeout: u32 = 500_000;
     while (done_timeout > 0) : (done_timeout -= 1) {
         if ((reg32(RINTSTS) & INT_DATA_OVER) != 0) break;
     }
-    wreg32(RINTSTS, 0xFFFFFFFF);
 
-    // Wait for card not busy after auto CMD12
+    // Wait for card not busy + controller idle
     var busy_timeout: u32 = 500_000;
     while (busy_timeout > 0) : (busy_timeout -= 1) {
         if ((reg32(STATUS) & STATUS_DATA_BUSY) == 0) break;
     }
+    var cmd_timeout: u32 = 500_000;
+    while (cmd_timeout > 0) : (cmd_timeout -= 1) {
+        if ((reg32(CMD) & CMD_START) == 0) break;
+    }
 
+    wreg32(RINTSTS, 0xFFFFFFFF);
     return true;
 }
 
@@ -556,27 +573,36 @@ pub fn readBlock(block: u64, buf: *[4096]u8) bool {
 pub fn writeBlock(block: u64, buf: *const [4096]u8) bool {
     if (!initialized) return false;
 
+    const base_sector = block * SECTORS_PER_BLOCK;
+
+    // Write 8 × 512-byte sectors using CMD24 (single-block write).
+    var s: u64 = 0;
+    while (s < SECTORS_PER_BLOCK) : (s += 1) {
+        const src: *const [512]u8 = @ptrCast(buf[@intCast(s * 512)..][0..512]);
+        if (!writeSector(base_sector + s, src)) return false;
+    }
+    return true;
+}
+
+/// Write a single 512-byte sector via CMD24 (WRITE_SINGLE_BLOCK).
+fn writeSector(sector: u64, buf: *const [512]u8) bool {
     resetFifo();
 
-    const sector = block * SECTORS_PER_BLOCK;
     const card_addr: u32 = if (card_sdhc)
         @intCast(sector)
     else
         @intCast(sector * 512);
 
     wreg32(BLKSIZ, 512);
-    wreg32(BYTCNT, 4096);
-
+    wreg32(BYTCNT, 512);
     wreg32(RINTSTS, 0xFFFFFFFF);
 
-    // CMD25: WRITE_MULTIPLE_BLOCK (CMD_SEND_STOP → auto CMD12)
-    if (!sendCmd(SD_CMD25_WRITE_MULTI, card_addr, CMD_RESP_EXPECTED | CMD_CHECK_RESP_CRC | CMD_DATA_EXPECTED | CMD_WRITE | CMD_SEND_STOP)) {
+    if (!sendCmd(SD_CMD24_WRITE_SINGLE, card_addr, CMD_RESP_EXPECTED | CMD_CHECK_RESP_CRC | CMD_DATA_EXPECTED | CMD_WRITE)) {
         return false;
     }
 
-    // Write data to FIFO
     var offset: usize = 0;
-    while (offset < 4096) {
+    while (offset < 512) {
         var timeout: u32 = 500_000;
         while (timeout > 0) : (timeout -= 1) {
             const sts = reg32(RINTSTS);
@@ -593,29 +619,30 @@ pub fn writeBlock(block: u64, buf: *const [4096]u8) bool {
             return false;
         }
 
-        while (offset < 4096) {
+        while (offset < 512) {
             if ((reg32(STATUS) & STATUS_FIFO_FULL) != 0) break;
             const src: *align(1) const u32 = @ptrCast(buf[offset..][0..4]);
             wreg32(DATA, src.*);
             offset += 4;
         }
-
         wreg32(RINTSTS, INT_TXDR);
     }
 
-    // Wait for data transfer complete + auto-stop
     var done_timeout: u32 = 500_000;
     while (done_timeout > 0) : (done_timeout -= 1) {
         if ((reg32(RINTSTS) & INT_DATA_OVER) != 0) break;
     }
-    wreg32(RINTSTS, 0xFFFFFFFF);
 
-    // Wait for card not busy after auto CMD12
     var busy_timeout: u32 = 1_000_000;
     while (busy_timeout > 0) : (busy_timeout -= 1) {
         if ((reg32(STATUS) & STATUS_DATA_BUSY) == 0) break;
     }
+    var cmd_timeout: u32 = 500_000;
+    while (cmd_timeout > 0) : (cmd_timeout -= 1) {
+        if ((reg32(CMD) & CMD_START) == 0) break;
+    }
 
+    wreg32(RINTSTS, 0xFFFFFFFF);
     return true;
 }
 

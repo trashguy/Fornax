@@ -266,17 +266,20 @@ def interrupt_uboot(ser, timeout=30):
     Returns (success, ser) — ser may be a new object after reconnect."""
     print("[boot] Waiting for U-Boot prompt (press reset on Mars if needed)...")
     deadline = time.monotonic() + timeout
+    buf = b""
+    saw_countdown = False
     while time.monotonic() < deadline:
         if not serial_ok(ser):
             ser = serial_reconnect(ser)
             deadline = time.monotonic() + timeout  # reset timeout after reconnect
+            buf = b""
 
         try:
             ser.write(b" ")
             ser.flush()
         except (OSError, serial.SerialException):
             continue
-        time.sleep(0.1)
+        time.sleep(0.05)
 
         try:
             if not ser.in_waiting:
@@ -287,19 +290,18 @@ def interrupt_uboot(ser, timeout=30):
 
         sys.stdout.buffer.write(chunk)
         sys.stdout.buffer.flush()
-        # Check for any U-Boot prompt variant
-        if (UBOOT_PROMPT in chunk or UBOOT_PROMPT_ALT in chunk or
-                b"Hit any key" in chunk or b"autoboot" in chunk):
-            # Keep spamming briefly to ensure we caught it
-            for _ in range(10):
-                try:
-                    ser.write(b" ")
-                    ser.flush()
-                except (OSError, serial.SerialException):
-                    break
-                time.sleep(0.05)
-            # Drain and check for prompt
-            time.sleep(0.3)
+        buf += chunk
+        # Keep buf from growing unbounded
+        if len(buf) > 8192:
+            buf = buf[-4096:]
+
+        if b"Hit any key" in chunk or b"autoboot" in chunk:
+            saw_countdown = True
+
+        # Only declare success when we see an actual U-Boot prompt
+        if UBOOT_PROMPT in buf or UBOOT_PROMPT_ALT in buf:
+            # Drain any remaining output
+            time.sleep(0.2)
             try:
                 if ser.in_waiting:
                     rest = ser.read(ser.in_waiting)
@@ -307,16 +309,27 @@ def interrupt_uboot(ser, timeout=30):
                     sys.stdout.buffer.flush()
             except (OSError, serial.SerialException):
                 pass
-            print("\n[boot] U-Boot prompt detected")
+            print("\n[boot] U-Boot prompt confirmed")
             return True, ser
 
+    if saw_countdown:
+        print("\n[boot] Saw countdown but never got prompt — boot may have continued")
     print("\n[boot] Timeout waiting for U-Boot")
     return False, ser
 
 
+class RestartRequested(Exception):
+    """Raised when Ctrl-R is pressed in the interactive console."""
+    pass
+
+
 def interactive_console(ser, logfile=None, reconnect=False):
-    """Pass-through serial console with raw terminal input."""
-    print("[console] Interactive serial console (Ctrl-D or Ctrl-] to exit)")
+    """Pass-through serial console with raw terminal input.
+
+    Returns normally on Ctrl-D / Ctrl-].
+    Raises RestartRequested on Ctrl-R (rebuild + reinstall cycle).
+    """
+    print("[console] Interactive serial console (Ctrl-D or Ctrl-] to exit, Ctrl-R to rebuild+reinstall)")
 
     old_settings = termios.tcgetattr(sys.stdin)
     try:
@@ -346,6 +359,8 @@ def interactive_console(ser, logfile=None, reconnect=False):
                     ch = os.read(sys.stdin.fileno(), 1)
                     if not ch or ch in (b"\x04", b"\x1d"):  # EOF, Ctrl-D, Ctrl-]
                         return
+                    if ch == b"\x12":  # Ctrl-R
+                        raise RestartRequested()
                     try:
                         ser.write(ch)
                         ser.flush()
@@ -579,7 +594,34 @@ def main():
                         help="Log all serial output to file")
     args = parser.parse_args()
 
-    logfile = open(args.log, "wb") if args.log else None
+    # Always log to boot.log (overwritten each install/restart); --log adds a second file
+    boot_log_path = os.path.join(PROJECT_DIR, "boot.log")
+    boot_log = open(boot_log_path, "wb")
+    extra_log = open(args.log, "wb") if args.log else None
+
+    class MultiLog:
+        """Write to boot.log (always) + optional extra log file."""
+        def write(self, data):
+            boot_log.write(data)
+            boot_log.flush()
+            if extra_log:
+                extra_log.write(data)
+                extra_log.flush()
+        def flush(self):
+            boot_log.flush()
+            if extra_log:
+                extra_log.flush()
+        def close(self):
+            boot_log.close()
+            if extra_log:
+                extra_log.close()
+        def reopen(self):
+            """Truncate boot.log for a fresh restart cycle."""
+            nonlocal boot_log
+            boot_log.close()
+            boot_log = open(boot_log_path, "wb")
+
+    logfile = MultiLog()
     host_ip = args.ip or detect_host_ip()
 
     # If --mars-ip not given, derive one on the same /24 as host
@@ -617,135 +659,178 @@ def main():
 
     # ── Install mode ───────────────────────────────────────────────
     if args.install:
-        # Build mkfxfs host tool
-        print("[build] zig build mkfxfs")
-        result = subprocess.run(["zig", "build", "mkfxfs"], cwd=PROJECT_DIR)
-        if result.returncode != 0:
-            print("[error] mkfxfs build failed")
-            sys.exit(1)
+        ser = None
+        tftp = None
 
-        # Build SD card image
-        mkfxfs_bin = os.path.join(PROJECT_DIR, "zig-out", "bin", "mkfxfs")
-        initrd_path = os.path.join(PROJECT_DIR, "zig-out", "esp-riscv64", "INITRD")
-        rootfs_dir = os.path.join(PROJECT_DIR, "zig-out", "rootfs-riscv64")
+        def do_install(ser_in):
+            """Build image, TFTP to Mars, write to SD card, boot.
 
-        for p, desc in [(kernel_bin, "kernel"), (initrd_path, "INITRD"),
-                         (rootfs_dir, "rootfs"), (mkfxfs_bin, "mkfxfs")]:
-            if not os.path.exists(p):
-                print(f"[error] {desc} not found: {p}")
+            Returns (ser, tftp) for reuse on restart.
+            """
+            nonlocal args, host_ip, logfile, kernel_bin
+
+            # Build mkfxfs host tool
+            print("[build] zig build mkfxfs")
+            result = subprocess.run(["zig", "build", "mkfxfs"], cwd=PROJECT_DIR)
+            if result.returncode != 0:
+                print("[error] mkfxfs build failed")
                 sys.exit(1)
 
-        img_path, total_sectors, kern_sectors, initrd_sectors = build_sdimg(
-            kernel_bin, initrd_path, rootfs_dir, mkfxfs_bin)
+            # Rebuild kernel + userspace (picks up code changes)
+            print(f"[build] zig build riscv64 -Dboard=milkv_mars")
+            result = subprocess.run(
+                ["zig", "build", "riscv64", "-Dboard=milkv_mars"],
+                cwd=PROJECT_DIR)
+            if result.returncode != 0:
+                print("[build] FAILED")
+                sys.exit(1)
 
-        img_size = os.path.getsize(img_path)
-        print(f"[install] Image ready: {img_path} ({img_size // (1024*1024)} MiB)")
+            # Re-convert ELF to raw binary (kernel may have changed)
+            subprocess.run(
+                ["llvm-objcopy", "-O", "binary", args.kernel, kernel_bin],
+                check=True)
 
-        # Start TFTP server for the SD image
-        tftp = TftpServer(img_path, port=args.tftp_port)
-        tftp.start()
-        time.sleep(0.2)
+            # Build SD card image
+            mkfxfs_bin = os.path.join(PROJECT_DIR, "zig-out", "bin", "mkfxfs")
+            initrd_path = os.path.join(PROJECT_DIR, "zig-out", "esp-riscv64", "INITRD")
+            rootfs_dir = os.path.join(PROJECT_DIR, "zig-out", "rootfs-riscv64")
 
-        # Connect serial
-        try:
-            ser = serial.Serial(args.port, args.baud, timeout=0.1, dsrdtr=True)
-            ser.dtr = False
-        except serial.SerialException as e:
-            print(f"[error] Cannot open {args.port}: {e}")
-            tftp.stop()
-            sys.exit(1)
-        print(f"[serial] Connected to {args.port} at {args.baud}")
+            for p, desc in [(kernel_bin, "kernel"), (initrd_path, "INITRD"),
+                             (rootfs_dir, "rootfs"), (mkfxfs_bin, "mkfxfs")]:
+                if not os.path.exists(p):
+                    print(f"[error] {desc} not found: {p}")
+                    sys.exit(1)
 
-        # Interrupt U-Boot
-        ok, ser = interrupt_uboot(ser, timeout=60)
-        if not ok:
-            print("[error] Could not reach U-Boot prompt")
-            interactive_console(ser, logfile)
-            ser.close()
-            tftp.stop()
-            sys.exit(1)
+            img_path, total_sectors, kern_sectors, initrd_sectors = build_sdimg(
+                kernel_bin, initrd_path, rootfs_dir, mkfxfs_bin)
 
-        time.sleep(0.2)
-        try:
-            ser.read(ser.in_waiting)
-        except (OSError, serial.SerialException):
-            pass
+            img_size = os.path.getsize(img_path)
+            print(f"[install] Image ready: {img_path} ({img_size // (1024*1024)} MiB)")
 
-        def uboot_setenv(ser, var, val):
-            send_cmd(ser, f"setenv {var} {val}")
-            time.sleep(0.3)
-            wait_for(ser, [UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=5, logfile=logfile)
+            # Start/restart TFTP server with new image
+            tftp_srv = TftpServer(img_path, port=args.tftp_port)
+            tftp_srv.start()
+            time.sleep(0.2)
 
-        # Network setup
-        if args.mars_ip:
-            uboot_setenv(ser, "ipaddr", args.mars_ip)
-        uboot_setenv(ser, "serverip", host_ip)
-        if args.gateway:
-            uboot_setenv(ser, "gatewayip", args.gateway)
-        if tftp.port != 69:
-            uboot_setenv(ser, "tftpserverport", str(tftp.port))
+            # Connect serial (reuse if already open)
+            ser = ser_in
+            if ser is None or not serial_ok(ser):
+                try:
+                    ser = serial.Serial(args.port, args.baud, timeout=0.1, dsrdtr=True)
+                    ser.dtr = False
+                except serial.SerialException as e:
+                    print(f"[error] Cannot open {args.port}: {e}")
+                    tftp_srv.stop()
+                    sys.exit(1)
+                print(f"[serial] Connected to {args.port} at {args.baud}")
 
-        # Ping to prime ARP
-        send_cmd(ser, f"ping {host_ip}")
-        wait_for(ser, [b"is alive", b"not alive",
-                       UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=30, logfile=logfile)
+            # Interrupt U-Boot (reset board via bootcmd → Ctrl-C, or just send newlines)
+            # Send reset command to get back to U-Boot prompt
+            send_cmd(ser, "reset")
+            time.sleep(2)
+            ok, ser = interrupt_uboot(ser, timeout=60)
+            if not ok:
+                print("[error] Could not reach U-Boot prompt")
+                interactive_console(ser, logfile)
+                ser.close()
+                tftp_srv.stop()
+                sys.exit(1)
 
-        # TFTP the SD image
-        send_cmd(ser, f"tftpboot {INSTALL_ADDR} fornax-mars.img")
-        print(f"[install] TFTP: {img_size // (1024*1024)} MiB image...")
-        idx, _ = wait_for(ser,
-            [b"Bytes transferred", b"ARP Retry count exceeded",
-             b"TFTP error", b"T T T T T"],
-            timeout=600, logfile=logfile)
-        if idx != 0:
-            reasons = {1: "ARP failed", 2: "TFTP error", 3: "TFTP timeout", -1: "timeout"}
-            print(f"\n[error] TFTP failed: {reasons.get(idx, 'unknown')}")
-            interactive_console(ser, logfile)
-            ser.close()
-            tftp.stop()
-            sys.exit(1)
-        wait_for(ser, [UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=10, logfile=logfile)
+            time.sleep(0.2)
+            try:
+                ser.read(ser.in_waiting)
+            except (OSError, serial.SerialException):
+                pass
 
-        # Select SD card (mmc dev 1 = MMC1 = microSD on Mars)
-        send_cmd(ser, "mmc dev 1")
-        wait_for(ser, [UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=10, logfile=logfile)
+            def uboot_setenv(ser, var, val):
+                send_cmd(ser, f"setenv {var} {val}")
+                time.sleep(0.3)
+                wait_for(ser, [UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=5, logfile=logfile)
 
-        # Write image to SD card
-        total_hex = f"0x{total_sectors:X}"
-        send_cmd(ser, f"mmc write {INSTALL_ADDR} 0 {total_hex}")
-        print(f"[install] Writing {total_sectors} sectors to SD card...")
-        idx, _ = wait_for(ser,
-            [b"blocks written", UBOOT_PROMPT, UBOOT_PROMPT_ALT],
-            timeout=300, logfile=logfile)
-        if idx == -1:
-            print("[error] mmc write timed out")
+            # Network setup
+            if args.mars_ip:
+                uboot_setenv(ser, "ipaddr", args.mars_ip)
+            uboot_setenv(ser, "serverip", host_ip)
+            if args.gateway:
+                uboot_setenv(ser, "gatewayip", args.gateway)
+            if tftp_srv.port != 69:
+                uboot_setenv(ser, "tftpserverport", str(tftp_srv.port))
 
-        # Set U-Boot bootcmd for standalone SD boot
-        kern_hex = f"0x{kern_sectors:X}"
-        initrd_hex = f"0x{initrd_sectors:X}"
-        bootcmd = (
-            f"mmc dev 1; "
-            f"mmc read 0x40200000 0x{IMG_KERNEL_LBA:X} {kern_hex}; "
-            f"mmc read 0x44000000 0x{IMG_INITRD_LBA:X} {initrd_hex}; "
-            f"fdt addr ${{fdtcontroladdr}}; "
-            f"fdt move ${{fdtcontroladdr}} 0x46000000; "
-            f"go 0x40200000"
-        )
-        uboot_setenv(ser, "bootcmd", f"'{bootcmd}'")
+            # Ping to prime ARP
+            send_cmd(ser, f"ping {host_ip}")
+            wait_for(ser, [b"is alive", b"not alive",
+                           UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=30, logfile=logfile)
 
-        send_cmd(ser, "saveenv")
-        wait_for(ser, [UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=10, logfile=logfile)
-        print("[install] U-Boot environment saved.")
+            # TFTP the SD image
+            send_cmd(ser, f"tftpboot {INSTALL_ADDR} fornax-mars.img")
+            print(f"[install] TFTP: {img_size // (1024*1024)} MiB image...")
+            idx, _ = wait_for(ser,
+                [b"Bytes transferred", b"ARP Retry count exceeded",
+                 b"TFTP error", b"T T T T T"],
+                timeout=600, logfile=logfile)
+            if idx != 0:
+                reasons = {1: "ARP failed", 2: "TFTP error", 3: "TFTP timeout", -1: "timeout"}
+                print(f"\n[error] TFTP failed: {reasons.get(idx, 'unknown')}")
+                interactive_console(ser, logfile)
+                ser.close()
+                tftp_srv.stop()
+                sys.exit(1)
+            wait_for(ser, [UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=10, logfile=logfile)
 
-        # Boot from the newly installed SD card
-        print("[install] Installation complete — booting from SD card...")
-        send_cmd(ser, "run bootcmd")
+            # Select SD card (mmc dev 1 = MMC1 = microSD on Mars)
+            send_cmd(ser, "mmc dev 1")
+            wait_for(ser, [UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=10, logfile=logfile)
 
-        time.sleep(0.5)
-        interactive_console(ser, logfile, reconnect=True)
+            # Write image to SD card
+            total_hex = f"0x{total_sectors:X}"
+            send_cmd(ser, f"mmc write {INSTALL_ADDR} 0 {total_hex}")
+            print(f"[install] Writing {total_sectors} sectors to SD card...")
+            idx, _ = wait_for(ser,
+                [b"blocks written", UBOOT_PROMPT, UBOOT_PROMPT_ALT],
+                timeout=300, logfile=logfile)
+            if idx == -1:
+                print("[error] mmc write timed out")
+
+            # Set U-Boot bootcmd for standalone SD boot
+            kern_hex = f"0x{kern_sectors:X}"
+            initrd_hex = f"0x{initrd_sectors:X}"
+            bootcmd = (
+                f"mmc dev 1; "
+                f"mmc read 0x40200000 0x{IMG_KERNEL_LBA:X} {kern_hex}; "
+                f"mmc read 0x44000000 0x{IMG_INITRD_LBA:X} {initrd_hex}; "
+                f"fdt addr ${{fdtcontroladdr}}; "
+                f"fdt move ${{fdtcontroladdr}} 0x46000000; "
+                f"go 0x40200000"
+            )
+            uboot_setenv(ser, "bootcmd", f"'{bootcmd}'")
+
+            send_cmd(ser, "saveenv")
+            wait_for(ser, [UBOOT_PROMPT, UBOOT_PROMPT_ALT], timeout=10, logfile=logfile)
+            print("[install] U-Boot environment saved.")
+
+            # Boot from the newly installed SD card
+            print("[install] Installation complete — booting from SD card...")
+            send_cmd(ser, "run bootcmd")
+
+            return ser, tftp_srv
+
+        # Initial install + restart loop
+        while True:
+            try:
+                if tftp:
+                    tftp.stop()
+                ser, tftp = do_install(ser)
+                time.sleep(0.5)
+                interactive_console(ser, logfile, reconnect=True)
+                break  # Normal exit (Ctrl-D / Ctrl-])
+            except RestartRequested:
+                print("\n[restart] Ctrl-R — rebuilding and reinstalling...")
+                logfile.reopen()  # truncate boot.log for fresh cycle
+                continue
 
         ser.close()
-        tftp.stop()
+        if tftp:
+            tftp.stop()
         if logfile:
             logfile.close()
         return
@@ -761,8 +846,10 @@ def main():
 
     # ── Serial connection ───────────────────────────────────────────
     try:
-        ser = serial.Serial(args.port, args.baud, timeout=0.1, dsrdtr=True)
+        ser = serial.Serial(args.port, args.baud, timeout=0.1,
+                             dsrdtr=False, rtscts=False)
         ser.dtr = False  # Don't assert DTR — it resets the Mars
+        ser.rts = False
     except serial.SerialException as e:
         print(f"[error] Cannot open {args.port}: {e}")
         if tftp:
