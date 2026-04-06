@@ -779,11 +779,7 @@ pub fn getByPid(pid: u32) ?*Process {
 
 /// Pick the online core with the shortest run queue.
 pub fn leastLoadedCore() u8 {
-    // On Mars, skip core 0 (PLIC UART IRQ flood makes it unreliable).
-    const start: u8 = if (@import("builtin").cpu.arch == .riscv64) blk: {
-        const rv_board = @import("arch/riscv64/board/board.zig");
-        break :blk if (!rv_board.active.has_pci_ecam and percpu.cores_online > 1) 1 else 0;
-    } else 0;
+    const start: u8 = 0;
     var best: u8 = start;
     var best_len: u32 = @atomicLoad(u32, &percpu.percpu_array[start].run_queue.len, .monotonic);
     var i: u8 = start + 1;
@@ -1144,19 +1140,10 @@ fn scheduleNextImpl() noreturn {
             percpu.percpu_array[my_core].idle_ticks +%= 1;
             switch (@import("builtin").cpu.arch) {
                 .riscv64 => {
-                    const rv_board = @import("arch/riscv64/board/board.zig");
-                    if (!rv_board.active.has_pci_ecam and my_core == 0) {
-                        // Mars core 0: U-Boot leaves UART PLIC IRQ enabled,
-                        // making WFI unreliable (external IRQ flood). Core 0
-                        // busy-polls UART instead. Userspace is assigned to
-                        // cores 1-3 via leastLoadedCore() to avoid starvation.
-                        @import("serial.zig").pollRx();
-                    } else {
-                        @import("timer.zig").rearmRiscvTimer();
-                        asm volatile ("csrsi sstatus, 0x2"); // SIE=1
-                        asm volatile ("wfi");
-                        asm volatile ("csrci sstatus, 0x2"); // SIE=0
-                    }
+                    @import("timer.zig").rearmRiscvTimer();
+                    asm volatile ("csrsi sstatus, 0x2"); // SIE=1
+                    asm volatile ("wfi");
+                    asm volatile ("csrci sstatus, 0x2"); // SIE=0
                 },
                 .aarch64 => {
                     asm volatile ("msr daifclr, #0xF"); // enable IRQs
@@ -1174,16 +1161,9 @@ fn scheduleNextImpl() noreturn {
             if (my_core == 0) {
                 const net = @import("net.zig");
                 net.poll();
-                // Mars UART RX: poll directly from scheduler idle loop.
-                // On JH7110, core 0's timer interrupt may not fire (only
-                // one hart receives STIP on this SBI), so the timer-based
-                // pollRx in timer.zig never runs on core 0. Poll here
-                // instead — runs every WFI wake on BSP.
+                // UART RX safety net — catch bytes delivered during WFI/HLT.
                 if (@import("builtin").cpu.arch == .riscv64) {
-                    const rv_board = @import("arch/riscv64/board/board.zig");
-                    if (!rv_board.active.has_pci_ecam) {
-                        @import("serial.zig").pollRx();
-                    }
+                    @import("serial.zig").pollRx();
                 }
             }
             continue;

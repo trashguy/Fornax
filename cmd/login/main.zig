@@ -7,8 +7,8 @@ const fx = @import("fornax");
 
 const out = fx.io.Writer.stdout;
 
-/// 2 MB ELF buffer for loading shell binary.
-var elf_buf: [2 * 1024 * 1024]u8 linksection(".bss") = undefined;
+/// 2 MB on x86_64/aarch64, 1 MB on riscv64 (U74 sfence.vma stall with >2MB BSS).
+var elf_buf: [if (@import("builtin").cpu.arch == .riscv64) 1 * 1024 * 1024 else 2 * 1024 * 1024]u8 linksection(".bss") = undefined;
 var line_buf: [256]u8 = undefined;
 var pw_buf: [128]u8 = undefined;
 

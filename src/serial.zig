@@ -124,31 +124,38 @@ pub fn enableRxInterrupt() void {
             // Register PLIC IRQ handler (board-specific: QEMU=10, JH7110=32)
             _ = interrupts.registerIrqHandler(rv_board.active.uart_irq, handleIrq);
 
-            // On JH7110 (Mars), do NOT enable UART PLIC interrupt.
-            // U-Boot leaves the UART in a state where enabling PLIC IRQ 32
-            // floods core 0 with external interrupts, starving the timer.
-            // UART RX is polled via timer tick instead (see timer.zig pollRx).
+            const plic = @import("arch/riscv64/plic.zig");
             if (!rv_board.active.has_pci_ecam) {
-                // Board without PCI = Mars (no UART PLIC enable)
-                // Full UART re-init for DW APB UART on JH7110:
-                // U-Boot leaves the UART running but we need to ensure
-                // RX works after kernel takeover. Use 32-bit writes
-                // (JH7110 APB bus may not support byte writes properly).
+                // Mars (DW APB UART on JH7110): full re-init after U-Boot.
+                // Use 32-bit writes (JH7110 APB bus may not support byte writes).
                 const mmw = cpu.mmioWrite32;
+                const mmr = cpu.mmioRead32;
                 const base = uartAddr(0);
                 const shift: u5 = @intCast(rv_board.active.uart_reg_shift);
+                // IER: disable all UART interrupts while we re-init
+                mmw(base + (@as(u64, 1) << shift), 0x00);
                 // LCR: clear DLAB (bit 7) — ensure reg 0/1 = RBR/IER, not DLL/DLH
-                // Preserve 8N1 (0x03) but clear DLAB
                 mmw(base + (@as(u64, 3) << shift), 0x03); // LCR = 8N1, DLAB=0
                 // FCR: enable FIFOs, reset RX/TX FIFOs
                 mmw(base + (@as(u64, 2) << shift), 0x07); // FCR = FIFO enable + reset both
                 // MCR: assert DTR + RTS (required for CH340 flow control)
                 mmw(base + (@as(u64, 4) << shift), 0x03); // MCR = DTR | RTS
+                // Drain any stale RX data left by U-Boot so the UART
+                // de-asserts its interrupt line before we enable PLIC IRQ 32.
+                for (0..64) |_| {
+                    const lsr = mmr(base + (@as(u64, 5) << shift));
+                    if (lsr & 0x01 == 0) break; // DR=0, FIFO empty
+                    _ = mmr(base); // read RBR to drain
+                }
+                // Read IIR to clear any pending interrupt identification
+                _ = mmr(base + (@as(u64, 2) << shift));
                 // IER: enable RX data available interrupt only
                 mmw(base + (@as(u64, 1) << shift), 0x01); // IER = ERBFI
+                // Now safe to enable PLIC IRQ 32 — stale pending IRQs
+                // were drained in plic.init(), UART source is quiesced.
+                plic.enable(rv_board.active.uart_irq);
             } else {
-                // QEMU virt: safe to use PLIC interrupt
-                const plic = @import("arch/riscv64/plic.zig");
+                // QEMU virt: simple 8250 UART
                 cpu.mmioWrite8(uartAddr(1), 0x01);
                 plic.enable(rv_board.active.uart_irq);
             }

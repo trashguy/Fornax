@@ -75,7 +75,10 @@ pub const R_ERROR = ipc.R_ERROR;
 pub const R_AGAIN = ipc.R_AGAIN;
 
 /// User argv layout base address (one page below stack top).
-pub const ARGV_BASE: u64 = 0x0000_7FFF_FFEF_F000;
+pub const ARGV_BASE: u64 = switch (@import("builtin").cpu.arch) {
+    .riscv64 => 0x0000_003F_FFEF_F000,
+    else => 0x0000_7FFF_FFEF_F000,
+};
 
 pub fn write(fd: i32, buf: []const u8) usize {
     return syscall3(.write, @bitCast(@as(i64, fd)), @intFromPtr(buf.ptr), buf.len);

@@ -55,6 +55,20 @@ pub fn init() void {
 
     context = board.active.plicSContext(boot.boot_hartid);
 
+    // Set threshold to 0 first so claim() returns all pending+enabled IRQs.
+    mmioWrite32(plicAddr(thresholdOff()), 0);
+
+    // Drain any pending interrupts left by U-Boot (e.g. UART IRQ 32 on
+    // JH7110). Must happen before clearing enables — claim only returns
+    // IRQs that are both pending and enabled.
+    var drained: u32 = 0;
+    while (true) {
+        const irq = mmioRead32(plicAddr(claimOff()));
+        if (irq == 0) break;
+        mmioWrite32(plicAddr(claimOff()), irq);
+        drained += 1;
+    }
+
     // Clear all interrupt enables left over from U-Boot.
     // Without this, stale enables (e.g. UART TX-empty, DW-MMC) flood
     // core 0 with external interrupts that starve the timer.
@@ -70,12 +84,12 @@ pub fn init() void {
             mmioWrite32(plicAddr(ap_enable_base + @as(u64, @intCast(i)) * 4), 0);
         }
     }
-
-    mmioWrite32(plicAddr(thresholdOff()), 0);
     klog.info("PLIC: initialized at ");
     klog.infoHex(plic_base);
     klog.info(" (context=");
     klog.infoDec(context);
+    klog.info(", drained=");
+    klog.infoDec(drained);
     klog.info(", threshold=0)\n");
 }
 

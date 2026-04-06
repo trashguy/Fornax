@@ -3,7 +3,7 @@
 # Loads argc/argv from ARGV_BASE, aligns stack, calls main(), exits.
 
 .set SYS_EXIT, 14
-.set ARGV_BASE, 0x7FFFFFEFF000
+.set ARGV_BASE, 0x3FFFEFF000
 
 .text
 .global _start
@@ -12,8 +12,8 @@ _start:
     # Zero frame pointer
     li s0, 0
 
-    # Load ARGV_BASE address
-    li t0, 0x7FFFFFEFF000
+    # Load ARGV_BASE address (riscv64 Sv39: stack top at 0x3FFFF00000)
+    li t0, 0x3FFFEFF000
 
     # Load argc from ARGV_BASE
     ld a0, 0(t0)                # argc in a0 (first arg to main)

@@ -4,8 +4,8 @@
 # 2. Builds a Linux-style stack layout from Fornax's ARGV_BASE + AUXV_BASE
 # 3. Calls musl's __libc_start_main(main, argc, argv, 0, 0, 0)
 
-.set ARGV_BASE, 0x7FFFFFEFF000
-.set AUXV_BASE, 0x7FFFFFEFE000
+.set ARGV_BASE, 0x3FFFEFF000
+.set AUXV_BASE, 0x3FFFEFE000
 .set SYS_RFORK, 11
 .set SYS_SHUTDOWN, 25
 .set RFNAMEG, 0x08
@@ -24,8 +24,8 @@ _start:
     bltz a0, .Lrfork_fail
 
     # Load ARGV_BASE and AUXV_BASE
-    li s1, 0x7FFFFFEFF000       # ARGV_BASE
-    li s2, 0x7FFFFFEFE000       # AUXV_BASE
+    li s1, 0x3FFFEFF000       # ARGV_BASE (riscv64 Sv39)
+    li s2, 0x3FFFEFE000       # AUXV_BASE
     ld s3, 0(s1)                # s3 = argc
 
     # Find end of auxv (pairs of u64 until AT_NULL=0)

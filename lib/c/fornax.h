@@ -66,7 +66,11 @@ typedef unsigned long      size_t;
 #define WSTAT_GID  0x04
 
 /* ARGV_BASE: where argc/argv are placed by the kernel */
+#if defined(__riscv)
+#define FX_ARGV_BASE ((void *)0x3FFFEFF000ULL)
+#else
 #define FX_ARGV_BASE ((void *)0x7FFFFFEFF000ULL)
+#endif
 
 /* Error sentinel (high bit set = error) */
 #define FX_IS_ERROR(r) ((r) > 0xFFFFFFFFFFFF0000ULL)

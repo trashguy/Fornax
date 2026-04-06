@@ -6,7 +6,7 @@ const fx = @import("fornax");
 const out = fx.io.Writer.stdout;
 const err = fx.io.Writer.stderr;
 
-var elf_buf: [2 * 1024 * 1024]u8 linksection(".bss") = undefined;
+var elf_buf: [if (@import("builtin").cpu.arch == .riscv64) 1 * 1024 * 1024 else 2 * 1024 * 1024]u8 linksection(".bss") = undefined;
 
 fn argSlice(arg: [*:0]const u8) []const u8 {
     var len: usize = 0;

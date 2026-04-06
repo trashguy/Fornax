@@ -12,7 +12,8 @@ const out = fx.io.Writer.stdout;
 // ── BSS buffers ────────────────────────────────────────────────────
 
 /// 4 MB buffer for loading ELF binaries (matches spawn syscall limit).
-var elf_buf: [4 * 1024 * 1024]u8 linksection(".bss") = undefined;
+/// 4 MB on x86_64/aarch64, 1 MB on riscv64 (U74 sfence.vma stall with >2MB BSS).
+var elf_buf: [if (@import("builtin").cpu.arch == .riscv64) 1 * 1024 * 1024 else 4 * 1024 * 1024]u8 linksection(".bss") = undefined;
 
 /// Scratch buffer for source builtin (separate from elf_buf to avoid
 /// corruption when source'd scripts spawn external commands).
