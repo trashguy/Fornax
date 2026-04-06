@@ -4,9 +4,11 @@
 /// When a login/shell exits, init respawns login on that VT.
 const fx = @import("fornax");
 
-/// 4 MB buffer for loading ELF binaries (matches spawn syscall limit).
-/// linksection forces this into .bss so it doesn't bloat the ELF file.
-var elf_buf: [4 * 1024 * 1024]u8 linksection(".bss") = undefined;
+/// ELF buffer for loading binaries. Reduced to 2 MB on riscv64 (U74
+/// workaround — splitting 3+ identity-map superpages triggers a PTW
+/// stall during sfence.vma on JH7110). 2 MB keeps splits to ≤2 regions.
+/// x86_64/aarch64 use the full 4 MB.
+var elf_buf: [if (@import("builtin").cpu.arch == .riscv64) 2 * 1024 * 1024 else 4 * 1024 * 1024]u8 linksection(".bss") = undefined;
 
 const out = fx.io.Writer.stdout;
 
@@ -152,6 +154,13 @@ fn spawnBridge() void {
 }
 
 fn spawnNetd() void {
+    // Load netd binary first — the slow SD read gives dwmac time to
+    // finish init and enter its IPC loop before we open /dev/ether0.
+    const netd_elf = loadBin("netd") orelse {
+        out.puts("init: failed to load /bin/netd, skipping\n");
+        return;
+    };
+
     // Create IPC channel pair
     const pair = fx.ipc_pair();
     if (pair.err < 0) {
@@ -167,15 +176,6 @@ fn spawnNetd() void {
         _ = fx.close(pair.client_fd);
         return;
     }
-
-    // Load netd binary
-    const netd_elf = loadBin("netd") orelse {
-        out.puts("init: failed to load /bin/netd, skipping\n");
-        _ = fx.close(pair.server_fd);
-        _ = fx.close(pair.client_fd);
-        _ = fx.close(ether_fd);
-        return;
-    };
 
     // Spawn with fd mappings: server_fd→3, ether_fd→4
     const mappings = [_]fx.FdMapping{
@@ -348,13 +348,6 @@ export fn _start() noreturn {
         _ = fx.close(shadow_fd);
     }
 
-    // Register optional services discovered on disk (e.g. after fay install)
-    startOptionalServices();
-
-    // Spawn crond (cron daemon) and gpud (GPU server) — non-blocking
-    spawnCrond();
-    spawnGpud();
-
     // Determine how many VTs to use (/etc/vts overrides default)
     readVtCount();
     out.print("init: {d} virtual terminals\n", .{@as(u64, active_vts)});
@@ -387,11 +380,15 @@ export fn _start() noreturn {
         vt_last_spawn[i] = now;
     }
 
-    // Spawn network services AFTER login — dwmac PHY init may block
-    // spawnNetd() for several seconds, so login must be available first.
-    spawnBridge();
+    startOptionalServices();
+    // Skip gpud on riscv64 — no GPU on Mars/QEMU-riscv64.
+    if (@import("builtin").cpu.arch != .riscv64) {
+        spawnGpud();
+    }
     spawnDwmac();
+    spawnBridge();
     spawnNetd();
+    spawnCrond();
 
     // Respawn loop: when any child exits, check which VT lost its login
     while (true) {

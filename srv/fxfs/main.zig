@@ -51,8 +51,11 @@ const MAX_INTERNAL_KEYS = 163;
 // always produce valid halves. (4096 - 16 - 42) / 2 = 2019.
 const MAX_INLINE_DATA = 2000;
 
-// Node cache
-const CACHE_SIZE = 16;
+// Node cache — 128 entries (512 KB) for real hardware where SD reads cost
+// milliseconds. Limited by U74 BSS constraint (sfence.vma superpage split
+// bug — see u74-sfence-vma-bug.md). Phase 4007 will use shmem-allocated
+// pages instead of BSS, enabling fossil-scale caches (16+ MB).
+const CACHE_SIZE = 128;
 
 // ── On-disk structures ─────────────────────────────────────────────
 
@@ -3172,8 +3175,9 @@ export fn _start() noreturn {
         }
     }
 
-    // Spawn worker threads (3 workers + main thread = 4 total)
-    const NUM_WORKERS = 3;
+    // Spawn worker threads — more on real hardware where SD card I/O
+    // is slow and concurrent clients (4 VTs + services) pile up.
+    const NUM_WORKERS = 7;
     var i: usize = 0;
     while (i < NUM_WORKERS) : (i += 1) {
         _ = fx.thread.spawnThread(workerEntry, null) catch {};

@@ -125,6 +125,9 @@ export fn _start() noreturn {
             continue;
         }
 
+        // Spawn shell as child (exec has a bug on Mars/riscv64 where the
+        // new entry point never executes). Wait for child to exit, then
+        // loop back to login prompt.
         // exec replaces this process image but preserves uid/gid/fds
         _ = fx.exec(elf_buf[0..total]);
 

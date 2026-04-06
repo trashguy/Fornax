@@ -389,6 +389,7 @@ var processes: [MAX_PROCESSES]Process = undefined;
 var initialized: bool = false;
 pub var next_pid: u32 = 1;
 
+
 /// Spinlock guarding process table allocation (next_pid, state transitions).
 pub var table_lock: SpinLock = .{};
 
@@ -612,8 +613,12 @@ pub fn create() ?*Process {
     namespace.getRootNamespace().cloneInto(&proc.ns);
     proc.ipc_msg.reset(.t_open);
 
-    // Assign core: kernel-spawned → BSP; otherwise least-loaded core
-    proc.assigned_core = if (current()) |_| leastLoadedCore() else 0;
+    proc.assigned_core = if (current()) |_|
+        leastLoadedCore()
+    else if (percpu.cores_online > 1)
+        leastLoadedCore()
+    else
+        0;
     proc.core_affinity = -1; // any core
     proc.cores_ran_on = 0;
 
@@ -774,9 +779,14 @@ pub fn getByPid(pid: u32) ?*Process {
 
 /// Pick the online core with the shortest run queue.
 pub fn leastLoadedCore() u8 {
-    var best: u8 = 0;
-    var best_len: u32 = @atomicLoad(u32, &percpu.percpu_array[0].run_queue.len, .monotonic);
-    var i: u8 = 1;
+    // On Mars, skip core 0 (PLIC UART IRQ flood makes it unreliable).
+    const start: u8 = if (@import("builtin").cpu.arch == .riscv64) blk: {
+        const rv_board = @import("arch/riscv64/board/board.zig");
+        break :blk if (!rv_board.active.has_pci_ecam and percpu.cores_online > 1) 1 else 0;
+    } else 0;
+    var best: u8 = start;
+    var best_len: u32 = @atomicLoad(u32, &percpu.percpu_array[start].run_queue.len, .monotonic);
+    var i: u8 = start + 1;
     while (i < percpu.cores_online) : (i += 1) {
         const len = @atomicLoad(u32, &percpu.percpu_array[i].run_queue.len, .monotonic);
         if (len < best_len) {
@@ -1065,6 +1075,7 @@ fn scheduleNextImpl() noreturn {
     const my_core = percpu.getCoreId();
     const my_queue = &percpu.percpu_array[my_core].run_queue;
 
+
     while (true) {
         // Try to pop from local run queue
         if (my_queue.pop()) |pid| {
@@ -1080,17 +1091,8 @@ fn scheduleNextImpl() noreturn {
             // Atomically claim: CAS .ready → .running ensures only one core
             // can schedule a given process, preventing double-scheduling on SMP.
             if (@cmpxchgStrong(ProcessState, &proc.state, .ready, .running, .seq_cst, .seq_cst) == null) {
-                // U74 (JH7110) workaround: after SATP write + sfence.vma, the U74
-                // needs additional time for the i-TLB invalidation to propagate.
-                // Poll the UART LSR register in a loop — each MMIO read forces a
-                // device memory access that drains the store buffer and pipeline.
-                if (@import("builtin").cpu.arch == .riscv64) {
-                    const lsr = @as(u64, 0x10000005) +% mem.KERNEL_VIRT_BASE;
-                    var i: u32 = 0;
-                    while (i < 32) : (i += 1) {
-                        _ = @as(*volatile u8, @ptrFromInt(lsr)).*;
-                    }
-                }
+                // Pipeline drain is now inside paging.switchAddressSpace()
+                // (after SATP write + sfence.vma, where it's actually needed).
                 switchTo(proc);
             }
             // If CAS failed, process is no longer ready (killed, already claimed,
@@ -1142,12 +1144,19 @@ fn scheduleNextImpl() noreturn {
             percpu.percpu_array[my_core].idle_ticks +%= 1;
             switch (@import("builtin").cpu.arch) {
                 .riscv64 => {
-                    // Safety net: re-arm timer before WFI in case the
-                    // interrupt handler's re-arm was lost.
-                    @import("timer.zig").rearmRiscvTimer();
-                    asm volatile ("csrsi sstatus, 0x2"); // SIE=1
-                    asm volatile ("wfi");
-                    asm volatile ("csrci sstatus, 0x2"); // SIE=0
+                    const rv_board = @import("arch/riscv64/board/board.zig");
+                    if (!rv_board.active.has_pci_ecam and my_core == 0) {
+                        // Mars core 0: U-Boot leaves UART PLIC IRQ enabled,
+                        // making WFI unreliable (external IRQ flood). Core 0
+                        // busy-polls UART instead. Userspace is assigned to
+                        // cores 1-3 via leastLoadedCore() to avoid starvation.
+                        @import("serial.zig").pollRx();
+                    } else {
+                        @import("timer.zig").rearmRiscvTimer();
+                        asm volatile ("csrsi sstatus, 0x2"); // SIE=1
+                        asm volatile ("wfi");
+                        asm volatile ("csrci sstatus, 0x2"); // SIE=0
+                    }
                 },
                 .aarch64 => {
                     asm volatile ("msr daifclr, #0xF"); // enable IRQs
@@ -1165,6 +1174,17 @@ fn scheduleNextImpl() noreturn {
             if (my_core == 0) {
                 const net = @import("net.zig");
                 net.poll();
+                // Mars UART RX: poll directly from scheduler idle loop.
+                // On JH7110, core 0's timer interrupt may not fire (only
+                // one hart receives STIP on this SBI), so the timer-based
+                // pollRx in timer.zig never runs on core 0. Poll here
+                // instead — runs every WFI wake on BSP.
+                if (@import("builtin").cpu.arch == .riscv64) {
+                    const rv_board = @import("arch/riscv64/board/board.zig");
+                    if (!rv_board.active.has_pci_ecam) {
+                        @import("serial.zig").pollRx();
+                    }
+                }
             }
             continue;
         } else {

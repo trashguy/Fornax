@@ -204,7 +204,6 @@ export fn handleExceptionRv(frame_ptr: u64, scause: u64, stval: u64) callconv(.c
 export fn handleInterruptRv(scause: u64, frame_ptr: u64) callconv(.c) void {
     _ = frame_ptr;
 
-
     // Increment per-core interrupt counter
     {
         const percpu = @import("../../percpu.zig");

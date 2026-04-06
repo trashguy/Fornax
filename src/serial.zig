@@ -127,11 +127,25 @@ pub fn enableRxInterrupt() void {
             // On JH7110 (Mars), do NOT enable UART PLIC interrupt.
             // U-Boot leaves the UART in a state where enabling PLIC IRQ 32
             // floods core 0 with external interrupts, starving the timer.
-            // UART RX is polled via timer tick instead.
+            // UART RX is polled via timer tick instead (see timer.zig pollRx).
             if (!rv_board.active.has_pci_ecam) {
                 // Board without PCI = Mars (no UART PLIC enable)
-                // Just enable IER for RX so LSR polling sees data
-                cpu.mmioWrite8(uartAddr(1), 0x01);
+                // Full UART re-init for DW APB UART on JH7110:
+                // U-Boot leaves the UART running but we need to ensure
+                // RX works after kernel takeover. Use 32-bit writes
+                // (JH7110 APB bus may not support byte writes properly).
+                const mmw = cpu.mmioWrite32;
+                const base = uartAddr(0);
+                const shift: u5 = @intCast(rv_board.active.uart_reg_shift);
+                // LCR: clear DLAB (bit 7) — ensure reg 0/1 = RBR/IER, not DLL/DLH
+                // Preserve 8N1 (0x03) but clear DLAB
+                mmw(base + (@as(u64, 3) << shift), 0x03); // LCR = 8N1, DLAB=0
+                // FCR: enable FIFOs, reset RX/TX FIFOs
+                mmw(base + (@as(u64, 2) << shift), 0x07); // FCR = FIFO enable + reset both
+                // MCR: assert DTR + RTS (required for CH340 flow control)
+                mmw(base + (@as(u64, 4) << shift), 0x03); // MCR = DTR | RTS
+                // IER: enable RX data available interrupt only
+                mmw(base + (@as(u64, 1) << shift), 0x01); // IER = ERBFI
             } else {
                 // QEMU virt: safe to use PLIC interrupt
                 const plic = @import("arch/riscv64/plic.zig");
@@ -157,6 +171,13 @@ pub fn enableRxInterrupt() void {
     }
 }
 
+/// Poll UART RX FIFO and feed bytes to keyboard.
+/// Called from scheduler idle loop and timer tick on boards where PLIC
+/// UART IRQ is disabled (e.g. Mars).
+pub fn pollRx() void {
+    _ = handleIrq();
+}
+
 fn handleIrq() bool {
     switch (builtin.cpu.arch) {
         .x86_64 => {
@@ -176,8 +197,10 @@ fn handleIrq() bool {
         .riscv64 => {
             const keyboard = @import("keyboard.zig");
             var count: u32 = 0;
-            while (cpu.mmioRead8(uartAddr(5)) & 0x01 != 0 and count < 16) {
-                const byte = cpu.mmioRead8(uartAddr(0));
+            // JH7110 DW APB UART: use 32-bit reads (some SoC buses don't
+            // support byte-width reads on 32-bit APB registers).
+            while (@as(u8, @truncate(cpu.mmioRead32(uartAddr(5)))) & 0x01 != 0 and count < 16) {
+                const byte: u8 = @truncate(cpu.mmioRead32(uartAddr(0)));
                 keyboard.handleChar(byte);
                 count += 1;
             }

@@ -288,10 +288,11 @@ pub fn clearIdentityMap(root: *PageTable) void {
         // point to L1 tables where ALL entries are identity-map superpages.
         // If mapPage modified this entry (split superpages for user code),
         // the L1/L0 tables contain user mappings — keep those.
-        // Simple approach: clear entries that user code doesn't touch.
-        // Entry 1 covers 0x40000000-0x7FFFFFFF (user image base) — keep it.
-        // Clear all other identity map entries (0, 2-9).
-        if (root_idx != 1) {
+        // Keep entries needed by user code and the kernel:
+        // Entry 1: 0x40000000-0x7FFFFFFF (user image base)
+        // Entry 2: 0x80000000-0xBFFFFFFF (kernel binary — linked at 0x80200000)
+        // Clear all other identity map entries (0, 3-9).
+        if (root_idx != 1 and root_idx != 2) {
             root.entries[root_idx] = 0;
         }
     }
@@ -417,17 +418,12 @@ pub fn unmapPage(root: *PageTable, virt: u64) void {
 /// (The earlier "sfence.vma kills timer" was caused by PLIC/identity-map
 /// bugs, not sfence.vma itself — Linux uses sfence.vma on U74 without issues.)
 pub fn switchAddressSpace(root: *PageTable, asid: u16) void {
+    _ = asid; // TODO: re-enable ASID once TLB flush is validated
     const virt = @intFromPtr(root);
     const phys = if (virt >= mem.KERNEL_VIRT_BASE) virt - mem.KERNEL_VIRT_BASE else virt;
-    const satp_val: u64 = (SATP_MODE_SV39 << 60) | (@as(u64, asid) << 44) | (phys >> 12);
-    asm volatile ("fence rw, rw" ::: .{ .memory = true });
+    const satp_val: u64 = (SATP_MODE_SV39 << 60) | (phys >> 12);
     cpu.csrWrite(cpu.CSR_SATP, satp_val);
-    if (max_asid == 0) {
-        // No ASID support: must flush entire TLB to clear stale entries.
-        // With ASIDs, each process has its own TLB partition — no flush needed.
-        asm volatile ("sfence.vma" ::: .{ .memory = true });
-    }
-    asm volatile ("fence.i" ::: .{ .memory = true });
+    asm volatile ("sfence.vma" ::: .{ .memory = true });
 }
 
 /// Switch SATP to the kernel's root page table (ASID 0).

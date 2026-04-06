@@ -160,11 +160,10 @@ fn handleIrq() bool {
         cpu.writeCntpTval(arm_timer_interval);
     }
 
-    // Only BSP manages the global tick counter, sleep wakeups, and
-    // supervisor checks.  On SMP, each core's timer PPI fires
-    // independently — without this guard, ticks advances N× too fast
-    // and sleep durations are wrong.
-    if (percpu.getCoreId() != 0) return true;
+    // Only one core manages the global tick counter and sleep wakeups.
+    // On Mars, core 0 busy-polls (no WFI/timer), so delegate to core 1.
+    const tick_core: u32 = if (builtin.cpu.arch == .riscv64 and !rv_board.active.has_pci_ecam) 1 else 0;
+    if (percpu.getCoreId() != tick_core) return true;
 
     ticks +%= 1;
     @import("trace.zig").trace(.timer_tick, @truncate(ticks));
@@ -184,6 +183,12 @@ fn handleIrq() bool {
     if (builtin.cpu.arch == .x86_64) {
         const xhci = @import("xhci.zig");
         xhci.pollUsbHid();
+    }
+
+    // Poll UART RX on boards where the PLIC UART IRQ is disabled
+    // (e.g. Milk-V Mars — U-Boot leaves UART in a state that floods IRQs).
+    if (builtin.cpu.arch == .riscv64 and !rv_board.active.has_pci_ecam) {
+        @import("serial.zig").pollRx();
     }
 
     // Check supervisor pending restarts and stability resets
