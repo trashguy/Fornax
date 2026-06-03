@@ -187,6 +187,15 @@ pub fn kernelInit(initrd_base: ?[*]const u8, initrd_size: usize, rsdp: ?[*]const
         if (dwmmc.init()) {
             klog.info("Block device ready (SD card).\n");
         }
+
+        // Phase 4007: Cadence USB3 (xHCI host controller)
+        const cdns_usb = @import("arch/riscv64/cdns_usb.zig");
+        if (cdns_usb.init()) |xhci_base| {
+            const xhci = @import("xhci.zig");
+            if (xhci.initFromMmio(xhci_base)) {
+                klog.info("USB ready (Cadence xHCI).\n");
+            }
+        }
     }
 
     // Phase 15: PCI + virtio-net

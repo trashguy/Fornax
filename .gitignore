@@ -9,6 +9,7 @@ __pycache__/
 .idea/
 .DS_Store
 test-serial.log
+*.log
 fornax-syms.gdb
 .serena/
 .claude/

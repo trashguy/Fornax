@@ -1,6 +1,6 @@
 # Phase 4007: Cadence USB3 Controller
 
-## Status: Not Started
+## Status: Implemented (needs hardware test)
 
 ## Goal
 

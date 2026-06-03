@@ -30,6 +30,7 @@ pub const Peripheral = enum {
     sdio0,
     sdio1,
     pcie0,
+    usb0,
 };
 
 // SYSCRG clock IDs (register offset = id * 4)
@@ -43,7 +44,16 @@ const SYSCLK_GMAC1_AXI: u32 = 98;
 const SYSCLK_GMAC1_GTXCLK: u32 = 100;
 const SYSCLK_GMAC1_TX: u32 = 105;
 
+// SYSCRG clock IDs (USB PHY)
+const SYSCLK_USB_125M: u32 = 95;
+
 // STGCRG clock IDs
+const STGCLK_USB0_APB: u32 = 1;
+const STGCLK_USB0_UTMI_APB: u32 = 2;
+const STGCLK_USB0_AXI: u32 = 3;
+const STGCLK_USB0_LPM: u32 = 4;
+const STGCLK_USB0_STB: u32 = 5;
+const STGCLK_USB0_APP_125: u32 = 6;
 const STGCLK_PCIE0_AXI_MST0: u32 = 8;
 const STGCLK_PCIE0_APB: u32 = 9;
 const STGCLK_PCIE0_TL: u32 = 10;
@@ -54,7 +64,13 @@ const SYSRST_SDIO1_AHB: u32 = 65;
 const SYSRST_GMAC1_AXI: u32 = 66;
 const SYSRST_GMAC1_AHB: u32 = 67;
 
-// STGCRG reset IDs
+// STGCRG reset IDs (USB)
+const STGRST_USB0_AXI: u32 = 7;
+const STGRST_USB0_APB: u32 = 8;
+const STGRST_USB0_UTMI_APB: u32 = 9;
+const STGRST_USB0_PWRUP: u32 = 10;
+
+// STGCRG reset IDs (PCIe)
 const STGRST_PCIE0_AXI_MST0: u32 = 11;
 const STGRST_PCIE0_AXI_SLV0: u32 = 12;
 const STGRST_PCIE0_AXI_SLV: u32 = 13;
@@ -143,6 +159,27 @@ pub fn enablePeripheral(peripheral: Peripheral) void {
             deassertReset(SYSCRG_BASE, SYSCRG_ASSERT, SYSRST_SDIO1_AHB);
             waitResetDone(SYSCRG_BASE, SYSCRG_STATUS, SYSRST_SDIO1_AHB);
             klog.info("CRG: SDIO1 clocks enabled, reset deasserted\n");
+        },
+        .usb0 => {
+            // STGCRG USB clocks
+            enableClock(STGCRG_BASE, STGCLK_USB0_LPM);
+            enableClock(STGCRG_BASE, STGCLK_USB0_STB);
+            enableClock(STGCRG_BASE, STGCLK_USB0_APB);
+            enableClock(STGCRG_BASE, STGCLK_USB0_AXI);
+            enableClock(STGCRG_BASE, STGCLK_USB0_UTMI_APB);
+            enableClock(STGCRG_BASE, STGCLK_USB0_APP_125);
+            // SYSCRG USB 125 MHz reference clock
+            enableClock(SYSCRG_BASE, SYSCLK_USB_125M);
+            // Deassert USB resets
+            deassertReset(STGCRG_BASE, STGCRG_ASSERT, STGRST_USB0_PWRUP);
+            deassertReset(STGCRG_BASE, STGCRG_ASSERT, STGRST_USB0_APB);
+            deassertReset(STGCRG_BASE, STGCRG_ASSERT, STGRST_USB0_AXI);
+            deassertReset(STGCRG_BASE, STGCRG_ASSERT, STGRST_USB0_UTMI_APB);
+            waitResetDone(STGCRG_BASE, STGCRG_STATUS, STGRST_USB0_PWRUP);
+            waitResetDone(STGCRG_BASE, STGCRG_STATUS, STGRST_USB0_APB);
+            waitResetDone(STGCRG_BASE, STGCRG_STATUS, STGRST_USB0_AXI);
+            waitResetDone(STGCRG_BASE, STGCRG_STATUS, STGRST_USB0_UTMI_APB);
+            klog.info("CRG: USB0 clocks enabled, resets deasserted\n");
         },
         .pcie0 => {
             enableClock(STGCRG_BASE, STGCLK_PCIE0_AXI_MST0);

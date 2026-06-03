@@ -6,10 +6,36 @@
 
 const pmm = @import("pmm.zig");
 const klog = @import("klog.zig");
-const paging = @import("arch/x86_64/paging.zig");
 const keyboard = @import("keyboard.zig");
 const process = @import("process.zig");
 const mem = @import("mem.zig");
+const builtin = @import("builtin");
+
+const paging = switch (builtin.cpu.arch) {
+    .x86_64 => @import("arch/x86_64/paging.zig"),
+    .riscv64 => @import("arch/riscv64/paging.zig"),
+    .aarch64 => @import("arch/aarch64/paging.zig"),
+    else => struct {
+        pub fn physPtr(_: u64) [*]u8 {
+            return @ptrFromInt(0);
+        }
+        pub const Flags = struct {
+            pub const WRITABLE: u64 = 0;
+            pub const NO_CACHE: u64 = 0;
+        };
+    },
+};
+
+const cpu = switch (builtin.cpu.arch) {
+    .x86_64 => @import("arch/x86_64/cpu.zig"),
+    .riscv64 => @import("arch/riscv64/cpu.zig"),
+    .aarch64 => @import("arch/aarch64/cpu.zig"),
+    else => struct {
+        pub fn mmioRead32(_: u64) u32 { return 0; }
+        pub fn mmioWrite32(_: u64, _: u32) void {}
+        pub fn spinHint() void {}
+    },
+};
 
 // ── TRB (Transfer Request Block) ────────────────────────────────────
 
@@ -120,6 +146,30 @@ const USB_CLASS_HID = 3;
 const HID_PROTOCOL_KEYBOARD = 1;
 const HID_PROTOCOL_MOUSE = 2;
 
+// Hub class
+const USB_CLASS_HUB = 9;
+const USB_DESC_HUB = 0x29;
+const USB_DESC_SS_HUB = 0x2A;
+
+// Hub class requests (bmRequestType for port = 0x23, for hub = 0x20)
+const HUB_REQ_SET_FEATURE = 0x03;
+const HUB_REQ_CLEAR_FEATURE = 0x01;
+const HUB_REQ_GET_STATUS = 0x00;
+
+// Hub port features
+const HUB_FEAT_PORT_POWER = 8;
+const HUB_FEAT_PORT_RESET = 4;
+const HUB_FEAT_C_PORT_CONNECTION = 16;
+const HUB_FEAT_C_PORT_RESET = 20;
+
+// Hub port status bits
+const HUB_PORT_CONNECTION = 1 << 0;
+const HUB_PORT_ENABLE = 1 << 1;
+const HUB_PORT_RESET_BIT = 1 << 4;
+const HUB_PORT_POWER_BIT = 1 << 8;
+const HUB_PORT_LOW_SPEED = 1 << 9;
+const HUB_PORT_HIGH_SPEED = 1 << 10;
+
 // ── Event Ring Segment Table Entry ──────────────────────────────────
 
 const ErstEntry = packed struct {
@@ -169,9 +219,15 @@ const UsbDevice = struct {
     hid_max_packet: u16 = 0,
     // Keyboard state (previous report for press/release detection)
     prev_kbd_report: [8]u8 = [_]u8{0} ** 8,
+    // Hub topology (for devices behind hubs)
+    route_string: u20 = 0,
+    root_port: u8 = 0, // root hub port for the topology chain
+    parent_slot: u8 = 0, // parent hub's slot_id (0 = root hub)
+    parent_port_num: u8 = 0, // port on parent hub
+    hub_ports: u8 = 0, // number of downstream ports (if this is a hub)
 };
 
-const MAX_USB_DEVICES = 8;
+const MAX_USB_DEVICES = 16;
 var usb_devices: [MAX_USB_DEVICES]UsbDevice = [_]UsbDevice{.{}} ** MAX_USB_DEVICES;
 var usb_device_count: u8 = 0;
 
@@ -255,22 +311,30 @@ pub fn isInitialized() bool {
 
 // ── MMIO Helpers ────────────────────────────────────────────────────
 
-fn mmioRead32(addr: u64) u32 {
-    const virt: usize = @intFromPtr(paging.physPtr(addr));
-    var result: u32 = undefined;
-    asm volatile ("movl (%[addr]), %[result]"
-        : [result] "=r" (result),
-        : [addr] "r" (virt),
-        : .{.memory = true});
-    return result;
+fn mmioRead32(a: u64) u32 {
+    if (comptime builtin.cpu.arch == .x86_64) {
+        const virt: usize = @intFromPtr(paging.physPtr(a));
+        var result: u32 = undefined;
+        asm volatile ("movl (%[addr]), %[result]"
+            : [result] "=r" (result),
+            : [addr] "r" (virt),
+            : .{.memory = true});
+        return result;
+    } else {
+        return cpu.mmioRead32(a +% mem.KERNEL_VIRT_BASE);
+    }
 }
 
-fn mmioWrite32(addr: u64, val: u32) void {
-    const virt: usize = @intFromPtr(paging.physPtr(addr));
-    asm volatile ("movl %[val], (%[addr])"
-        :
-        : [val] "r" (val), [addr] "r" (virt),
-        : .{.memory = true});
+fn mmioWrite32(a: u64, val: u32) void {
+    if (comptime builtin.cpu.arch == .x86_64) {
+        const virt: usize = @intFromPtr(paging.physPtr(a));
+        asm volatile ("movl %[val], (%[addr])"
+            :
+            : [val] "r" (val), [addr] "r" (virt),
+            : .{.memory = true});
+    } else {
+        cpu.mmioWrite32(a +% mem.KERNEL_VIRT_BASE, val);
+    }
 }
 
 fn mmioRead64(addr: u64) u64 {
@@ -349,8 +413,9 @@ fn speedName(speed: u8) []const u8 {
 
 // ── Phase 400: Init & PCI Detection ─────────────────────────────────
 
+/// PCI-based xHCI discovery (x86_64, riscv64 QEMU, aarch64).
 pub fn init() bool {
-    if (@import("builtin").cpu.arch != .x86_64) return false;
+    if (comptime builtin.cpu.arch != .x86_64) return false;
 
     const pci = @import("arch/x86_64/pci.zig");
 
@@ -367,18 +432,36 @@ pub fn init() bool {
     pci.enableBusMastering(dev);
 
     // Read BAR0 (MMIO)
-    mmio_base = dev.memBase(0) orelse {
+    const bar = dev.memBase(0) orelse {
         klog.err("xhci: BAR0 not memory-mapped\n");
         return false;
     };
 
     // If BAR is above 4 GB, map the MMIO region into kernel page tables.
-    if (mmio_base >= 0x1_0000_0000) {
-        if (!mapMmioRegion(mmio_base, 0x10000)) {
+    if (bar >= 0x1_0000_0000) {
+        if (!mapMmioRegion(bar, 0x10000)) {
             klog.err("xhci: failed to map MMIO region\n");
             return false;
         }
     }
+
+    return setupController(bar);
+}
+
+/// Platform-device xHCI init (Cadence USB3, non-PCI).
+/// base is the physical address of the xHCI capability registers.
+pub fn initFromMmio(base: u64) bool {
+    // Map the xHCI MMIO region into kernel page tables
+    if (!mapMmioRegion(base, 0x10000)) {
+        klog.err("xhci: failed to map MMIO region\n");
+        return false;
+    }
+    return setupController(base);
+}
+
+/// Shared controller setup: read caps, reset, configure rings, scan ports.
+fn setupController(base: u64) bool {
+    mmio_base = base;
 
     // Read capability registers
     // Offset 0x00: [7:0] CAPLENGTH, [31:16] HCIVERSION
@@ -398,7 +481,7 @@ pub fn init() bool {
     runtime_base = mmio_base + (readCap(RTSOFF) & 0xFFFFFFE0);
     doorbell_base = mmio_base + (readCap(DBOFF) & 0xFFFFFFFC);
 
-    klog.info(", v");
+    klog.info("xhci: v");
     klog.infoDec(version >> 8);
     klog.info(".");
     klog.infoDec(version & 0xFF);
@@ -423,6 +506,13 @@ pub fn init() bool {
     zeroPage(scratch_phys);
 
     if (!startController()) return false;
+
+    // Wait for USB link training / port power-up (~200ms)
+    // USB 3.0 link training can take 100-200ms after controller start.
+    {
+        var wait: u32 = 200_000;
+        while (wait > 0) : (wait -= 1) microDelay();
+    }
 
     // Phase 402: Scan ports and enable devices
     scanPorts();
@@ -567,7 +657,10 @@ fn setupEventRing() bool {
 
 fn startController() bool {
     var cmd = readOp(USBCMD);
-    cmd |= USBCMD_RS | USBCMD_INTE;
+    // Run/Stop only — do NOT set INTE (interrupter enable). We use polling,
+    // and INTE would fire hardware interrupts to PLIC with no handler.
+    cmd |= USBCMD_RS;
+    cmd &= ~@as(u32, USBCMD_INTE);
     writeOp(USBCMD, cmd);
 
     // Poll for HCH clear (running)
@@ -589,21 +682,27 @@ fn scanPorts() void {
     for (1..@as(u16, max_ports) + 1) |port_u16| {
         const port: u8 = @truncate(port_u16);
         const portsc = readPortsc(port);
+
+        // Log port status for debugging
+        klog.info("xhci: port ");
+        klog.infoDec(port);
+        klog.info(" PORTSC=");
+        klog.infoHex(portsc);
         if (portsc & PORTSC_CCS != 0) {
             const speed = portSpeed(portsc);
-            klog.info("xhci: port ");
-            klog.infoDec(port);
             klog.info(" connected (");
             klog.info(speedName(speed));
             klog.info(")\n");
 
             if (resetPort(port)) {
-                if (enableSlotAndAddress(port, speed)) |_| {} else {
+                if (enableSlotAndAddress(port, speed, 0, 0, 0)) |_| {} else {
                     klog.err("xhci: failed to enable device on port ");
                     klog.errDec(port);
                     klog.err("\n");
                 }
             }
+        } else {
+            klog.info(" no device\n");
         }
     }
 }
@@ -664,12 +763,14 @@ fn enqueueCommand(trb: Trb) void {
 }
 
 fn ringCommandDoorbell() void {
+    dmaFence(); // ensure TRBs are visible to controller before doorbell
     writeDb(0, 0);
 }
 
 fn pollEvent(timeout_us: u32) ?Trb {
     var remaining = timeout_us;
     while (remaining > 0) : (remaining -= 1) {
+        dmaFence(); // ensure we see controller-written event TRBs
         const offset = @as(u64, evt_dequeue) * 16;
         const ptr: *volatile Trb = @ptrCast(@alignCast(paging.physPtr(evt_ring_phys + offset)));
         const trb = ptr.*;
@@ -753,7 +854,10 @@ fn enableSlot() ?u8 {
 
 // ── Phase 403: Address Device & Descriptors ─────────────────────────
 
-fn enableSlotAndAddress(port: u8, speed: u8) ?*UsbDevice {
+/// Enable a slot, address a device, read descriptors, and configure it.
+/// For root hub devices: parent_slot=0, parent_port=0, route_string=0.
+/// For devices behind a hub: parent_slot/port/route describe the topology.
+fn enableSlotAndAddress(port: u8, speed: u8, parent_slot: u8, parent_port: u8, route_string: u20) ?*UsbDevice {
     if (usb_device_count >= MAX_USB_DEVICES) return null;
 
     const slot_id = enableSlot() orelse return null;
@@ -766,6 +870,10 @@ fn enableSlotAndAddress(port: u8, speed: u8) ?*UsbDevice {
         .port = port,
         .speed = speed,
         .state = .slot_enabled,
+        .route_string = route_string,
+        .root_port = if (parent_slot == 0) port else usb_devices[findDevBySlot(parent_slot)].root_port,
+        .parent_slot = parent_slot,
+        .parent_port_num = parent_port,
     };
 
     if (!setupDeviceContext(dev)) return null;
@@ -795,10 +903,186 @@ fn enableSlotAndAddress(port: u8, speed: u8) ?*UsbDevice {
     }
     klog.info("\n");
 
+    // Hub detection — enumerate downstream ports
+    if (dev.class_code == USB_CLASS_HUB) {
+        enumerateHub(dev);
+        return dev;
+    }
+
     // Phase 405: Configure HID devices
     configureHidDevice(dev);
 
     return dev;
+}
+
+fn findDevBySlot(slot_id: u8) usize {
+    for (0..usb_device_count) |i| {
+        if (usb_devices[i].slot_id == slot_id) return i;
+    }
+    return 0;
+}
+
+// ── Phase 4007: USB Hub Enumeration ────────────────────────────────
+
+fn enumerateHub(hub: *UsbDevice) void {
+    klog.info("xhci: hub on port ");
+    klog.infoDec(hub.port);
+    klog.info(", enumerating\n");
+
+    // SET_CONFIGURATION(1) on the hub
+    _ = controlTransfer(hub, [8]u8{
+        USB_DIR_OUT, USB_REQ_SET_CONFIGURATION,
+        0x01, 0x00,
+        0x00, 0x00,
+        0x00, 0x00,
+    }, 0, 0, false) orelse {
+        klog.err("xhci: hub SET_CONFIGURATION failed\n");
+        return;
+    };
+
+    // GET_DESCRIPTOR(HUB) — read hub descriptor to get port count
+    const hub_desc_type: u8 = if (hub.speed == USB_SPEED_SUPER) USB_DESC_SS_HUB else USB_DESC_HUB;
+    _ = controlTransfer(hub, [8]u8{
+        0xA0, // bmRequestType: device-to-host, class, device
+        USB_REQ_GET_DESCRIPTOR,
+        0x00, hub_desc_type, // wValue: index 0, type
+        0x00, 0x00, // wIndex
+        16, 0x00, // wLength (hub descriptor is 7-12 bytes)
+    }, scratch_phys, 16, true) orelse {
+        klog.err("xhci: hub GET_DESCRIPTOR failed\n");
+        return;
+    };
+
+    const desc_buf = paging.physPtr(scratch_phys);
+    const num_ports = desc_buf[2];
+    hub.hub_ports = num_ports;
+
+    klog.info("xhci: hub has ");
+    klog.infoDec(num_ports);
+    klog.info(" ports\n");
+
+    if (num_ports == 0 or num_ports > 15) return;
+
+    // Power on each hub port
+    for (1..@as(u16, num_ports) + 1) |hp_u16| {
+        const hp: u8 = @truncate(hp_u16);
+        _ = controlTransfer(hub, [8]u8{
+            0x23, // bmRequestType: host-to-device, class, other (port)
+            HUB_REQ_SET_FEATURE,
+            HUB_FEAT_PORT_POWER, 0x00, // wValue: PORT_POWER
+            hp, 0x00, // wIndex: port number
+            0x00, 0x00,
+        }, 0, 0, false);
+    }
+
+    // Wait for power to stabilize (~100ms)
+    var delay: u32 = 100_000;
+    while (delay > 0) : (delay -= 1) microDelay();
+
+    // Scan each hub port for connected devices
+    for (1..@as(u16, num_ports) + 1) |hp_u16| {
+        const hp: u8 = @truncate(hp_u16);
+
+        // GET_STATUS on this port
+        const status_len = controlTransfer(hub, [8]u8{
+            0xA3, // bmRequestType: device-to-host, class, other (port)
+            HUB_REQ_GET_STATUS,
+            0x00, 0x00,
+            hp, 0x00,
+            0x04, 0x00, // wLength = 4
+        }, scratch_phys, 4, true) orelse continue;
+
+        if (status_len < 4) continue;
+        const status_buf = paging.physPtr(scratch_phys);
+        const port_status: u32 = @as(u32, status_buf[0]) | (@as(u32, status_buf[1]) << 8) |
+            (@as(u32, status_buf[2]) << 16) | (@as(u32, status_buf[3]) << 24);
+
+        if (port_status & HUB_PORT_CONNECTION == 0) continue;
+
+        klog.info("xhci: hub port ");
+        klog.infoDec(hp);
+        klog.info(" connected\n");
+
+        // Reset the port: SET_FEATURE(PORT_RESET)
+        _ = controlTransfer(hub, [8]u8{
+            0x23, HUB_REQ_SET_FEATURE,
+            HUB_FEAT_PORT_RESET, 0x00,
+            hp, 0x00,
+            0x00, 0x00,
+        }, 0, 0, false) orelse continue;
+
+        // Wait for reset to complete (~50ms then poll)
+        var reset_delay: u32 = 50_000;
+        while (reset_delay > 0) : (reset_delay -= 1) microDelay();
+
+        // Poll port status until reset is complete
+        var reset_done = false;
+        var poll: u32 = 200;
+        while (poll > 0) : (poll -= 1) {
+            const slen = controlTransfer(hub, [8]u8{
+                0xA3, HUB_REQ_GET_STATUS,
+                0x00, 0x00,
+                hp, 0x00,
+                0x04, 0x00,
+            }, scratch_phys, 4, true) orelse break;
+
+            if (slen < 4) break;
+            const sb = paging.physPtr(scratch_phys);
+            const ps2: u32 = @as(u32, sb[0]) | (@as(u32, sb[1]) << 8) |
+                (@as(u32, sb[2]) << 16) | (@as(u32, sb[3]) << 24);
+
+            // Check change bits (high word) for C_PORT_RESET
+            if (ps2 & (1 << 20) != 0) {
+                // Clear C_PORT_RESET
+                _ = controlTransfer(hub, [8]u8{
+                    0x23, HUB_REQ_CLEAR_FEATURE,
+                    HUB_FEAT_C_PORT_RESET, 0x00,
+                    hp, 0x00,
+                    0x00, 0x00,
+                }, 0, 0, false);
+
+                // Determine speed from port status
+                const dev_speed: u8 = if (hub.speed == USB_SPEED_SUPER)
+                    USB_SPEED_SUPER
+                else if (ps2 & HUB_PORT_LOW_SPEED != 0)
+                    USB_SPEED_LOW
+                else if (ps2 & HUB_PORT_HIGH_SPEED != 0)
+                    USB_SPEED_HIGH
+                else
+                    USB_SPEED_FULL;
+
+                // Build route string: shift parent's route and add this port in the lowest nibble
+                const rs: u20 = hub.route_string | (@as(u20, @intCast(hp & 0xF)) << hubTierShift(hub.route_string));
+
+                if (enableSlotAndAddress(hub.port, dev_speed, hub.slot_id, hp, rs)) |_| {} else {
+                    klog.err("xhci: hub port ");
+                    klog.errDec(hp);
+                    klog.err(" enumeration failed\n");
+                }
+                reset_done = true;
+                break;
+            }
+            var rd: u32 = 1000;
+            while (rd > 0) : (rd -= 1) microDelay();
+        }
+        if (!reset_done) {
+            klog.warn("xhci: hub port ");
+            klog.warnDec(hp);
+            klog.warn(" reset timeout\n");
+        }
+    }
+}
+
+/// Calculate the bit shift for the next tier in a route string.
+/// Each tier occupies 4 bits. Tier 0 is bits 3:0, tier 1 is 7:4, etc.
+fn hubTierShift(route: u20) u5 {
+    if (route == 0) return 0;
+    var shift: u5 = 0;
+    var r = route;
+    while (r != 0 and shift < 16) : (shift += 4) {
+        r >>= 4;
+    }
+    return shift;
 }
 
 fn setupDeviceContext(dev: *UsbDevice) bool {
@@ -855,12 +1139,19 @@ fn addressDevice(dev: *UsbDevice) bool {
     // Slot Context at offset context_size (one context_size past ICC)
     const slot_ctx_base = dev.input_ctx_phys + ctx_sz;
     const slot_dw0_ptr: *u32 = @ptrCast(@alignCast(paging.physPtr(slot_ctx_base)));
-    // DW0: Route String (0) | Speed | Context Entries (1 = EP0 only)
-    slot_dw0_ptr.* = (@as(u32, dev.speed) << 20) | (1 << 27); // context_entries=1
+    // DW0: Route String | Speed | Context Entries (1 = EP0 only)
+    slot_dw0_ptr.* = @as(u32, dev.route_string) | (@as(u32, dev.speed) << 20) | (1 << 27);
 
     const slot_dw1_ptr: *u32 = @ptrCast(@alignCast(paging.physPtr(slot_ctx_base + 4)));
-    // DW1: Root Hub Port Number
-    slot_dw1_ptr.* = @as(u32, dev.port) << 16;
+    // DW1: Root Hub Port Number (always the root port, even behind hubs)
+    const rh_port: u8 = if (dev.parent_slot == 0) dev.port else dev.root_port;
+    slot_dw1_ptr.* = @as(u32, rh_port) << 16;
+
+    // DW2: TT fields — for LS/FS devices behind a HS hub
+    if (dev.parent_slot != 0 and (dev.speed == USB_SPEED_LOW or dev.speed == USB_SPEED_FULL)) {
+        const slot_dw2_ptr: *u32 = @ptrCast(@alignCast(paging.physPtr(slot_ctx_base + 8)));
+        slot_dw2_ptr.* = (@as(u32, dev.parent_slot) << 8) | @as(u32, dev.parent_port_num);
+    }
 
     // Endpoint 0 Context at offset 2*context_size (EP0 is DCI 1, but stored after slot ctx)
     const ep0_ctx_base = dev.input_ctx_phys + 2 * ctx_sz;
@@ -950,6 +1241,7 @@ fn controlTransfer(dev: *UsbDevice, setup: [8]u8, data_phys: u64, data_len: u16,
     });
 
     // Ring doorbell for this slot, EP0 (DCI=1)
+    dmaFence(); // ensure TRBs visible before doorbell
     writeDb(dev.slot_id, 1);
 
     // Poll for transfer event (skipping PSC events)
@@ -965,6 +1257,9 @@ fn controlTransfer(dev: *UsbDevice, setup: [8]u8, data_phys: u64, data_len: u16,
         klog.err("\n");
         return null;
     }
+
+    // Fence to ensure CPU sees DMA-written data (cache coherency on real hardware)
+    dmaFence();
 
     const residual: u16 = @truncate(evt.status & 0xFFFFFF);
     return if (data_len > residual) data_len - residual else 0;
@@ -1003,11 +1298,27 @@ fn getDeviceDescriptor(dev: *UsbDevice) void {
         18, 0x00, // wLength
     };
 
-    const transferred = controlTransfer(dev, setup, scratch_phys, 18, true) orelse return;
-    if (transferred < 8) return;
+    const transferred = controlTransfer(dev, setup, scratch_phys, 18, true) orelse {
+        klog.err("xhci: GET_DESCRIPTOR(DEVICE) failed\n");
+        return;
+    };
+
+    klog.info("xhci: descriptor ");
+    klog.infoDec(transferred);
+    klog.info(" bytes:");
 
     // Parse 18-byte device descriptor
     const buf = paging.physPtr(scratch_phys);
+
+    // Dump first 8 bytes for debug
+    for (0..@min(transferred, 18)) |i| {
+        klog.info(" ");
+        klog.infoHex(@as(u32, buf[i]));
+    }
+    klog.info("\n");
+
+    if (transferred < 8) return;
+
     dev.class_code = buf[4];
     dev.subclass = buf[5];
     dev.protocol = buf[6];
@@ -1186,10 +1497,11 @@ fn setupInterruptEndpoint(dev: *UsbDevice, ep_addr: u8, interval: u8, max_packet
     // Update Slot Context — set context entries to max of current and dci
     const slot_ctx_base = dev.input_ctx_phys + ctx_sz;
     const slot_dw0_ptr: *u32 = @ptrCast(@alignCast(paging.physPtr(slot_ctx_base)));
-    slot_dw0_ptr.* = (@as(u32, dev.speed) << 20) | (@as(u32, dci) << 27);
+    slot_dw0_ptr.* = @as(u32, dev.route_string) | (@as(u32, dev.speed) << 20) | (@as(u32, dci) << 27);
 
     const slot_dw1_ptr: *u32 = @ptrCast(@alignCast(paging.physPtr(slot_ctx_base + 4)));
-    slot_dw1_ptr.* = @as(u32, dev.port) << 16;
+    const rh_port2: u8 = if (dev.parent_slot == 0) dev.port else dev.root_port;
+    slot_dw1_ptr.* = @as(u32, rh_port2) << 16;
 
     // Endpoint Context at offset (1 + dci) * context_size
     const ep_ctx_base = dev.input_ctx_phys + (@as(u64, 1 + dci) * ctx_sz);
@@ -1606,32 +1918,62 @@ fn fmtHex16(buf: []u8, val: u16) usize {
 // ── Utilities ───────────────────────────────────────────────────────
 
 fn zeroPage(phys: u64) void {
-    const ptr = paging.physPtr(phys);
-    @memset(ptr[0..4096], 0);
+    if (comptime builtin.cpu.arch == .x86_64) {
+        const ptr = paging.physPtr(phys);
+        @memset(ptr[0..4096], 0);
+    } else {
+        const virt = phys +% mem.KERNEL_VIRT_BASE;
+        const ptr: [*]u8 = @ptrFromInt(virt);
+        @memset(ptr[0..4096], 0);
+    }
 }
 
 fn microDelay() void {
-    // Simple delay — read a port or just spin
-    // On x86_64, reading port 0x80 is ~1μs
-    if (@import("builtin").cpu.arch == .x86_64) {
-        const cpu = @import("arch/x86_64/cpu.zig");
-        _ = cpu.inb(0x80);
+    if (comptime builtin.cpu.arch == .x86_64) {
+        _ = @import("arch/x86_64/cpu.zig").inb(0x80);
+    } else {
+        // ~1μs spin on RISC-V/AArch64
+        var i: u32 = 50;
+        while (i > 0) : (i -= 1) cpu.spinHint();
+    }
+}
+
+/// Memory fence for DMA coherency on non-x86 architectures.
+/// Ensures CPU cache sees data written by DMA engines, and DMA engines
+/// see data written by CPU. On x86, store/load ordering makes this a no-op.
+inline fn dmaFence() void {
+    if (comptime builtin.cpu.arch == .riscv64) {
+        asm volatile ("fence iorw, iorw"
+            :
+            :
+            : .{.memory = true});
+    } else if (comptime builtin.cpu.arch == .aarch64) {
+        asm volatile ("dsb sy"
+            :
+            :
+            : .{.memory = true});
     }
 }
 
 /// Map a physical MMIO region into the kernel's higher-half page tables.
-/// This is needed for BARs above 4 GB which aren't covered by the initial 4GB map.
-/// Maps into the higher-half (0xFFFF_8000_... + phys) since physPtr() uses that.
-/// The mapping is in the shared kernel PML4 entries 256-511 so it's visible
-/// in all address spaces (process page tables shallow-copy these entries).
+/// Maps phys → phys + KERNEL_VIRT_BASE so mmioRead32/Write32 can access it.
 fn mapMmioRegion(phys_base: u64, size: u64) bool {
-    const kernel_pml4 = paging.getKernelPml4();
+    const kernel_root = if (comptime builtin.cpu.arch == .x86_64)
+        paging.getKernelPml4()
+    else if (comptime builtin.cpu.arch == .riscv64)
+        paging.getKernelRoot()
+    else if (comptime builtin.cpu.arch == .aarch64)
+        paging.getKernelRoot()
+    else
+        return false;
+
+    const flags = paging.Flags.WRITABLE | if (comptime @hasDecl(paging.Flags, "NO_CACHE")) paging.Flags.NO_CACHE else 0;
     const page_size: u64 = 4096;
     var offset: u64 = 0;
     while (offset < size) : (offset += page_size) {
         const phys = (phys_base + offset) & ~@as(u64, 0xFFF);
         const virt = phys +% mem.KERNEL_VIRT_BASE;
-        paging.mapPage(kernel_pml4, virt, phys, paging.Flags.WRITABLE | paging.Flags.NO_CACHE) orelse {
+        paging.mapPage(kernel_root, virt, phys, flags) orelse {
             return false;
         };
     }
